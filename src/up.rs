@@ -33,8 +33,6 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         })?;
         println!("{}", report.format_text());
     }
-    delta_backend.warm_up()?;
-
     let (sender, receiver) = mpsc::channel();
     let mut watcher = build_watcher(request.poll, sender)?;
     for watch_dir in &config.sync.watch_dirs {
@@ -91,7 +89,6 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             }
         }
     }
-    delta_backend.shutdown();
     println!("[watch] stopped");
     Ok(())
 }
