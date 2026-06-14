@@ -146,7 +146,7 @@ fn build_rsync_command(build: RsyncCommandBuild<'_>, mode: DetectedRsync) -> Pro
 }
 
 fn build_native_rsync_command(build: RsyncCommandBuild<'_>) -> ProcessCommand {
-    let source = build.request.project_root.join(build.watch_dir);
+    let source = local_source(build.request, build.watch_dir);
     let remote = remote_dest(build.config, build.remote_root, build.watch_dir);
     let mut command =
         ProcessCommand::new("rsync").args(common_rsync_args(build.config, build.request));
@@ -203,8 +203,16 @@ fn wsl_source(config: &AppConfig, request: &SyncRequest, watch_dir: &Path) -> St
     if !config.sync.rsync_local_path.is_empty() {
         return join_wsl_path(&config.sync.rsync_local_path, watch_dir);
     }
-    let source = request.project_root.join(watch_dir);
+    let source = local_source(request, watch_dir);
     windows_path_to_wsl(&source)
+}
+
+fn local_source(request: &SyncRequest, watch_dir: &Path) -> PathBuf {
+    if is_current_dir(watch_dir) {
+        request.project_root.clone()
+    } else {
+        request.project_root.join(watch_dir)
+    }
 }
 
 fn windows_path_to_wsl(path: &Path) -> String {
@@ -230,9 +238,23 @@ fn join_wsl_path(root: &str, path: &Path) -> String {
 
 fn path_to_forward_slashes(path: &Path) -> String {
     path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter_map(|component| {
+            let item = component.as_os_str().to_string_lossy();
+            if item == "." {
+                None
+            } else {
+                Some(item.to_string())
+            }
+        })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn is_current_dir(path: &Path) -> bool {
+    path.components().all(|component| {
+        let item = component.as_os_str().to_string_lossy();
+        item == "."
+    })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -356,5 +378,26 @@ mod tests {
         assert_eq!(error.info.code, "sync.rsync_failed");
         assert_eq!(error.context.exit_code, Some(12));
         assert!(error.context.command.is_some());
+    }
+
+    #[test]
+    fn dot_watch_dir_syncs_project_root_without_dot_suffix() {
+        let mut config = AppConfig::template("root@example.com", 22, "/root/project");
+        config.sync.rsync_mode = RsyncMode::Wsl;
+        config.sync.watch_dirs = vec![PathBuf::from(".")];
+        let runner = FakeRunner::success(2);
+        let backend = RsyncSyncBackend::new(&config, &runner);
+
+        let report = backend.sync_full(SyncRequest {
+            dry_run: true,
+            delete: true,
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+        });
+
+        assert!(report.is_ok());
+        let commands = runner.commands.borrow();
+        assert!(commands[1].contains("'/mnt/j/RustWorkspace/project/'"));
+        assert!(commands[1].contains("'root@example.com:/root/project/'"));
+        assert!(!commands[1].contains("/./"));
     }
 }

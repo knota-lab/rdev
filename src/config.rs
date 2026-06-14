@@ -113,9 +113,11 @@ impl Default for SyncConfig {
                 ".git".to_owned(),
                 "target".to_owned(),
                 "node_modules".to_owned(),
+                "data".to_owned(),
                 ".rdev".to_owned(),
                 ".idea".to_owned(),
                 ".vscode".to_owned(),
+                ".codegraph".to_owned(),
                 "dist".to_owned(),
                 "build".to_owned(),
             ],
@@ -192,6 +194,8 @@ remote_env = {}
         assert_eq!(config.version, CONFIG_VERSION);
         assert_eq!(config.remote.port, 2222);
         assert!(config.sync.exclude.iter().any(|item| item == ".rdev"));
+        assert!(config.sync.exclude.iter().any(|item| item == "data"));
+        assert!(config.sync.exclude.iter().any(|item| item == ".codegraph"));
         assert_eq!(config.sync.full_sync_threshold, 32);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
     }
