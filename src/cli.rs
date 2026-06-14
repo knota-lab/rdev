@@ -16,6 +16,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Init(InitArgs),
+    AuthCheck,
     Doctor,
     Run(RunArgs),
     Sync(SyncArgs),

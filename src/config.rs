@@ -25,6 +25,10 @@ pub struct RemoteConfig {
     pub path: String,
     #[serde(default)]
     pub ssh_config: String,
+    #[serde(default)]
+    pub identity_file: String,
+    #[serde(default)]
+    pub passphrase_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +101,8 @@ impl AppConfig {
                 port,
                 path: remote_path.to_owned(),
                 ssh_config: String::new(),
+                identity_file: String::new(),
+                passphrase_env: String::new(),
             },
             sync: SyncConfig::default(),
             command: CommandConfig::default(),

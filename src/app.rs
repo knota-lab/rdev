@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::auth::run_auth_check;
 use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs, SyncArgs};
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{AppConfig, CONFIG_FILE_NAME};
@@ -15,6 +16,7 @@ use crate::up::{run_up, UpRequest};
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
     match cli.command {
         Command::Init(args) => init(args, cwd),
+        Command::AuthCheck => auth_check(cwd),
         Command::Doctor => doctor(cwd),
         Command::Run(args) => run_command(args, cwd),
         Command::Sync(args) => sync(args, cwd),
@@ -22,6 +24,11 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Stop => stop(cwd),
         Command::Ssh(args) => ssh(args, cwd),
     }
+}
+
+fn auth_check(cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    run_auth_check(&config)
 }
 
 fn init(args: InitArgs, cwd: &Path) -> Result<String> {

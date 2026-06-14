@@ -3,6 +3,7 @@
 #![deny(clippy::expect_used)]
 
 pub mod app;
+pub mod auth;
 pub mod cli;
 pub mod command;
 pub mod config;
