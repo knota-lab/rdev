@@ -1,0 +1,80 @@
+use std::fs;
+use std::path::Path;
+
+use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs};
+use crate::config::{AppConfig, CONFIG_FILE_NAME};
+use crate::error::{err, err_with_source, Result};
+use crate::error_info;
+use crate::path::{RelativePath, RemotePath};
+
+pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
+    match cli.command {
+        Command::Init(args) => init(args, cwd),
+        Command::Doctor => doctor(cwd),
+        Command::Run(args) => run_command(args, cwd),
+        Command::Sync(_) => Ok("sync is not implemented yet".to_owned()),
+        Command::Up(_) => Ok("up is not implemented yet".to_owned()),
+        Command::Ssh(args) => ssh(args, cwd),
+    }
+}
+
+fn init(args: InitArgs, cwd: &Path) -> Result<String> {
+    let host = args.host.ok_or_else(|| {
+        err(error_info::CONFIG_INVALID)
+            .with_hint("请使用 --host 指定远端主机，例如 root@example.com")
+    })?;
+    let remote_path = args.path.ok_or_else(|| {
+        err(error_info::CONFIG_INVALID)
+            .with_hint("请使用 --path 指定远端项目目录，例如 /root/project")
+    })?;
+    RemotePath::parse(remote_path.as_str())?;
+
+    let config_path = cwd.join(CONFIG_FILE_NAME);
+    let config = AppConfig::template(&host, args.port, &remote_path);
+    let raw = toml::to_string_pretty(&config)
+        .map_err(|source| err_with_source(error_info::CONFIG_INVALID, source))?;
+    fs::write(&config_path, raw)
+        .map_err(|source| err_with_source(error_info::CONFIG_INVALID, source))?;
+    Ok(format!("created {}", config_path.display()))
+}
+
+fn doctor(cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    RemotePath::parse(config.remote.path)?;
+    if config.sync.direction != crate::config::SyncDirection::Push {
+        return Err(err(error_info::CONFIG_INVALID)
+            .with_hint("sync.direction 目前只支持 push，pull/bidirectional 为预留值"));
+    }
+    Ok("doctor checks passed for config and path model".to_owned())
+}
+
+fn run_command(args: RunArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let remote_root = RemotePath::parse(config.remote.path)?;
+    let relative = parse_optional_dir(args.dir.as_deref())?;
+    let remote_dir = remote_root.join_relative(&relative);
+    let sync_mode = if args.no_sync {
+        "without sync"
+    } else {
+        "with sync-before-run"
+    };
+    Ok(format!(
+        "would run {sync_mode} in {remote_dir}: {}",
+        args.command
+    ))
+}
+
+fn ssh(args: SshArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let remote_root = RemotePath::parse(config.remote.path)?;
+    let relative = parse_optional_dir(args.dir.as_deref())?;
+    let remote_dir = remote_root.join_relative(&relative);
+    Ok(format!("would open ssh in {remote_dir}"))
+}
+
+fn parse_optional_dir(path: Option<&Path>) -> Result<RelativePath> {
+    match path {
+        Some(path) => RelativePath::parse(path),
+        None => RelativePath::parse("."),
+    }
+}
