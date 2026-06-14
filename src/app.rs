@@ -10,6 +10,7 @@ use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
 use crate::process::SystemProcessRunner;
 use crate::sync::{RsyncSyncBackend, SyncRequest};
+use crate::up::{run_up, UpRequest};
 
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
     match cli.command {
@@ -17,7 +18,7 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Doctor => doctor(cwd),
         Command::Run(args) => run_command(args, cwd),
         Command::Sync(args) => sync(args, cwd),
-        Command::Up(_) => Ok("up is not implemented yet".to_owned()),
+        Command::Up(args) => up(args, cwd),
         Command::Ssh(args) => ssh(args, cwd),
     }
 }
@@ -69,9 +70,24 @@ fn sync(args: SyncArgs, cwd: &Path) -> Result<String> {
     let report = backend.sync_full(SyncRequest {
         dry_run: args.dry_run,
         delete: config.sync.delete && !args.no_delete,
-        project_root: cwd.to_path_buf(),
+        project_root: resolve_local_root(cwd, &config.sync.local_path),
     })?;
     Ok(report.format_text())
+}
+
+fn up(args: crate::cli::UpArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let runner = SystemProcessRunner::default();
+    run_up(
+        &config,
+        &runner,
+        UpRequest {
+            project_root: cwd.to_path_buf(),
+            initial_sync: !args.no_initial_sync,
+            poll: args.poll,
+        },
+    )?;
+    Ok(String::new())
 }
 
 fn format_command_output(output: CommandExit) -> String {
@@ -95,5 +111,13 @@ fn parse_optional_dir(path: Option<&Path>) -> Result<RelativePath> {
     match path {
         Some(path) => RelativePath::parse(path),
         None => RelativePath::parse("."),
+    }
+}
+
+fn resolve_local_root(project_root: &Path, local_path: &Path) -> std::path::PathBuf {
+    if local_path.is_absolute() {
+        local_path.to_path_buf()
+    } else {
+        project_root.join(local_path)
     }
 }
