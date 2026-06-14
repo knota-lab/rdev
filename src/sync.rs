@@ -23,7 +23,7 @@ pub struct SyncDeltaRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
-    mode: DetectedRsync,
+    mode: SyncMode,
     synced_roots: Vec<String>,
     dry_run: bool,
 }
@@ -31,8 +31,9 @@ pub struct SyncReport {
 impl SyncReport {
     pub fn format_text(&self) -> String {
         let mode = match self.mode {
-            DetectedRsync::Native => "native",
-            DetectedRsync::Wsl => "wsl",
+            SyncMode::NativeRsync => "native",
+            SyncMode::WslRsync => "wsl",
+            SyncMode::Sftp => "sftp",
         };
         let action = if self.dry_run { "dry-run" } else { "sync" };
         format!(
@@ -40,6 +41,26 @@ impl SyncReport {
             self.synced_roots.join(", ")
         )
     }
+
+    pub fn completed_sftp(uploads: Vec<PathBuf>, deletes: Vec<PathBuf>) -> Self {
+        let synced_roots = uploads
+            .into_iter()
+            .chain(deletes)
+            .map(|path| path.display().to_string())
+            .collect();
+        Self {
+            mode: SyncMode::Sftp,
+            synced_roots,
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncMode {
+    NativeRsync,
+    WslRsync,
+    Sftp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +109,7 @@ where
             synced_roots.push(watch_dir.display().to_string());
         }
         Ok(SyncReport {
-            mode,
+            mode: mode.into(),
             synced_roots,
             dry_run: request.dry_run,
         })
@@ -130,7 +151,7 @@ where
         }
 
         Ok(SyncReport {
-            mode,
+            mode: mode.into(),
             synced_roots,
             dry_run: false,
         })
@@ -187,6 +208,15 @@ where
             Ok(())
         } else {
             Err(tool_rsync_error(output, display))
+        }
+    }
+}
+
+impl From<DetectedRsync> for SyncMode {
+    fn from(value: DetectedRsync) -> Self {
+        match value {
+            DetectedRsync::Native => Self::NativeRsync,
+            DetectedRsync::Wsl => Self::WslRsync,
         }
     }
 }

@@ -80,6 +80,14 @@ pub const SYNC_RSYNC_FAILED: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Sync,
 };
 
+pub const SYNC_SFTP_FAILED: ErrorInfo = ErrorInfo {
+    code: "sync.sftp_failed",
+    message_zh: "SFTP 同步失败",
+    message_en: "SFTP sync failed",
+    severity: ErrorSeverity::Remote,
+    exit_code: RdevExitCode::Sync,
+};
+
 pub const SYNC_DELETE_REJECTED: ErrorInfo = ErrorInfo {
     code: "sync.delete_rejected",
     message_zh: "删除动作被路径保护拒绝",

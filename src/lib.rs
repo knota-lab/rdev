@@ -11,5 +11,6 @@ pub mod error;
 pub mod error_info;
 pub mod path;
 pub mod process;
+pub mod sftp;
 pub mod sync;
 pub mod up;

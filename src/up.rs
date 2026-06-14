@@ -9,6 +9,7 @@ use crate::config::AppConfig;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::process::ProcessRunner;
+use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
 
 #[derive(Debug, Clone)]
@@ -20,9 +21,10 @@ pub struct UpRequest {
 
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
-    let backend = RsyncSyncBackend::new(config, runner);
+    let rsync_backend = RsyncSyncBackend::new(config, runner);
+    let mut delta_backend = SftpDeltaBackend::new(config);
     if request.initial_sync {
-        let report = backend.sync_full(SyncRequest {
+        let report = rsync_backend.sync_full(SyncRequest {
             dry_run: false,
             delete: config.sync.delete,
             project_root: local_root.clone(),
@@ -66,7 +68,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
                 if pending.has_changes() && last_event_at.elapsed() >= debounce {
                     let changes = pending.take();
                     let changes = reconcile_existing_paths(changes, &local_root);
-                    let report = backend.sync_delta(SyncDeltaRequest {
+                    let report = delta_backend.sync_delta(SyncDeltaRequest {
                         project_root: local_root.clone(),
                         uploads: changes.uploads.into_iter().collect(),
                         deletes: changes.deletes.into_iter().collect(),
