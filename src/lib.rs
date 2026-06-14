@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod command;
 pub mod config;
 pub mod doctor;
 pub mod error;

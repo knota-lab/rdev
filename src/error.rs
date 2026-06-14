@@ -108,6 +108,11 @@ impl RdevError {
         self.0.context.remote = Some(remote.into());
         self
     }
+
+    pub fn with_exit_code(mut self, exit_code: Option<i32>) -> Self {
+        self.0.context.exit_code = exit_code;
+        self
+    }
 }
 
 impl Deref for RdevError {

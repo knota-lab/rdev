@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs};
+use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{AppConfig, CONFIG_FILE_NAME};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
@@ -49,18 +50,24 @@ fn doctor(cwd: &Path) -> Result<String> {
 
 fn run_command(args: RunArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
-    let remote_root = RemotePath::parse(config.remote.path)?;
     let relative = parse_optional_dir(args.dir.as_deref())?;
-    let remote_dir = remote_root.join_relative(&relative);
-    let sync_mode = if args.no_sync {
-        "without sync"
-    } else {
-        "with sync-before-run"
-    };
-    Ok(format!(
-        "would run {sync_mode} in {remote_dir}: {}",
-        args.command
-    ))
+    let runner = SystemProcessRunner::default();
+    let backend = SshCommandBackend::new(&config, &runner);
+    let output = backend.run(RunRequest {
+        command: args.command,
+        dir: relative,
+        sync_before_run: !args.no_sync,
+    })?;
+    Ok(format_command_output(output))
+}
+
+fn format_command_output(output: CommandExit) -> String {
+    match (output.stdout.is_empty(), output.stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => output.stdout,
+        (true, false) => output.stderr,
+        (false, false) => format!("{}\n{}", output.stdout, output.stderr),
+    }
 }
 
 fn ssh(args: SshArgs, cwd: &Path) -> Result<String> {
