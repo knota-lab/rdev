@@ -39,6 +39,8 @@ pub struct SyncConfig {
     pub delete_policy: DeletePolicy,
     pub full_sync_threshold: usize,
     #[serde(default)]
+    pub rsync_mode: RsyncMode,
+    #[serde(default)]
     pub rsync_local_path: String,
 }
 
@@ -57,6 +59,15 @@ pub enum DeletePolicy {
     KeepTarget,
     TrashTarget,
     Confirm,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RsyncMode {
+    #[default]
+    Auto,
+    Native,
+    Wsl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +125,7 @@ impl Default for SyncConfig {
             delete: true,
             delete_policy: DeletePolicy::Propagate,
             full_sync_threshold: 32,
+            rsync_mode: RsyncMode::Auto,
             rsync_local_path: String::new(),
         }
     }
@@ -152,6 +164,7 @@ direction = "push"
 delete = true
 delete_policy = "propagate"
 full_sync_threshold = 32
+rsync_mode = "auto"
 
 [command]
 default_shell = "bash"
@@ -169,6 +182,7 @@ remote_env = {}
         assert_eq!(config.remote.host, "root@example.com");
         assert_eq!(config.sync.direction, SyncDirection::Push);
         assert_eq!(config.sync.delete_policy, DeletePolicy::Propagate);
+        assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
     }
 
     #[test]
@@ -179,5 +193,6 @@ remote_env = {}
         assert_eq!(config.remote.port, 2222);
         assert!(config.sync.exclude.iter().any(|item| item == ".rdev"));
         assert_eq!(config.sync.full_sync_threshold, 32);
+        assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, SyncDirection};
+use crate::config::{AppConfig, RsyncMode, SyncDirection};
 use crate::error::{err, err_with_source, ErrorInfo, Result};
 use crate::error_info;
 use crate::path::RemotePath;
@@ -56,11 +56,8 @@ pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<Doc
     )?;
     checks.push(DoctorCheck::ok("ssh", "available"));
 
-    check_tool(
-        runner,
-        ToolCheck::new("rsync", error_info::TOOL_RSYNC_NOT_FOUND),
-    )?;
-    checks.push(DoctorCheck::ok("rsync", "available"));
+    let rsync = check_rsync(runner, config.sync.rsync_mode)?;
+    checks.push(DoctorCheck::ok("rsync", rsync.detail()));
 
     let remote = RemoteTarget::from_config(config);
     check_remote_sh(runner, &remote)?;
@@ -116,10 +113,77 @@ fn check_tool(runner: &impl ProcessRunner, tool: ToolCheck) -> Result<()> {
     let command = tool.version_command();
     let display = command.display();
     match runner.output(command) {
-        Ok(_) => Ok(()),
+        Ok(output) if output.code == Some(0) => Ok(()),
+        Ok(output) => {
+            Err(err(tool.missing)
+                .with_command(display)
+                .with_hint(if output.stderr.is_empty() {
+                    tool.install_hint().to_owned()
+                } else {
+                    output.stderr
+                }))
+        }
         Err(source) => Err(err_with_source(tool.missing, source)
             .with_command(display)
             .with_hint(tool.install_hint())),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedRsync {
+    Native,
+    Wsl,
+}
+
+impl DetectedRsync {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Native => "available via native PATH",
+            Self::Wsl => "available via WSL",
+        }
+    }
+}
+
+fn check_rsync(runner: &impl ProcessRunner, mode: RsyncMode) -> Result<DetectedRsync> {
+    match mode {
+        RsyncMode::Native => {
+            check_tool(
+                runner,
+                ToolCheck::new("rsync", error_info::TOOL_RSYNC_NOT_FOUND),
+            )?;
+            Ok(DetectedRsync::Native)
+        }
+        RsyncMode::Wsl => {
+            check_wsl_rsync(runner)?;
+            Ok(DetectedRsync::Wsl)
+        }
+        RsyncMode::Auto => match check_tool(
+            runner,
+            ToolCheck::new("rsync", error_info::TOOL_RSYNC_NOT_FOUND),
+        ) {
+            Ok(()) => Ok(DetectedRsync::Native),
+            Err(_) => {
+                check_wsl_rsync(runner)?;
+                Ok(DetectedRsync::Wsl)
+            }
+        },
+    }
+}
+
+fn check_wsl_rsync(runner: &impl ProcessRunner) -> Result<()> {
+    let command = ProcessCommand::new("wsl")
+        .arg("bash")
+        .arg("-lc")
+        .arg("rsync --version");
+    let display = command.display();
+    match runner.output(command) {
+        Ok(output) if output.code == Some(0) => Ok(()),
+        Ok(output) => Err(err(error_info::TOOL_RSYNC_NOT_FOUND)
+            .with_command(display)
+            .with_hint(output.stderr)),
+        Err(source) => Err(err_with_source(error_info::TOOL_RSYNC_NOT_FOUND, source)
+            .with_command(display)
+            .with_hint("请通过 WSL、MSYS2、Git Bash 或 Cygwin 提供 rsync，并确认 rsync 可运行")),
     }
 }
 
@@ -221,6 +285,10 @@ fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
     ProcessCommand::new("ssh")
         .arg("-p")
         .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
         .arg(remote.host.clone())
         .arg("sh")
         .arg("-lc")
@@ -252,6 +320,21 @@ mod tests {
             let outputs = (0..count)
                 .map(|_| ProcessOutput {
                     code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+                .collect();
+            Self {
+                outputs: RefCell::new(outputs),
+                commands: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn from_codes(codes: impl IntoIterator<Item = Option<i32>>) -> Self {
+            let outputs = codes
+                .into_iter()
+                .map(|code| ProcessOutput {
+                    code,
                     stdout: String::new(),
                     stderr: String::new(),
                 })
@@ -301,5 +384,17 @@ mod tests {
 
         assert!(report.is_err());
         assert!(runner.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn doctor_falls_back_to_wsl_rsync_in_auto_mode() {
+        let config = AppConfig::template("root@example.com", 22, "/root/project");
+        let runner = FakeRunner::from_codes([Some(0), Some(1), Some(0), Some(0), Some(0), Some(0)]);
+
+        let report = run_doctor(&config, &runner);
+
+        assert!(report.is_ok());
+        let commands = runner.commands.borrow();
+        assert!(commands.iter().any(|command| command.starts_with("wsl ")));
     }
 }

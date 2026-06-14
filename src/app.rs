@@ -42,7 +42,7 @@ fn init(args: InitArgs, cwd: &Path) -> Result<String> {
 
 fn doctor(cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
-    let runner = SystemProcessRunner;
+    let runner = SystemProcessRunner::default();
     let report = run_doctor(&config, &runner)?;
     Ok(report.format_text())
 }

@@ -1,6 +1,9 @@
 use std::ffi::OsStr;
 use std::io;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOutput {
@@ -52,20 +55,63 @@ impl ProcessCommand {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct SystemProcessRunner;
+#[derive(Debug)]
+pub struct SystemProcessRunner {
+    timeout: Duration,
+}
+
+impl SystemProcessRunner {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for ProcessCommand {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
 
 impl ProcessRunner for SystemProcessRunner {
     fn output(&self, command: ProcessCommand) -> io::Result<ProcessOutput> {
-        let output = Command::new(command.program())
-            .args(command.args_slice().iter().map(OsStr::new))
-            .output()?;
+        let (sender, receiver) = mpsc::channel();
+        let command_for_thread = command.clone();
+        thread::spawn(move || {
+            let result = run_output(command_for_thread);
+            let _send_result = sender.send(result);
+        });
 
-        Ok(ProcessOutput {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+        match receiver.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("command timed out: {}", command.display()),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("command runner disconnected: {}", command.display()),
+            )),
+        }
+    }
+}
+
+fn run_output(command: ProcessCommand) -> io::Result<ProcessOutput> {
+    let output = Command::new(command.program())
+        .args(command.args_slice().iter().map(OsStr::new))
+        .output()?;
+
+    Ok(ProcessOutput {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
+impl Default for SystemProcessRunner {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+        }
     }
 }
 
