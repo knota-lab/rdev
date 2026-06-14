@@ -1,7 +1,7 @@
-use std::cell::Cell;
-use std::fs;
+use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, ChildStdin, Command as StdCommand, Stdio};
 
 use crate::config::AppConfig;
 use crate::error::{err_with_source, Result};
@@ -15,6 +15,7 @@ pub struct SftpDeltaBackend<'a, R> {
     runner: &'a R,
     control_path: PathBuf,
     control_enabled: Cell<bool>,
+    session: RefCell<Option<PersistentSftpSession>>,
 }
 
 impl<'a, R> SftpDeltaBackend<'a, R>
@@ -27,7 +28,12 @@ where
             runner,
             control_path: control_path(config),
             control_enabled: Cell::new(true),
+            session: RefCell::new(None),
         }
+    }
+
+    pub fn warm_up(&self) -> Result<()> {
+        self.ensure_session()
     }
 
     pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
@@ -46,6 +52,9 @@ where
     }
 
     pub fn shutdown(&self) {
+        if let Some(mut session) = self.session.replace(None) {
+            session.shutdown();
+        }
         let command = ProcessCommand::new("ssh")
             .arg("-O")
             .arg("exit")
@@ -59,29 +68,34 @@ where
 
     fn upload_batch(&self, upload: UploadBatch<'_>) -> Result<()> {
         let batch = build_upload_batch(upload.project_root, upload.remote_root, upload.uploads);
-        let batch_path = write_batch_file(&batch)?;
-        let result = self.run_sftp_batch(&batch_path);
-        let _remove_result = fs::remove_file(&batch_path);
-        result
+        self.write_sftp_batch(&batch)
     }
 
-    fn run_sftp_batch(&self, batch_path: &Path) -> Result<()> {
-        let command = self.sftp_command(batch_path, self.control_enabled.get());
-        let display = command.display();
-        let output = self.runner.output(command).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
-        })?;
-        if should_retry_without_control(&output) && self.control_enabled.get() {
-            self.control_enabled.set(false);
-            let retry = self.sftp_command(batch_path, false);
-            let retry_display = retry.display();
-            let retry_output = self.runner.output(retry).map_err(|source| {
-                err_with_source(error_info::SYNC_SFTP_FAILED, source)
-                    .with_command(retry_display.clone())
-            })?;
-            return check_output(retry_output, retry_display);
+    fn ensure_session(&self) -> Result<()> {
+        if self.session.borrow().is_none() {
+            self.session
+                .replace(Some(PersistentSftpSession::connect(self.config)?));
         }
-        check_output(output, display)
+        Ok(())
+    }
+
+    fn write_sftp_batch(&self, batch: &str) -> Result<()> {
+        self.ensure_session()?;
+        let mut session_ref = self.session.borrow_mut();
+        let Some(session) = session_ref.as_mut() else {
+            return Err(crate::error::err(error_info::INTERNAL_UNEXPECTED));
+        };
+        if session.has_exited()? {
+            drop(session_ref);
+            self.session
+                .replace(Some(PersistentSftpSession::connect(self.config)?));
+            let mut session_ref = self.session.borrow_mut();
+            let Some(session) = session_ref.as_mut() else {
+                return Err(crate::error::err(error_info::INTERNAL_UNEXPECTED));
+            };
+            return session.write_batch(batch);
+        }
+        session.write_batch(batch)
     }
 
     fn delete_batch(&self, remote_root: &RemotePath, deletes: &[PathBuf]) -> Result<()> {
@@ -101,18 +115,55 @@ where
         })?;
         check_output(output, display)
     }
+}
 
-    fn sftp_command(&self, batch_path: &Path, use_control: bool) -> ProcessCommand {
-        let mut command = ProcessCommand::new("sftp");
-        if use_control {
-            command = command.args(control_options(&self.control_path));
-        }
-        command
+struct PersistentSftpSession {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+impl PersistentSftpSession {
+    fn connect(config: &AppConfig) -> Result<Self> {
+        let mut child = StdCommand::new("sftp")
+            .arg("-q")
             .arg("-b")
-            .arg(batch_path.display().to_string())
+            .arg("-")
             .arg("-P")
-            .arg(self.config.remote.port.to_string())
-            .arg(self.config.remote.host.clone())
+            .arg(config.remote.port.to_string())
+            .arg(config.remote.host.clone())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => return Err(crate::error::err(error_info::SYNC_SFTP_FAILED)),
+        };
+        Ok(Self { child, stdin })
+    }
+
+    fn write_batch(&mut self, batch: &str) -> Result<()> {
+        self.stdin
+            .write_all(batch.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))
+    }
+
+    fn has_exited(&mut self) -> Result<bool> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))
+    }
+
+    fn shutdown(&mut self) {
+        let _write_result = self.stdin.write_all(b"bye\n");
+        let _flush_result = self.stdin.flush();
+        if self.child.wait().is_err() {
+            let _kill_result = self.child.kill();
+        }
     }
 }
 
@@ -144,7 +195,6 @@ fn build_upload_batch(
             ));
         }
     }
-    lines.push("bye".to_owned());
     lines.join("\n")
 }
 
@@ -195,14 +245,6 @@ fn build_delete_command(delete: DeleteBatch<'_>) -> ProcessCommand {
         .arg(remote_shell)
 }
 
-fn write_batch_file(batch: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("rdev-sftp-{}.batch", batch_id()));
-    fs::write(&path, batch).map_err(|source| {
-        err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(path.display())
-    })?;
-    Ok(path)
-}
-
 fn control_options(control_path: &Path) -> Vec<String> {
     vec![
         "-o".to_owned(),
@@ -223,13 +265,6 @@ fn control_path(config: &AppConfig) -> PathBuf {
     std::env::temp_dir().join(raw)
 }
 
-fn batch_id() -> u128 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    }
-}
-
 fn check_output(output: ProcessOutput, command: String) -> Result<()> {
     if output.code == Some(0) {
         Ok(())
@@ -242,14 +277,6 @@ fn check_output(output: ProcessOutput, command: String) -> Result<()> {
         }
         Err(error)
     }
-}
-
-fn should_retry_without_control(output: &ProcessOutput) -> bool {
-    output.code == Some(255)
-        && (output.stderr.contains("getsockname failed")
-            || output.stderr.contains("mux_client")
-            || output.stderr.contains("Control socket")
-            || output.stderr.contains("Connection closed"))
 }
 
 fn remote_path(remote_root: &RemotePath, relative_path: &Path) -> String {

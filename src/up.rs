@@ -33,6 +33,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         })?;
         println!("{}", report.format_text());
     }
+    delta_backend.warm_up()?;
 
     let (sender, receiver) = mpsc::channel();
     let mut watcher = build_watcher(request.poll, sender)?;
