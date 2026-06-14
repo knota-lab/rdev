@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs};
+use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs, SyncArgs};
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{AppConfig, CONFIG_FILE_NAME};
 use crate::doctor::run_doctor;
@@ -9,13 +9,14 @@ use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
 use crate::process::SystemProcessRunner;
+use crate::sync::{RsyncSyncBackend, SyncRequest};
 
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
     match cli.command {
         Command::Init(args) => init(args, cwd),
         Command::Doctor => doctor(cwd),
         Command::Run(args) => run_command(args, cwd),
-        Command::Sync(_) => Ok("sync is not implemented yet".to_owned()),
+        Command::Sync(args) => sync(args, cwd),
         Command::Up(_) => Ok("up is not implemented yet".to_owned()),
         Command::Ssh(args) => ssh(args, cwd),
     }
@@ -59,6 +60,18 @@ fn run_command(args: RunArgs, cwd: &Path) -> Result<String> {
         sync_before_run: !args.no_sync,
     })?;
     Ok(format_command_output(output))
+}
+
+fn sync(args: SyncArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let runner = SystemProcessRunner::default();
+    let backend = RsyncSyncBackend::new(&config, &runner);
+    let report = backend.sync_full(SyncRequest {
+        dry_run: args.dry_run,
+        delete: config.sync.delete && !args.no_delete,
+        project_root: cwd.to_path_buf(),
+    })?;
+    Ok(report.format_text())
 }
 
 fn format_command_output(output: CommandExit) -> String {

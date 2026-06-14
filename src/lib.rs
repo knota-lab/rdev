@@ -11,3 +11,4 @@ pub mod error;
 pub mod error_info;
 pub mod path;
 pub mod process;
+pub mod sync;
