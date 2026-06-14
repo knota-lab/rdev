@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -20,6 +21,7 @@ pub struct UpRequest {
 }
 
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
+    let shutdown = install_shutdown_handler()?;
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
     let delta_backend = SftpDeltaBackend::new(config, runner);
@@ -48,7 +50,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     let debounce = Duration::from_millis(config.sync.debounce_ms);
     let mut pending = PendingChanges::default();
     let mut last_event_at = Instant::now();
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
@@ -68,11 +70,18 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
                 if pending.has_changes() && last_event_at.elapsed() >= debounce {
                     let changes = pending.take();
                     let changes = reconcile_existing_paths(changes, &local_root);
-                    let report = delta_backend.sync_delta(SyncDeltaRequest {
+                    let result = delta_backend.sync_delta(SyncDeltaRequest {
                         project_root: local_root.clone(),
                         uploads: changes.uploads.into_iter().collect(),
                         deletes: changes.deletes.into_iter().collect(),
-                    })?;
+                    });
+                    let report = match result {
+                        Ok(report) => report,
+                        Err(error) => {
+                            delta_backend.shutdown();
+                            return Err(error);
+                        }
+                    };
                     println!("{}", report.format_text());
                 }
             }
@@ -81,6 +90,19 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             }
         }
     }
+    delta_backend.shutdown();
+    println!("[watch] stopped");
+    Ok(())
+}
+
+fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        signal.store(true, Ordering::SeqCst);
+    })
+    .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    Ok(shutdown)
 }
 
 fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {

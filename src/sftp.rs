@@ -42,6 +42,18 @@ where
         Ok(SyncReport::completed_sftp(request.uploads, request.deletes))
     }
 
+    pub fn shutdown(&self) {
+        let command = ProcessCommand::new("ssh")
+            .arg("-O")
+            .arg("exit")
+            .arg("-o")
+            .arg(format!("ControlPath={}", self.control_path.display()))
+            .arg("-p")
+            .arg(self.config.remote.port.to_string())
+            .arg(self.config.remote.host.clone());
+        let _result = self.runner.output(command);
+    }
+
     fn upload_batch(&self, upload: UploadBatch<'_>) -> Result<()> {
         let batch = build_upload_batch(upload.project_root, upload.remote_root, upload.uploads);
         let batch_path = write_batch_file(&batch)?;
