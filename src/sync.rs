@@ -126,8 +126,28 @@ where
         if output.code == Some(0) {
             Ok(())
         } else {
-            Err(err(error_info::TOOL_RSYNC_NOT_FOUND).with_command(display))
+            Err(tool_rsync_error(output, display))
         }
+    }
+}
+
+fn tool_rsync_error(output: ProcessOutput, command: String) -> crate::error::RdevError {
+    let mut error = err(error_info::TOOL_RSYNC_NOT_FOUND)
+        .with_command(command)
+        .with_exit_code(output.code);
+    let hint = first_non_empty(&output.stderr, &output.stdout)
+        .unwrap_or("请确认 WSL 默认发行版可启动，并且其中 rsync 在 PATH 中");
+    error = error.with_hint(hint);
+    error
+}
+
+fn first_non_empty<'a>(first: &'a str, second: &'a str) -> Option<&'a str> {
+    if !first.is_empty() {
+        Some(first)
+    } else if !second.is_empty() {
+        Some(second)
+    } else {
+        None
     }
 }
 

@@ -180,10 +180,24 @@ fn check_wsl_rsync(runner: &impl ProcessRunner) -> Result<()> {
         Ok(output) if output.code == Some(0) => Ok(()),
         Ok(output) => Err(err(error_info::TOOL_RSYNC_NOT_FOUND)
             .with_command(display)
-            .with_hint(output.stderr)),
+            .with_exit_code(output.code)
+            .with_hint(
+                first_non_empty(&output.stderr, &output.stdout)
+                    .unwrap_or("请确认 WSL 默认发行版可启动，并且其中 rsync 在 PATH 中"),
+            )),
         Err(source) => Err(err_with_source(error_info::TOOL_RSYNC_NOT_FOUND, source)
             .with_command(display)
             .with_hint("请通过 WSL、MSYS2、Git Bash 或 Cygwin 提供 rsync，并确认 rsync 可运行")),
+    }
+}
+
+fn first_non_empty<'a>(first: &'a str, second: &'a str) -> Option<&'a str> {
+    if !first.is_empty() {
+        Some(first)
+    } else if !second.is_empty() {
+        Some(second)
+    } else {
+        None
     }
 }
 
