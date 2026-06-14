@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -20,6 +21,7 @@ pub trait ProcessRunner {
 pub struct ProcessCommand {
     program: String,
     args: Vec<String>,
+    current_dir: Option<PathBuf>,
 }
 
 impl ProcessCommand {
@@ -27,6 +29,7 @@ impl ProcessCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            current_dir: None,
         }
     }
 
@@ -37,6 +40,11 @@ impl ProcessCommand {
 
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn current_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(path.into());
         self
     }
 
@@ -52,6 +60,10 @@ impl ProcessCommand {
 
     pub fn args_slice(&self) -> &[String] {
         &self.args
+    }
+
+    pub fn current_dir_path(&self) -> Option<&PathBuf> {
+        self.current_dir.as_ref()
     }
 }
 
@@ -96,9 +108,12 @@ impl ProcessRunner for SystemProcessRunner {
 }
 
 fn run_output(command: ProcessCommand) -> io::Result<ProcessOutput> {
-    let output = Command::new(command.program())
-        .args(command.args_slice().iter().map(OsStr::new))
-        .output()?;
+    let mut process = Command::new(command.program());
+    process.args(command.args_slice().iter().map(OsStr::new));
+    if let Some(current_dir) = command.current_dir_path() {
+        process.current_dir(current_dir);
+    }
+    let output = process.output()?;
 
     Ok(ProcessOutput {
         code: output.status.code(),

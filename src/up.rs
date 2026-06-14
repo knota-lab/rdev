@@ -1,14 +1,15 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::config::AppConfig;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::process::ProcessRunner;
-use crate::sync::{RsyncSyncBackend, SyncRequest};
+use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
 
 #[derive(Debug, Clone)]
 pub struct UpRequest {
@@ -43,10 +44,10 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     }
 
     let debounce = Duration::from_millis(config.sync.debounce_ms);
-    let mut pending = false;
+    let mut pending = PendingChanges::default();
     let mut last_event_at = Instant::now();
     loop {
-        let timeout = if pending {
+        let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
             Duration::from_millis(500)
@@ -54,20 +55,23 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
 
         match receiver.recv_timeout(timeout) {
             Ok(event) => {
-                if should_process_event(&event, &local_root, &config.sync.exclude) {
-                    pending = true;
+                if let Some(changes) =
+                    collect_event_changes(&event, &local_root, &config.sync.exclude)
+                {
+                    pending.merge(changes);
                     last_event_at = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if pending && last_event_at.elapsed() >= debounce {
-                    let report = backend.sync_full(SyncRequest {
-                        dry_run: false,
-                        delete: config.sync.delete,
+                if pending.has_changes() && last_event_at.elapsed() >= debounce {
+                    let changes = pending.take();
+                    let changes = reconcile_existing_paths(changes, &local_root);
+                    let report = backend.sync_delta(SyncDeltaRequest {
                         project_root: local_root.clone(),
+                        uploads: changes.uploads.into_iter().collect(),
+                        deletes: changes.deletes.into_iter().collect(),
                     })?;
                     println!("{}", report.format_text());
-                    pending = false;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -103,11 +107,78 @@ fn resolve_local_root(project_root: &Path, local_path: &Path) -> PathBuf {
     }
 }
 
-fn should_process_event(event: &Event, local_root: &Path, excludes: &[String]) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| !is_excluded(path, local_root, excludes))
+#[derive(Debug, Default)]
+struct PendingChanges {
+    uploads: BTreeSet<PathBuf>,
+    deletes: BTreeSet<PathBuf>,
+}
+
+impl PendingChanges {
+    fn has_changes(&self) -> bool {
+        !self.uploads.is_empty() || !self.deletes.is_empty()
+    }
+
+    fn merge(&mut self, other: Self) {
+        for upload in other.uploads {
+            self.deletes.remove(&upload);
+            self.uploads.insert(upload);
+        }
+        for delete in other.deletes {
+            self.uploads.remove(&delete);
+            self.deletes.insert(delete);
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        Self {
+            uploads: std::mem::take(&mut self.uploads),
+            deletes: std::mem::take(&mut self.deletes),
+        }
+    }
+}
+
+fn collect_event_changes(
+    event: &Event,
+    local_root: &Path,
+    excludes: &[String],
+) -> Option<PendingChanges> {
+    let mut changes = PendingChanges::default();
+    for path in &event.paths {
+        if is_excluded(path, local_root, excludes) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(local_root) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        match event.kind {
+            EventKind::Remove(_) => {
+                changes.deletes.insert(relative.to_path_buf());
+            }
+            _ => {
+                changes.uploads.insert(relative.to_path_buf());
+            }
+        }
+    }
+    if changes.has_changes() {
+        Some(changes)
+    } else {
+        None
+    }
+}
+
+fn reconcile_existing_paths(mut changes: PendingChanges, local_root: &Path) -> PendingChanges {
+    let uploads = std::mem::take(&mut changes.uploads);
+    for upload in uploads {
+        if local_root.join(&upload).exists() {
+            changes.uploads.insert(upload);
+        } else {
+            changes.deletes.insert(upload);
+        }
+    }
+    changes
 }
 
 fn is_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
@@ -126,7 +197,7 @@ mod tests {
 
     use notify::{Event, EventKind};
 
-    use super::{is_excluded, resolve_local_root, should_process_event};
+    use super::{collect_event_changes, is_excluded, reconcile_existing_paths, resolve_local_root};
 
     #[test]
     fn resolves_relative_local_root() {
@@ -147,15 +218,49 @@ mod tests {
             attrs: notify::event::EventAttributes::new(),
         };
 
-        assert!(!should_process_event(
-            &event,
-            &local_root,
-            &["data".to_owned()]
-        ));
+        assert!(collect_event_changes(&event, &local_root, &["data".to_owned()]).is_none());
         assert!(is_excluded(
             &PathBuf::from("J:\\project\\data\\db"),
             &local_root,
             &["data".to_owned()]
         ));
+    }
+
+    #[test]
+    fn collects_upload_and_delete_changes() {
+        let local_root = PathBuf::from("J:\\project");
+        let modify = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![PathBuf::from("J:\\project\\src\\main.rs")],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        let remove = Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::File),
+            paths: vec![PathBuf::from("J:\\project\\src\\old.rs")],
+            attrs: notify::event::EventAttributes::new(),
+        };
+
+        let upload = collect_event_changes(&modify, &local_root, &[]);
+        let delete = collect_event_changes(&remove, &local_root, &[]);
+
+        assert!(upload.is_some());
+        assert!(delete.is_some());
+        let delete = match delete {
+            Some(delete) => delete,
+            None => panic!("delete should be collected"),
+        };
+        assert!(delete.deletes.contains(&PathBuf::from("src\\old.rs")));
+    }
+
+    #[test]
+    fn missing_pending_upload_becomes_delete() {
+        let local_root = PathBuf::from("J:\\project");
+        let mut changes = super::PendingChanges::default();
+        changes.uploads.insert(PathBuf::from("src\\gone.rs"));
+
+        let changes = reconcile_existing_paths(changes, &local_root);
+
+        assert!(changes.uploads.is_empty());
+        assert!(changes.deletes.contains(&PathBuf::from("src\\gone.rs")));
     }
 }

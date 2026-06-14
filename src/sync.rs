@@ -13,6 +13,13 @@ pub struct SyncRequest {
     pub project_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncDeltaRequest {
+    pub project_root: PathBuf,
+    pub uploads: Vec<PathBuf>,
+    pub deletes: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     mode: DetectedRsync,
@@ -81,6 +88,48 @@ where
         })
     }
 
+    pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
+        let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
+        let mode = self.detect_rsync()?;
+        let mut synced_roots = Vec::new();
+
+        for path in &request.uploads {
+            let build = DeltaCommandBuild {
+                config: self.config,
+                project_root: &request.project_root,
+                remote_root: &remote_root,
+                relative_path: path,
+            };
+            let command = build_delta_upload_command(build, mode);
+            let display = command.display();
+            let output = self.runner.output(command).map_err(|source| {
+                err_with_source(error_info::SYNC_RSYNC_FAILED, source).with_command(display.clone())
+            })?;
+            if output.code != Some(0) {
+                return Err(rsync_failed(output, display));
+            }
+            synced_roots.push(path.display().to_string());
+        }
+
+        for path in &request.deletes {
+            let command = build_remote_delete_command(self.config, &remote_root, path);
+            let display = command.display();
+            let output = self.runner.output(command).map_err(|source| {
+                err_with_source(error_info::SYNC_RSYNC_FAILED, source).with_command(display.clone())
+            })?;
+            if output.code != Some(0) {
+                return Err(rsync_failed(output, display));
+            }
+            synced_roots.push(path.display().to_string());
+        }
+
+        Ok(SyncReport {
+            mode,
+            synced_roots,
+            dry_run: false,
+        })
+    }
+
     fn detect_rsync(&self) -> Result<DetectedRsync> {
         match self.config.sync.rsync_mode {
             RsyncMode::Native => {
@@ -129,6 +178,95 @@ where
             Err(tool_rsync_error(output, display))
         }
     }
+}
+
+struct DeltaCommandBuild<'a> {
+    config: &'a AppConfig,
+    project_root: &'a Path,
+    remote_root: &'a RemotePath,
+    relative_path: &'a Path,
+}
+
+fn build_delta_upload_command(build: DeltaCommandBuild<'_>, mode: DetectedRsync) -> ProcessCommand {
+    match mode {
+        DetectedRsync::Native => ProcessCommand::new("rsync")
+            .args(delta_rsync_args(build.config))
+            .arg(path_to_forward_slashes(build.relative_path))
+            .arg(format!(
+                "{}:{}/",
+                build.config.remote.host,
+                build.remote_root.as_str()
+            ))
+            .current_dir(build.project_root.to_path_buf()),
+        DetectedRsync::Wsl => {
+            let root = if !build.config.sync.rsync_local_path.is_empty() {
+                build
+                    .config
+                    .sync
+                    .rsync_local_path
+                    .trim_end_matches('/')
+                    .to_owned()
+            } else {
+                windows_path_to_wsl(build.project_root)
+            };
+            let rel = path_to_forward_slashes(build.relative_path);
+            let remote = format!(
+                "{}:{}/",
+                build.config.remote.host,
+                build.remote_root.as_str()
+            );
+            let mut parts = vec![
+                "cd".to_owned(),
+                shell_quote(&root),
+                "&&".to_owned(),
+                "rsync".to_owned(),
+            ];
+            parts.extend(delta_rsync_args(build.config));
+            parts.push(shell_quote(&rel));
+            parts.push(shell_quote(&remote));
+            ProcessCommand::new("wsl")
+                .arg("bash")
+                .arg("-lc")
+                .arg(parts.join(" "))
+        }
+    }
+}
+
+fn build_remote_delete_command(
+    config: &AppConfig,
+    remote_root: &RemotePath,
+    relative_path: &Path,
+) -> ProcessCommand {
+    let remote_path = format!(
+        "{}/{}",
+        remote_root.as_str().trim_end_matches('/'),
+        path_to_forward_slashes(relative_path)
+    );
+    let remote_shell = format!(
+        "sh -lc {}",
+        shell_quote(&format!("rm -rf -- {}", shell_quote(&remote_path)))
+    );
+    ProcessCommand::new("ssh")
+        .arg("-p")
+        .arg(config.remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(config.remote.host.clone())
+        .arg(remote_shell)
+}
+
+fn delta_rsync_args(config: &AppConfig) -> Vec<String> {
+    let mut args = vec!["-azR".to_owned()];
+    args.extend(
+        config
+            .sync
+            .exclude
+            .iter()
+            .map(|exclude| format!("--exclude={exclude}")),
+    );
+    args
 }
 
 fn tool_rsync_error(output: ProcessOutput, command: String) -> crate::error::RdevError {
@@ -398,6 +536,46 @@ mod tests {
         assert_eq!(error.info.code, "sync.rsync_failed");
         assert_eq!(error.context.exit_code, Some(12));
         assert!(error.context.command.is_some());
+    }
+
+    #[test]
+    fn builds_wsl_delta_upload_command() {
+        let mut config = AppConfig::template("root@example.com", 22, "/root/project");
+        config.sync.rsync_mode = RsyncMode::Wsl;
+        let runner = FakeRunner::success(2);
+        let backend = RsyncSyncBackend::new(&config, &runner);
+
+        let report = backend.sync_delta(super::SyncDeltaRequest {
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            uploads: vec![PathBuf::from("src/main.rs")],
+            deletes: Vec::new(),
+        });
+
+        assert!(report.is_ok());
+        let commands = runner.commands.borrow();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].contains("rsync -azR"));
+        assert!(commands[1].contains("'src/main.rs'"));
+        assert!(commands[1].contains("'root@example.com:/root/project/'"));
+    }
+
+    #[test]
+    fn builds_remote_delete_command() {
+        let config = AppConfig::template("root@example.com", 22, "/root/project");
+        let runner = FakeRunner::success(2);
+        let backend = RsyncSyncBackend::new(&config, &runner);
+
+        let report = backend.sync_delta(super::SyncDeltaRequest {
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            uploads: Vec::new(),
+            deletes: vec![PathBuf::from("src/old.rs")],
+        });
+
+        assert!(report.is_ok());
+        let commands = runner.commands.borrow();
+        assert!(commands[1].contains("ssh"));
+        assert!(commands[1].contains("rm -rf --"));
+        assert!(commands[1].contains("/root/project/src/old.rs"));
     }
 
     #[test]
