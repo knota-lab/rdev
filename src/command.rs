@@ -92,6 +92,7 @@ fn ssh_run_command(
         shell_quote(remote_dir.as_str()),
         user_command
     );
+    let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
     ProcessCommand::new("ssh")
         .arg("-p")
         .arg(config.remote.port.to_string())
@@ -100,9 +101,7 @@ fn ssh_run_command(
         .arg("-o")
         .arg("ConnectTimeout=5")
         .arg(config.remote.host.clone())
-        .arg("sh")
-        .arg("-lc")
-        .arg(remote_command)
+        .arg(remote_shell)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -172,7 +171,9 @@ mod tests {
             None => panic!("command should be captured"),
         };
         assert!(command.contains("root@example.com"));
-        assert!(command.contains("cd '/root/project/backend' && cargo test"));
+        assert!(command.contains("sh -lc"));
+        assert!(command.contains("/root/project/backend"));
+        assert!(command.contains("cargo test"));
     }
 
     #[test]

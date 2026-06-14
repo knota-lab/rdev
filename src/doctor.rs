@@ -282,6 +282,7 @@ fn check_remote_command(
 }
 
 fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
+    let remote_shell = format!("sh -lc {}", shell_quote(remote_command));
     ProcessCommand::new("ssh")
         .arg("-p")
         .arg(remote.port.to_string())
@@ -290,9 +291,7 @@ fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
         .arg("-o")
         .arg("ConnectTimeout=5")
         .arg(remote.host.clone())
-        .arg("sh")
-        .arg("-lc")
-        .arg(remote_command)
+        .arg(remote_shell)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -373,6 +372,11 @@ mod tests {
         assert!(output.contains("config ok"));
         assert!(output.contains("remote.path.writable ok"));
         assert_eq!(runner.commands.borrow().len(), 5);
+        assert!(runner
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| command.contains("sh -lc")));
     }
 
     #[test]
