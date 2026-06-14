@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use crate::config::{AppConfig, RsyncMode};
@@ -50,6 +51,7 @@ enum DetectedRsync {
 pub struct RsyncSyncBackend<'a, R> {
     config: &'a AppConfig,
     runner: &'a R,
+    detected_rsync: Cell<Option<DetectedRsync>>,
 }
 
 impl<'a, R> RsyncSyncBackend<'a, R>
@@ -57,7 +59,11 @@ where
     R: ProcessRunner,
 {
     pub fn new(config: &'a AppConfig, runner: &'a R) -> Self {
-        Self { config, runner }
+        Self {
+            config,
+            runner,
+            detected_rsync: Cell::new(None),
+        }
     }
 
     pub fn sync_full(&self, request: SyncRequest) -> Result<SyncReport> {
@@ -131,7 +137,10 @@ where
     }
 
     fn detect_rsync(&self) -> Result<DetectedRsync> {
-        match self.config.sync.rsync_mode {
+        if let Some(mode) = self.detected_rsync.get() {
+            return Ok(mode);
+        }
+        let mode = match self.config.sync.rsync_mode {
             RsyncMode::Native => {
                 self.check_native_rsync()?;
                 Ok(DetectedRsync::Native)
@@ -147,7 +156,9 @@ where
                     Ok(DetectedRsync::Wsl)
                 }
             },
-        }
+        }?;
+        self.detected_rsync.set(Some(mode));
+        Ok(mode)
     }
 
     fn check_native_rsync(&self) -> Result<()> {
@@ -557,6 +568,33 @@ mod tests {
         assert!(commands[1].contains("rsync -azR"));
         assert!(commands[1].contains("'src/main.rs'"));
         assert!(commands[1].contains("'root@example.com:/root/project/'"));
+    }
+
+    #[test]
+    fn caches_detected_rsync_mode() {
+        let mut config = AppConfig::template("root@example.com", 22, "/root/project");
+        config.sync.rsync_mode = RsyncMode::Wsl;
+        let runner = FakeRunner::success(3);
+        let backend = RsyncSyncBackend::new(&config, &runner);
+
+        let first = backend.sync_delta(super::SyncDeltaRequest {
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            uploads: vec![PathBuf::from("src/main.rs")],
+            deletes: Vec::new(),
+        });
+        let second = backend.sync_delta(super::SyncDeltaRequest {
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            uploads: vec![PathBuf::from("src/lib.rs")],
+            deletes: Vec::new(),
+        });
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        let commands = runner.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert!(commands[0].contains("rsync --version"));
+        assert!(commands[1].contains("'src/main.rs'"));
+        assert!(commands[2].contains("'src/lib.rs'"));
     }
 
     #[test]
