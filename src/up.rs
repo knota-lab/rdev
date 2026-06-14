@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -18,6 +19,7 @@ use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
 
 const RDEV_DIR: &str = ".rdev";
 const STOP_FILE: &str = "stop";
+const PID_FILE: &str = "up.pid";
 
 #[derive(Debug, Clone)]
 pub struct UpRequest {
@@ -29,6 +31,7 @@ pub struct UpRequest {
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
     let shutdown = install_shutdown_handler()?;
     clear_stop_request(&request.project_root)?;
+    write_pid_file(&request.project_root)?;
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
     let delta_backend = SftpDeltaBackend::new(config, runner);
@@ -99,6 +102,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         }
     }
     println!("[watch] stopped");
+    clear_pid_file(&request.project_root)?;
     Ok(())
 }
 
@@ -107,7 +111,11 @@ pub fn request_stop(project_root: &Path) -> Result<()> {
     fs::create_dir_all(&dir)
         .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
     fs::write(dir.join(STOP_FILE), b"stop")
-        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if let Some(pid) = read_pid_file(project_root)? {
+        terminate_pid(pid)?;
+    }
+    Ok(())
 }
 
 fn clear_stop_request(project_root: &Path) -> Result<()> {
@@ -125,6 +133,76 @@ fn stop_requested(project_root: &Path) -> bool {
 
 fn stop_file(project_root: &Path) -> PathBuf {
     project_root.join(RDEV_DIR).join(STOP_FILE)
+}
+
+fn write_pid_file(project_root: &Path) -> Result<()> {
+    let dir = project_root.join(RDEV_DIR);
+    fs::create_dir_all(&dir)
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    fs::write(pid_file(project_root), std::process::id().to_string())
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
+}
+
+fn clear_pid_file(project_root: &Path) -> Result<()> {
+    let path = pid_file(project_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(err_with_source(error_info::WATCH_EVENT_FAILED, source)),
+    }
+}
+
+fn read_pid_file(project_root: &Path) -> Result<Option<u32>> {
+    let path = pid_file(project_root);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(err_with_source(error_info::WATCH_EVENT_FAILED, source)),
+    };
+    Ok(raw.trim().parse::<u32>().ok())
+}
+
+fn pid_file(project_root: &Path) -> PathBuf {
+    project_root.join(RDEV_DIR).join(PID_FILE)
+}
+
+fn terminate_pid(pid: u32) -> Result<()> {
+    if pid == std::process::id() {
+        return Ok(());
+    }
+    terminate_other_pid(pid)
+}
+
+#[cfg(windows)]
+fn terminate_other_pid(pid: u32) -> Result<()> {
+    let output = Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .arg("/T")
+        .arg("/F")
+        .output()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(err(error_info::WATCH_EVENT_FAILED)
+            .with_hint(String::from_utf8_lossy(&output.stderr).trim()))
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_other_pid(pid: u32) -> Result<()> {
+    let output = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .output()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(err(error_info::WATCH_EVENT_FAILED)
+            .with_hint(String::from_utf8_lossy(&output.stderr).trim()))
+    }
 }
 
 fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
