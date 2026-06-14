@@ -3,9 +3,11 @@ use std::path::Path;
 
 use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs};
 use crate::config::{AppConfig, CONFIG_FILE_NAME};
+use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
+use crate::process::SystemProcessRunner;
 
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
     match cli.command {
@@ -40,12 +42,9 @@ fn init(args: InitArgs, cwd: &Path) -> Result<String> {
 
 fn doctor(cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
-    RemotePath::parse(config.remote.path)?;
-    if config.sync.direction != crate::config::SyncDirection::Push {
-        return Err(err(error_info::CONFIG_INVALID)
-            .with_hint("sync.direction 目前只支持 push，pull/bidirectional 为预留值"));
-    }
-    Ok("doctor checks passed for config and path model".to_owned())
+    let runner = SystemProcessRunner;
+    let report = run_doctor(&config, &runner)?;
+    Ok(report.format_text())
 }
 
 fn run_command(args: RunArgs, cwd: &Path) -> Result<String> {

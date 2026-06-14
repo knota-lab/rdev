@@ -1,0 +1,305 @@
+use crate::config::{AppConfig, SyncDirection};
+use crate::error::{err, err_with_source, ErrorInfo, Result};
+use crate::error_info;
+use crate::path::RemotePath;
+use crate::process::{ProcessCommand, ProcessRunner};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    pub fn new(checks: Vec<DoctorCheck>) -> Self {
+        Self { checks }
+    }
+
+    pub fn format_text(&self) -> String {
+        self.checks
+            .iter()
+            .map(DoctorCheck::format_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCheck {
+    name: &'static str,
+    detail: String,
+}
+
+impl DoctorCheck {
+    pub fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            detail: detail.into(),
+        }
+    }
+
+    fn format_text(&self) -> String {
+        format!("[doctor] {} ok: {}", self.name, self.detail)
+    }
+}
+
+pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<DoctorReport> {
+    let mut checks = Vec::new();
+    validate_config(config)?;
+    checks.push(DoctorCheck::ok("config", "loaded .rdev.toml"));
+
+    let remote_path = RemotePath::parse(config.remote.path.as_str())?;
+    checks.push(DoctorCheck::ok("remote.path", remote_path.as_str()));
+
+    check_tool(
+        runner,
+        ToolCheck::new("ssh", error_info::TOOL_SSH_NOT_FOUND),
+    )?;
+    checks.push(DoctorCheck::ok("ssh", "available"));
+
+    check_tool(
+        runner,
+        ToolCheck::new("rsync", error_info::TOOL_RSYNC_NOT_FOUND),
+    )?;
+    checks.push(DoctorCheck::ok("rsync", "available"));
+
+    let remote = RemoteTarget::from_config(config);
+    check_remote_sh(runner, &remote)?;
+    checks.push(DoctorCheck::ok("remote.sh", "available"));
+
+    check_remote_rsync(runner, &remote)?;
+    checks.push(DoctorCheck::ok("remote.rsync", "available"));
+
+    check_remote_path_writable(runner, &remote, &remote_path)?;
+    checks.push(DoctorCheck::ok(
+        "remote.path.writable",
+        remote_path.as_str(),
+    ));
+
+    Ok(DoctorReport::new(checks))
+}
+
+fn validate_config(config: &AppConfig) -> Result<()> {
+    if config.sync.direction != SyncDirection::Push {
+        return Err(err(error_info::CONFIG_INVALID)
+            .with_hint("sync.direction 目前只支持 push，pull/bidirectional 为预留值"));
+    }
+    Ok(())
+}
+
+struct ToolCheck {
+    name: &'static str,
+    missing: ErrorInfo,
+}
+
+impl ToolCheck {
+    fn new(name: &'static str, missing: ErrorInfo) -> Self {
+        Self { name, missing }
+    }
+
+    fn version_command(&self) -> ProcessCommand {
+        match self.name {
+            "ssh" => ProcessCommand::new(self.name).arg("-V"),
+            _ => ProcessCommand::new(self.name).arg("--version"),
+        }
+    }
+
+    fn install_hint(&self) -> &'static str {
+        match self.name {
+            "ssh" => "请安装或启用 OpenSSH，并确认 ssh 在 PATH 中",
+            "rsync" => "请通过 WSL、MSYS2、Git Bash 或 Cygwin 提供 rsync，并确认 rsync 在 PATH 中",
+            _ => "请安装缺失工具，并确认它在 PATH 中",
+        }
+    }
+}
+
+fn check_tool(runner: &impl ProcessRunner, tool: ToolCheck) -> Result<()> {
+    let command = tool.version_command();
+    let display = command.display();
+    match runner.output(command) {
+        Ok(_) => Ok(()),
+        Err(source) => Err(err_with_source(tool.missing, source)
+            .with_command(display)
+            .with_hint(tool.install_hint())),
+    }
+}
+
+#[derive(Debug)]
+struct RemoteTarget {
+    host: String,
+    port: u16,
+}
+
+impl RemoteTarget {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            host: config.remote.host.clone(),
+            port: config.remote.port,
+        }
+    }
+}
+
+fn check_remote_sh(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(
+            remote,
+            "command -v sh",
+            error_info::REMOTE_SSH_CONNECT_FAILED,
+        ),
+    )
+}
+
+fn check_remote_rsync(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(
+            remote,
+            "command -v rsync",
+            error_info::REMOTE_COMMAND_FAILED,
+        ),
+    )
+}
+
+fn check_remote_path_writable(
+    runner: &impl ProcessRunner,
+    remote: &RemoteTarget,
+    path: &RemotePath,
+) -> Result<()> {
+    let command = format!(
+        "mkdir -p {} && test -w {}",
+        shell_quote(path.as_str()),
+        shell_quote(path.as_str())
+    );
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(remote, command, error_info::REMOTE_PATH_NOT_WRITABLE),
+    )
+}
+
+struct RemoteCheckRequest<'a> {
+    remote: &'a RemoteTarget,
+    remote_command: String,
+    error_info: ErrorInfo,
+}
+
+impl<'a> RemoteCheckRequest<'a> {
+    fn new(
+        remote: &'a RemoteTarget,
+        remote_command: impl Into<String>,
+        error_info: ErrorInfo,
+    ) -> Self {
+        Self {
+            remote,
+            remote_command: remote_command.into(),
+            error_info,
+        }
+    }
+}
+
+fn check_remote_command(
+    runner: &impl ProcessRunner,
+    request: RemoteCheckRequest<'_>,
+) -> Result<()> {
+    let command = ssh_command(request.remote, &request.remote_command);
+    let display = command.display();
+    let output = runner.output(command).map_err(|source| {
+        err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
+            .with_remote(request.remote.host.clone())
+            .with_command(display.clone())
+    })?;
+    if output.code == Some(0) {
+        Ok(())
+    } else {
+        Err(err(request.error_info)
+            .with_remote(request.remote.host.clone())
+            .with_command(display)
+            .with_hint(output.stderr))
+    }
+}
+
+fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
+    ProcessCommand::new("ssh")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg(remote.host.clone())
+        .arg("sh")
+        .arg("-lc")
+        .arg(remote_command)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use crate::config::AppConfig;
+    use crate::process::{ProcessCommand, ProcessOutput, ProcessRunner};
+
+    use super::run_doctor;
+
+    #[derive(Debug)]
+    struct FakeRunner {
+        outputs: RefCell<VecDeque<ProcessOutput>>,
+        commands: RefCell<Vec<String>>,
+    }
+
+    impl FakeRunner {
+        fn success(count: usize) -> Self {
+            let outputs = (0..count)
+                .map(|_| ProcessOutput {
+                    code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+                .collect();
+            Self {
+                outputs: RefCell::new(outputs),
+                commands: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessRunner for FakeRunner {
+        fn output(&self, command: ProcessCommand) -> std::io::Result<ProcessOutput> {
+            self.commands.borrow_mut().push(command.display());
+            let output = self.outputs.borrow_mut().pop_front();
+            match output {
+                Some(output) => Ok(output),
+                None => panic!("fake output missing"),
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_runs_expected_checks() {
+        let config = AppConfig::template("root@example.com", 22, "/root/project");
+        let runner = FakeRunner::success(5);
+
+        let report = run_doctor(&config, &runner);
+
+        assert!(report.is_ok());
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => panic!("doctor should pass: {error}"),
+        };
+        let output = report.format_text();
+        assert!(output.contains("config ok"));
+        assert!(output.contains("remote.path.writable ok"));
+        assert_eq!(runner.commands.borrow().len(), 5);
+    }
+
+    #[test]
+    fn doctor_rejects_unsafe_remote_path_before_running_commands() {
+        let config = AppConfig::template("root@example.com", 22, "/root");
+        let runner = FakeRunner::success(5);
+
+        let report = run_doctor(&config, &runner);
+
+        assert!(report.is_err());
+        assert!(runner.commands.borrow().is_empty());
+    }
+}

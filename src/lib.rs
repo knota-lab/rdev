@@ -5,6 +5,8 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod error_info;
 pub mod path;
+pub mod process;
