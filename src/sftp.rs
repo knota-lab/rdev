@@ -2,6 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command as StdCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::error::{err_with_source, Result};
@@ -27,7 +29,7 @@ where
             config,
             runner,
             control_path: control_path(config),
-            control_enabled: Cell::new(true),
+            control_enabled: Cell::new(false),
             session: RefCell::new(None),
         }
     }
@@ -55,15 +57,6 @@ where
         if let Some(mut session) = self.session.replace(None) {
             session.shutdown();
         }
-        let command = ProcessCommand::new("ssh")
-            .arg("-O")
-            .arg("exit")
-            .arg("-o")
-            .arg(format!("ControlPath={}", self.control_path.display()))
-            .arg("-p")
-            .arg(self.config.remote.port.to_string())
-            .arg(self.config.remote.host.clone());
-        let _result = self.runner.output(command);
     }
 
     fn upload_batch(&self, upload: UploadBatch<'_>) -> Result<()> {
@@ -119,7 +112,7 @@ where
 
 struct PersistentSftpSession {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
 }
 
 impl PersistentSftpSession {
@@ -140,14 +133,20 @@ impl PersistentSftpSession {
             Some(stdin) => stdin,
             None => return Err(crate::error::err(error_info::SYNC_SFTP_FAILED)),
         };
-        Ok(Self { child, stdin })
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+        })
     }
 
     fn write_batch(&mut self, batch: &str) -> Result<()> {
-        self.stdin
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(crate::error::err(error_info::SYNC_SFTP_FAILED));
+        };
+        stdin
             .write_all(batch.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))
     }
 
@@ -159,10 +158,24 @@ impl PersistentSftpSession {
     }
 
     fn shutdown(&mut self) {
-        let _write_result = self.stdin.write_all(b"bye\n");
-        let _flush_result = self.stdin.flush();
-        if self.child.wait().is_err() {
-            let _kill_result = self.child.kill();
+        if let Some(mut stdin) = self.stdin.take() {
+            let _write_result = stdin.write_all(b"bye\n");
+            let _flush_result = stdin.flush();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) | Err(_) => {
+                    let _kill_result = self.child.kill();
+                    let _wait_result = self.child.wait();
+                    return;
+                }
+            }
         }
     }
 }
