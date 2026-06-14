@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,7 @@ pub struct SftpDeltaBackend<'a, R> {
     config: &'a AppConfig,
     runner: &'a R,
     control_path: PathBuf,
+    control_enabled: Cell<bool>,
 }
 
 impl<'a, R> SftpDeltaBackend<'a, R>
@@ -24,6 +26,7 @@ where
             config,
             runner,
             control_path: control_path(config),
+            control_enabled: Cell::new(true),
         }
     }
 
@@ -63,24 +66,32 @@ where
     }
 
     fn run_sftp_batch(&self, batch_path: &Path) -> Result<()> {
-        let command = ProcessCommand::new("sftp")
-            .args(control_options(&self.control_path))
-            .arg("-b")
-            .arg(batch_path.display().to_string())
-            .arg("-P")
-            .arg(self.config.remote.port.to_string())
-            .arg(self.config.remote.host.clone());
+        let command = self.sftp_command(batch_path, self.control_enabled.get());
         let display = command.display();
         let output = self.runner.output(command).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
         })?;
+        if should_retry_without_control(&output) && self.control_enabled.get() {
+            self.control_enabled.set(false);
+            let retry = self.sftp_command(batch_path, false);
+            let retry_display = retry.display();
+            let retry_output = self.runner.output(retry).map_err(|source| {
+                err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                    .with_command(retry_display.clone())
+            })?;
+            return check_output(retry_output, retry_display);
+        }
         check_output(output, display)
     }
 
     fn delete_batch(&self, remote_root: &RemotePath, deletes: &[PathBuf]) -> Result<()> {
         let command = build_delete_command(DeleteBatch {
             config: self.config,
-            control_path: &self.control_path,
+            control_path: if self.control_enabled.get() {
+                Some(self.control_path.as_path())
+            } else {
+                None
+            },
             remote_root,
             deletes,
         });
@@ -89,6 +100,19 @@ where
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
         })?;
         check_output(output, display)
+    }
+
+    fn sftp_command(&self, batch_path: &Path, use_control: bool) -> ProcessCommand {
+        let mut command = ProcessCommand::new("sftp");
+        if use_control {
+            command = command.args(control_options(&self.control_path));
+        }
+        command
+            .arg("-b")
+            .arg(batch_path.display().to_string())
+            .arg("-P")
+            .arg(self.config.remote.port.to_string())
+            .arg(self.config.remote.host.clone())
     }
 }
 
@@ -140,7 +164,7 @@ fn mkdir_lines(dir: &Path) -> Vec<String> {
 
 struct DeleteBatch<'a> {
     config: &'a AppConfig,
-    control_path: &'a Path,
+    control_path: Option<&'a Path>,
     remote_root: &'a RemotePath,
     deletes: &'a [PathBuf],
 }
@@ -156,8 +180,11 @@ fn build_delete_command(delete: DeleteBatch<'_>) -> ProcessCommand {
         .collect::<Vec<_>>()
         .join(" && ");
     let remote_shell = format!("sh -lc {}", shell_quote(&delete_commands));
-    ProcessCommand::new("ssh")
-        .args(control_options(delete.control_path))
+    let mut command = ProcessCommand::new("ssh");
+    if let Some(control_path) = delete.control_path {
+        command = command.args(control_options(control_path));
+    }
+    command
         .arg("-p")
         .arg(delete.config.remote.port.to_string())
         .arg("-o")
@@ -215,6 +242,14 @@ fn check_output(output: ProcessOutput, command: String) -> Result<()> {
         }
         Err(error)
     }
+}
+
+fn should_retry_without_control(output: &ProcessOutput) -> bool {
+    output.code == Some(255)
+        && (output.stderr.contains("getsockname failed")
+            || output.stderr.contains("mux_client")
+            || output.stderr.contains("Control socket")
+            || output.stderr.contains("Connection closed"))
 }
 
 fn remote_path(remote_root: &RemotePath, relative_path: &Path) -> String {
@@ -278,7 +313,7 @@ mod tests {
         let deletes = [PathBuf::from("src\\old.rs")];
         let command = build_delete_command(DeleteBatch {
             config: &config,
-            control_path: &control_path(&config),
+            control_path: Some(&control_path(&config)),
             remote_root: &root,
             deletes: &deletes,
         });

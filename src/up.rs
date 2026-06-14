@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::config::AppConfig;
-use crate::error::{err, err_with_source, Result};
+use crate::error::{err, err_with_source, format_error, Result};
 use crate::error_info;
 use crate::process::ProcessRunner;
 use crate::sftp::SftpDeltaBackend;
@@ -78,8 +78,8 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
                     let report = match result {
                         Ok(report) => report,
                         Err(error) => {
-                            delta_backend.shutdown();
-                            return Err(error);
+                            eprintln!("{}", format_error(&error));
+                            continue;
                         }
                     };
                     println!("{}", report.format_text());
