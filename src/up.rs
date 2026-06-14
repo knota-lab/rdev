@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,9 @@ use crate::process::ProcessRunner;
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
 
+const RDEV_DIR: &str = ".rdev";
+const STOP_FILE: &str = "stop";
+
 #[derive(Debug, Clone)]
 pub struct UpRequest {
     pub project_root: PathBuf,
@@ -24,6 +28,7 @@ pub struct UpRequest {
 
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
     let shutdown = install_shutdown_handler()?;
+    clear_stop_request(&request.project_root)?;
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
     let delta_backend = SftpDeltaBackend::new(config, runner);
@@ -53,7 +58,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     let debounce = Duration::from_millis(config.sync.debounce_ms.max(1000));
     let mut pending = PendingChanges::default();
     let mut last_event_at = Instant::now();
-    while !shutdown.load(Ordering::SeqCst) {
+    while !shutdown.load(Ordering::SeqCst) && !stop_requested(&request.project_root) {
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
@@ -95,6 +100,31 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     }
     println!("[watch] stopped");
     Ok(())
+}
+
+pub fn request_stop(project_root: &Path) -> Result<()> {
+    let dir = project_root.join(RDEV_DIR);
+    fs::create_dir_all(&dir)
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    fs::write(dir.join(STOP_FILE), b"stop")
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
+}
+
+fn clear_stop_request(project_root: &Path) -> Result<()> {
+    let path = stop_file(project_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(err_with_source(error_info::WATCH_EVENT_FAILED, source)),
+    }
+}
+
+fn stop_requested(project_root: &Path) -> bool {
+    stop_file(project_root).exists()
+}
+
+fn stop_file(project_root: &Path) -> PathBuf {
+    project_root.join(RDEV_DIR).join(STOP_FILE)
 }
 
 fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
@@ -240,7 +270,10 @@ mod tests {
 
     use notify::{Event, EventKind};
 
-    use super::{collect_event_changes, is_excluded, reconcile_existing_paths, resolve_local_root};
+    use super::{
+        collect_event_changes, is_excluded, reconcile_existing_paths, request_stop,
+        resolve_local_root, stop_requested,
+    };
 
     #[test]
     fn resolves_relative_local_root() {
@@ -305,5 +338,17 @@ mod tests {
 
         assert!(changes.uploads.is_empty());
         assert!(changes.deletes.contains(&PathBuf::from("src\\gone.rs")));
+    }
+
+    #[test]
+    fn stop_file_requests_shutdown() {
+        let root = std::env::temp_dir().join(format!("rdev-stop-test-{}", std::process::id()));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        let result = request_stop(&root);
+
+        assert!(result.is_ok());
+        assert!(stop_requested(&root));
+
+        let _cleanup_after = std::fs::remove_dir_all(&root);
     }
 }
