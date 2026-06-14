@@ -1,210 +1,172 @@
-use std::fs::File;
-use std::io;
-use std::net::TcpStream;
+use std::fs;
 use std::path::{Path, PathBuf};
-
-use ssh2::{Session, Sftp};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::AppConfig;
-use crate::error::{err, err_with_source, Result};
+use crate::error::{err_with_source, Result};
 use crate::error_info;
 use crate::path::RemotePath;
+use crate::process::{ProcessCommand, ProcessOutput, ProcessRunner};
 use crate::sync::{SyncDeltaRequest, SyncReport};
 
-pub struct SftpDeltaBackend<'a> {
+pub struct SftpDeltaBackend<'a, R> {
     config: &'a AppConfig,
-    client: Option<SftpClient>,
+    runner: &'a R,
 }
 
-impl<'a> SftpDeltaBackend<'a> {
-    pub fn new(config: &'a AppConfig) -> Self {
-        Self {
-            config,
-            client: None,
-        }
+impl<'a, R> SftpDeltaBackend<'a, R>
+where
+    R: ProcessRunner,
+{
+    pub fn new(config: &'a AppConfig, runner: &'a R) -> Self {
+        Self { config, runner }
     }
 
-    pub fn sync_delta(&mut self, request: SyncDeltaRequest) -> Result<SyncReport> {
+    pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
-        let client = self.client()?;
-
-        for path in &request.uploads {
-            let local_path = request.project_root.join(path);
-            let remote_path = remote_path(&remote_root, path);
-            client.upload(&local_path, Path::new(&remote_path))?;
+        if !request.uploads.is_empty() {
+            self.upload_batch(UploadBatch {
+                project_root: &request.project_root,
+                remote_root: &remote_root,
+                uploads: &request.uploads,
+            })?;
         }
-
-        for path in &request.deletes {
-            let remote_path = remote_path(&remote_root, path);
-            client.remove(Path::new(&remote_path))?;
+        if !request.deletes.is_empty() {
+            self.delete_batch(&remote_root, &request.deletes)?;
         }
-
         Ok(SyncReport::completed_sftp(request.uploads, request.deletes))
     }
 
-    fn client(&mut self) -> Result<&mut SftpClient> {
-        if self.client.is_none() {
-            self.client = Some(SftpClient::connect(self.config)?);
-        }
-        match self.client.as_mut() {
-            Some(client) => Ok(client),
-            None => Err(err(error_info::INTERNAL_UNEXPECTED)),
-        }
+    fn upload_batch(&self, upload: UploadBatch<'_>) -> Result<()> {
+        let batch = build_upload_batch(upload.project_root, upload.remote_root, upload.uploads);
+        let batch_path = write_batch_file(&batch)?;
+        let result = self.run_sftp_batch(&batch_path);
+        let _remove_result = fs::remove_file(&batch_path);
+        result
+    }
+
+    fn run_sftp_batch(&self, batch_path: &Path) -> Result<()> {
+        let command = ProcessCommand::new("sftp")
+            .arg("-b")
+            .arg(batch_path.display().to_string())
+            .arg("-P")
+            .arg(self.config.remote.port.to_string())
+            .arg(self.config.remote.host.clone());
+        let display = command.display();
+        let output = self.runner.output(command).map_err(|source| {
+            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
+        })?;
+        check_output(output, display)
+    }
+
+    fn delete_batch(&self, remote_root: &RemotePath, deletes: &[PathBuf]) -> Result<()> {
+        let command = build_delete_command(self.config, remote_root, deletes);
+        let display = command.display();
+        let output = self.runner.output(command).map_err(|source| {
+            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
+        })?;
+        check_output(output, display)
     }
 }
 
-struct SftpClient {
-    session: Session,
-    sftp: Sftp,
+struct UploadBatch<'a> {
+    project_root: &'a Path,
+    remote_root: &'a RemotePath,
+    uploads: &'a [PathBuf],
 }
 
-impl SftpClient {
-    fn connect(config: &AppConfig) -> Result<Self> {
-        let endpoint = SshEndpoint::parse(&config.remote.host, config.remote.port);
-        let tcp = TcpStream::connect(endpoint.address()).map_err(|source| {
-            err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
-                .with_remote(config.remote.host.clone())
-        })?;
-        let mut session = Session::new()
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        session.set_tcp_stream(tcp);
-        session.handshake().map_err(|source| {
-            err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
-                .with_remote(config.remote.host.clone())
-        })?;
-        authenticate(&session, &endpoint.user, config)?;
-        let sftp = session
-            .sftp()
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        Ok(Self { session, sftp })
-    }
-
-    fn upload(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
+fn build_upload_batch(
+    project_root: &Path,
+    remote_root: &RemotePath,
+    uploads: &[PathBuf],
+) -> String {
+    let mut lines = Vec::new();
+    for relative in uploads {
+        let local_path = project_root.join(relative);
+        let remote_path = remote_path(remote_root, relative);
         if local_path.is_dir() {
-            return ensure_dir(&self.sftp, remote_path);
-        }
-        ensure_parent_dir(&self.sftp, remote_path)?;
-        let mut local = File::open(local_path).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(local_path.display())
-        })?;
-        let mut remote = self.sftp.create(remote_path).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
-        })?;
-        io::copy(&mut local, &mut remote).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
-        })?;
-        Ok(())
-    }
-
-    fn remove(&mut self, remote_path: &Path) -> Result<()> {
-        let command = format!(
-            "rm -rf -- {}",
-            shell_quote(&remote_path.display().to_string())
-        );
-        let mut channel = self
-            .session
-            .channel_session()
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        channel
-            .exec(&command)
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        channel
-            .wait_close()
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        let code = channel.exit_status().map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(command.clone())
-        })?;
-        if code == 0 {
-            Ok(())
+            lines.extend(mkdir_lines(Path::new(&remote_path)));
         } else {
-            Err(err(error_info::SYNC_SFTP_FAILED)
-                .with_command(command)
-                .with_exit_code(Some(code)))
+            if let Some(parent) = Path::new(&remote_path).parent() {
+                lines.extend(mkdir_lines(parent));
+            }
+            lines.push(format!(
+                "put {} {}",
+                batch_quote(&local_path.display().to_string()),
+                batch_quote(&remote_path)
+            ));
         }
     }
+    lines.push("bye".to_owned());
+    lines.join("\n")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SshEndpoint {
-    user: String,
-    host: String,
-    port: u16,
-}
-
-impl SshEndpoint {
-    fn parse(remote: &str, port: u16) -> Self {
-        let (user, host) = match remote.split_once('@') {
-            Some((user, host)) => (user.to_owned(), host.to_owned()),
-            None => (default_user(), remote.to_owned()),
-        };
-        Self { user, host, port }
-    }
-
-    fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-}
-
-fn authenticate(session: &Session, user: &str, config: &AppConfig) -> Result<()> {
-    if session.userauth_agent(user).is_ok() && session.authenticated() {
-        return Ok(());
-    }
-
-    for key in default_private_keys() {
-        if key.exists()
-            && session.userauth_pubkey_file(user, None, &key, None).is_ok()
-            && session.authenticated()
-        {
-            return Ok(());
-        }
-    }
-
-    Err(err(error_info::REMOTE_SSH_CONNECT_FAILED)
-        .with_remote(config.remote.host.clone())
-        .with_hint("SFTP 目前支持 ssh-agent 或默认私钥 id_ed25519/id_rsa"))
-}
-
-fn default_private_keys() -> Vec<PathBuf> {
-    let mut keys = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        let ssh = PathBuf::from(home).join(".ssh");
-        keys.push(ssh.join("id_ed25519"));
-        keys.push(ssh.join("id_rsa"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let ssh = PathBuf::from(home).join(".ssh");
-        keys.push(ssh.join("id_ed25519"));
-        keys.push(ssh.join("id_rsa"));
-    }
-    keys
-}
-
-fn ensure_parent_dir(sftp: &Sftp, remote_path: &Path) -> Result<()> {
-    let Some(parent) = remote_path.parent() else {
-        return Ok(());
-    };
-    ensure_dir(sftp, parent)
-}
-
-fn ensure_dir(sftp: &Sftp, dir: &Path) -> Result<()> {
+fn mkdir_lines(dir: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
     let mut current = PathBuf::new();
     for component in dir.components() {
         current.push(component.as_os_str());
-        let path = current.as_path();
-        if path.as_os_str().is_empty() {
+        let path = current.display().to_string().replace('\\', "/");
+        if path == "/" || path.is_empty() {
             continue;
         }
-        match sftp.mkdir(path, 0o755) {
-            Ok(()) => {}
-            Err(_) if sftp.stat(path).is_ok() => {}
-            Err(source) => {
-                return Err(
-                    err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(path.display())
-                );
-            }
-        }
+        lines.push(format!("-mkdir {}", batch_quote(&path)));
     }
-    Ok(())
+    lines
+}
+
+fn build_delete_command(
+    config: &AppConfig,
+    remote_root: &RemotePath,
+    deletes: &[PathBuf],
+) -> ProcessCommand {
+    let delete_commands = deletes
+        .iter()
+        .map(|path| {
+            let path = remote_path(remote_root, path);
+            format!("rm -rf -- {}", shell_quote(&path))
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let remote_shell = format!("sh -lc {}", shell_quote(&delete_commands));
+    ProcessCommand::new("ssh")
+        .arg("-p")
+        .arg(config.remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(config.remote.host.clone())
+        .arg(remote_shell)
+}
+
+fn write_batch_file(batch: &str) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("rdev-sftp-{}.batch", batch_id()));
+    fs::write(&path, batch).map_err(|source| {
+        err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(path.display())
+    })?;
+    Ok(path)
+}
+
+fn batch_id() -> u128 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    }
+}
+
+fn check_output(output: ProcessOutput, command: String) -> Result<()> {
+    if output.code == Some(0) {
+        Ok(())
+    } else {
+        let mut error = crate::error::err(error_info::SYNC_SFTP_FAILED)
+            .with_command(command)
+            .with_exit_code(output.code);
+        if !output.stderr.is_empty() {
+            error = error.with_hint(output.stderr);
+        }
+        Err(error)
+    }
 }
 
 fn remote_path(remote_root: &RemotePath, relative_path: &Path) -> String {
@@ -229,10 +191,8 @@ fn path_to_forward_slashes(path: &Path) -> String {
         .join("/")
 }
 
-fn default_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "root".to_owned())
+fn batch_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -243,29 +203,52 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::config::AppConfig;
     use crate::path::RemotePath;
 
-    use super::{remote_path, SshEndpoint};
+    use super::{build_delete_command, build_upload_batch, remote_path};
 
     #[test]
-    fn parses_user_host_endpoint() {
-        let endpoint = SshEndpoint::parse("root@10.0.0.2", 2222);
+    fn builds_upload_batch_with_parent_dirs() {
+        let root = parse_root();
+        let batch = build_upload_batch(
+            &PathBuf::from("J:\\project"),
+            &root,
+            &[PathBuf::from("src\\main.rs")],
+        );
 
-        assert_eq!(endpoint.user, "root");
-        assert_eq!(endpoint.host, "10.0.0.2");
-        assert_eq!(endpoint.address(), "10.0.0.2:2222");
+        assert!(batch.contains("-mkdir \"/rdev\""));
+        assert!(batch.contains("-mkdir \"/rdev/project/src\""));
+        assert!(batch.contains("put \"J:\\project\\src\\main.rs\" \"/rdev/project/src/main.rs\""));
+    }
+
+    #[test]
+    fn builds_delete_command() {
+        let root = parse_root();
+        let config = AppConfig::template("root@example.com", 22, "/rdev/project");
+
+        let command = build_delete_command(&config, &root, &[PathBuf::from("src\\old.rs")]);
+
+        let display = command.display();
+        assert!(display.contains("ssh"));
+        assert!(display.contains("rm -rf --"));
+        assert!(display.contains("/rdev/project/src/old.rs"));
     }
 
     #[test]
     fn builds_remote_path_with_forward_slashes() {
-        let root = match RemotePath::parse("/rdev/project") {
-            Ok(root) => root,
-            Err(error) => panic!("remote path should parse: {error}"),
-        };
+        let root = parse_root();
 
         assert_eq!(
             remote_path(&root, &PathBuf::from("src\\main.rs")),
             "/rdev/project/src/main.rs"
         );
+    }
+
+    fn parse_root() -> RemotePath {
+        match RemotePath::parse("/rdev/project") {
+            Ok(root) => root,
+            Err(error) => panic!("remote path should parse: {error}"),
+        }
     }
 }

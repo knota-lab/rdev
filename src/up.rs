@@ -22,7 +22,7 @@ pub struct UpRequest {
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
-    let mut delta_backend = SftpDeltaBackend::new(config);
+    let delta_backend = SftpDeltaBackend::new(config, runner);
     if request.initial_sync {
         let report = rsync_backend.sync_full(SyncRequest {
             dry_run: false,
