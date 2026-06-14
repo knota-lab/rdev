@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -34,6 +36,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         println!("{}", report.format_text());
     }
     let (sender, receiver) = mpsc::channel();
+    install_stdin_shutdown(Arc::clone(&shutdown));
     let mut watcher = build_watcher(request.poll, sender)?;
     for watch_dir in &config.sync.watch_dirs {
         let watch_path = local_root.join(watch_dir);
@@ -45,8 +48,9 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             })?;
         println!("[watch] {}", watch_path.display());
     }
+    println!("[watch] press q then Enter to stop");
 
-    let debounce = Duration::from_millis(config.sync.debounce_ms);
+    let debounce = Duration::from_millis(config.sync.debounce_ms.max(1000));
     let mut pending = PendingChanges::default();
     let mut last_event_at = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -101,6 +105,23 @@ fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
     })
     .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
     Ok(shutdown)
+}
+
+fn install_stdin_shutdown(shutdown: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if line.trim().eq_ignore_ascii_case("q") => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
 }
 
 fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {
