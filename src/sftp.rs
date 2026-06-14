@@ -5,6 +5,9 @@ use std::process::{Child, ChildStdin, Command as StdCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::config::AppConfig;
 use crate::error::{err_with_source, Result};
 use crate::error_info;
@@ -117,7 +120,8 @@ struct PersistentSftpSession {
 
 impl PersistentSftpSession {
     fn connect(config: &AppConfig) -> Result<Self> {
-        let mut child = StdCommand::new("sftp")
+        let mut command = StdCommand::new("sftp");
+        command
             .arg("-q")
             .arg("-b")
             .arg("-")
@@ -126,7 +130,9 @@ impl PersistentSftpSession {
             .arg(config.remote.host.clone())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        configure_sftp_process(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
         let stdin = match child.stdin.take() {
@@ -179,6 +185,15 @@ impl PersistentSftpSession {
         }
     }
 }
+
+#[cfg(windows)]
+fn configure_sftp_process(command: &mut StdCommand) {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(windows))]
+fn configure_sftp_process(_command: &mut StdCommand) {}
 
 struct UploadBatch<'a> {
     project_root: &'a Path,
