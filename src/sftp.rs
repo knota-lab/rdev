@@ -12,6 +12,7 @@ use crate::sync::{SyncDeltaRequest, SyncReport};
 pub struct SftpDeltaBackend<'a, R> {
     config: &'a AppConfig,
     runner: &'a R,
+    control_path: PathBuf,
 }
 
 impl<'a, R> SftpDeltaBackend<'a, R>
@@ -19,7 +20,11 @@ where
     R: ProcessRunner,
 {
     pub fn new(config: &'a AppConfig, runner: &'a R) -> Self {
-        Self { config, runner }
+        Self {
+            config,
+            runner,
+            control_path: control_path(config),
+        }
     }
 
     pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
@@ -47,6 +52,7 @@ where
 
     fn run_sftp_batch(&self, batch_path: &Path) -> Result<()> {
         let command = ProcessCommand::new("sftp")
+            .args(control_options(&self.control_path))
             .arg("-b")
             .arg(batch_path.display().to_string())
             .arg("-P")
@@ -60,7 +66,12 @@ where
     }
 
     fn delete_batch(&self, remote_root: &RemotePath, deletes: &[PathBuf]) -> Result<()> {
-        let command = build_delete_command(self.config, remote_root, deletes);
+        let command = build_delete_command(DeleteBatch {
+            config: self.config,
+            control_path: &self.control_path,
+            remote_root,
+            deletes,
+        });
         let display = command.display();
         let output = self.runner.output(command).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_command(display.clone())
@@ -115,28 +126,33 @@ fn mkdir_lines(dir: &Path) -> Vec<String> {
     lines
 }
 
-fn build_delete_command(
-    config: &AppConfig,
-    remote_root: &RemotePath,
-    deletes: &[PathBuf],
-) -> ProcessCommand {
-    let delete_commands = deletes
+struct DeleteBatch<'a> {
+    config: &'a AppConfig,
+    control_path: &'a Path,
+    remote_root: &'a RemotePath,
+    deletes: &'a [PathBuf],
+}
+
+fn build_delete_command(delete: DeleteBatch<'_>) -> ProcessCommand {
+    let delete_commands = delete
+        .deletes
         .iter()
         .map(|path| {
-            let path = remote_path(remote_root, path);
+            let path = remote_path(delete.remote_root, path);
             format!("rm -rf -- {}", shell_quote(&path))
         })
         .collect::<Vec<_>>()
         .join(" && ");
     let remote_shell = format!("sh -lc {}", shell_quote(&delete_commands));
     ProcessCommand::new("ssh")
+        .args(control_options(delete.control_path))
         .arg("-p")
-        .arg(config.remote.port.to_string())
+        .arg(delete.config.remote.port.to_string())
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=5")
-        .arg(config.remote.host.clone())
+        .arg(delete.config.remote.host.clone())
         .arg(remote_shell)
 }
 
@@ -146,6 +162,26 @@ fn write_batch_file(batch: &str) -> Result<PathBuf> {
         err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(path.display())
     })?;
     Ok(path)
+}
+
+fn control_options(control_path: &Path) -> Vec<String> {
+    vec![
+        "-o".to_owned(),
+        "ControlMaster=auto".to_owned(),
+        "-o".to_owned(),
+        "ControlPersist=10m".to_owned(),
+        "-o".to_owned(),
+        format!("ControlPath={}", control_path.display()),
+    ]
+}
+
+fn control_path(config: &AppConfig) -> PathBuf {
+    let raw = format!(
+        "rdev-{}-{}",
+        config.remote.host.replace(['@', ':', '\\', '/', '.'], "_"),
+        config.remote.port
+    );
+    std::env::temp_dir().join(raw)
 }
 
 fn batch_id() -> u128 {
@@ -206,7 +242,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::path::RemotePath;
 
-    use super::{build_delete_command, build_upload_batch, remote_path};
+    use super::{build_delete_command, build_upload_batch, control_path, remote_path, DeleteBatch};
 
     #[test]
     fn builds_upload_batch_with_parent_dirs() {
@@ -227,10 +263,17 @@ mod tests {
         let root = parse_root();
         let config = AppConfig::template("root@example.com", 22, "/rdev/project");
 
-        let command = build_delete_command(&config, &root, &[PathBuf::from("src\\old.rs")]);
+        let deletes = [PathBuf::from("src\\old.rs")];
+        let command = build_delete_command(DeleteBatch {
+            config: &config,
+            control_path: &control_path(&config),
+            remote_root: &root,
+            deletes: &deletes,
+        });
 
         let display = command.display();
         assert!(display.contains("ssh"));
+        assert!(display.contains("ControlMaster=auto"));
         assert!(display.contains("rm -rf --"));
         assert!(display.contains("/rdev/project/src/old.rs"));
     }
