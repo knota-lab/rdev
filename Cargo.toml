@@ -12,3 +12,4 @@ serde = { version = "1.0", features = ["derive"] }
 ssh2 = "0.9"
 thiserror = "1.0"
 toml = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }

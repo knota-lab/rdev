@@ -1,12 +1,16 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime};
+
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(not(windows))]
 use std::thread;
-use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -32,6 +36,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     let shutdown = install_shutdown_handler()?;
     clear_stop_request(&request.project_root)?;
     write_pid_file(&request.project_root)?;
+    let _guard = UpStateGuard::new(request.project_root.clone());
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
     let delta_backend = SftpDeltaBackend::new(config);
@@ -43,6 +48,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         })?;
         println!("{}", report.format_text());
     }
+    delta_backend.warm_up()?;
     let (sender, receiver) = mpsc::channel();
     install_stdin_shutdown(Arc::clone(&shutdown));
     let mut watcher = build_watcher(request.poll, sender)?;
@@ -56,12 +62,13 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             })?;
         println!("[watch] {}", watch_path.display());
     }
-    println!("[watch] press q then Enter to stop");
+    print_stop_hint();
 
-    let debounce = Duration::from_millis(config.sync.debounce_ms.max(1000));
+    let debounce = Duration::from_millis(config.sync.debounce_ms.max(50));
     let mut pending = PendingChanges::default();
+    let mut synced_files = SyncedFiles::default();
     let mut last_event_at = Instant::now();
-    while !shutdown.load(Ordering::SeqCst) && !stop_requested(&request.project_root) {
+    while !shutdown_requested(&shutdown, &request.project_root) {
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
@@ -81,11 +88,16 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
                 if pending.has_changes() && last_event_at.elapsed() >= debounce {
                     let changes = pending.take();
                     let changes = reconcile_existing_paths(changes, &local_root);
+                    let changes = synced_files.filter_changed(changes, &local_root);
+                    if !changes.has_changes() {
+                        continue;
+                    }
                     let report = delta_backend.sync_delta(SyncDeltaRequest {
                         project_root: local_root.clone(),
-                        uploads: changes.uploads.into_iter().collect(),
-                        deletes: changes.deletes.into_iter().collect(),
+                        uploads: changes.uploads.iter().cloned().collect(),
+                        deletes: changes.deletes.iter().cloned().collect(),
                     })?;
+                    synced_files.record(&changes, &local_root);
                     println!("{}", report.format_text());
                 }
             }
@@ -95,8 +107,90 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         }
     }
     println!("[watch] stopped");
-    clear_pid_file(&request.project_root)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Default)]
+struct SyncedFiles {
+    files: BTreeMap<PathBuf, FileFingerprint>,
+}
+
+impl SyncedFiles {
+    fn filter_changed(&self, changes: PendingChanges, local_root: &Path) -> PendingChanges {
+        let mut filtered = PendingChanges {
+            uploads: BTreeSet::new(),
+            deletes: changes.deletes,
+        };
+        for upload in changes.uploads {
+            let fingerprint = file_fingerprint(&local_root.join(&upload));
+            if fingerprint.is_none() || self.files.get(&upload) != fingerprint.as_ref() {
+                filtered.uploads.insert(upload);
+            }
+        }
+        filtered
+    }
+
+    fn record(&mut self, changes: &PendingChanges, local_root: &Path) {
+        for upload in &changes.uploads {
+            if let Some(fingerprint) = file_fingerprint(&local_root.join(upload)) {
+                self.files.insert(upload.clone(), fingerprint);
+            }
+        }
+        for delete in &changes.deletes {
+            self.files.remove(delete);
+        }
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn shutdown_requested(shutdown: &AtomicBool, project_root: &Path) -> bool {
+    if shutdown.load(Ordering::SeqCst) || stop_requested(project_root) {
+        return true;
+    }
+    quit_key_pressed()
+}
+
+#[cfg(windows)]
+fn print_stop_hint() {
+    println!("[watch] press q to stop");
+}
+
+#[cfg(not(windows))]
+fn print_stop_hint() {
+    println!("[watch] press q then Enter to stop");
+}
+
+struct UpStateGuard {
+    project_root: PathBuf,
+}
+
+impl UpStateGuard {
+    fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+}
+
+impl Drop for UpStateGuard {
+    fn drop(&mut self) {
+        let _clear_pid = clear_pid_file(&self.project_root);
+        let _clear_stop = clear_stop_request(&self.project_root);
+    }
 }
 
 pub fn request_stop(project_root: &Path) -> Result<()> {
@@ -209,6 +303,11 @@ fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
 }
 
 fn install_stdin_shutdown(shutdown: Arc<AtomicBool>) {
+    #[cfg(windows)]
+    {
+        let _unused = shutdown;
+    }
+    #[cfg(not(windows))]
     thread::spawn(move || {
         let mut line = String::new();
         loop {
@@ -223,6 +322,29 @@ fn install_stdin_shutdown(shutdown: Arc<AtomicBool>) {
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn quit_key_pressed() -> bool {
+    const KEY_DOWN: i16 = 0x8000u16 as i16;
+    const Q_KEY: i32 = b'Q' as i32;
+    static SEEN_DOWN: AtomicUsize = AtomicUsize::new(0);
+
+    let pressed =
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(Q_KEY) }
+            & KEY_DOWN
+            != 0;
+    if pressed {
+        SEEN_DOWN.swap(1, Ordering::SeqCst) == 0
+    } else {
+        SEEN_DOWN.store(0, Ordering::SeqCst);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn quit_key_pressed() -> bool {
+    false
 }
 
 fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {

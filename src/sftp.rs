@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ssh2::{Session, Sftp};
 
@@ -28,19 +29,51 @@ impl<'a> SftpDeltaBackend<'a> {
 
     pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
+        println!(
+            "[sync] delta start transport=internal-sftp uploads={} deletes={}",
+            request.uploads.len(),
+            request.deletes.len()
+        );
+        let started = Instant::now();
         self.with_client(|client| {
             for path in &request.uploads {
+                let item_started = Instant::now();
                 let local_path = request.project_root.join(path);
                 let remote_path = remote_path(&remote_root, path);
                 client.upload(&local_path, Path::new(&remote_path))?;
+                println!(
+                    "[sync] upload ok path={} elapsed_ms={}",
+                    path.display(),
+                    item_started.elapsed().as_millis()
+                );
             }
             for path in &request.deletes {
+                let item_started = Instant::now();
                 let remote_path = remote_path(&remote_root, path);
                 client.remove(Path::new(&remote_path))?;
+                println!(
+                    "[sync] delete ok path={} elapsed_ms={}",
+                    path.display(),
+                    item_started.elapsed().as_millis()
+                );
             }
             Ok(())
         })?;
+        println!(
+            "[sync] delta done elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         Ok(SyncReport::completed_sftp(request.uploads, request.deletes))
+    }
+
+    pub fn warm_up(&self) -> Result<()> {
+        let started = Instant::now();
+        self.with_client(|_| Ok(()))?;
+        println!(
+            "[sync] internal-sftp connected elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     fn with_client<T>(&self, action: impl FnOnce(&mut SftpClient) -> Result<T>) -> Result<T> {
@@ -58,6 +91,7 @@ impl<'a> SftpDeltaBackend<'a> {
 struct SftpClient {
     session: Session,
     sftp: Sftp,
+    ensured_dirs: BTreeSet<PathBuf>,
 }
 
 impl SftpClient {
@@ -78,23 +112,81 @@ impl SftpClient {
         let sftp = session
             .sftp()
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
-        Ok(Self { session, sftp })
+        Ok(Self {
+            session,
+            sftp,
+            ensured_dirs: BTreeSet::new(),
+        })
     }
 
     fn upload(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
         if local_path.is_dir() {
-            return ensure_dir(&self.sftp, remote_path);
+            return self.ensure_dir(remote_path);
         }
-        ensure_parent_dir(&self.sftp, remote_path)?;
+        let ensure_started = Instant::now();
+        self.ensure_parent_dir(remote_path)?;
+        let ensure_elapsed = ensure_started.elapsed().as_millis();
+
+        let open_started = Instant::now();
         let mut local = File::open(local_path).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(local_path.display())
         })?;
+        let open_elapsed = open_started.elapsed().as_millis();
+
+        let create_started = Instant::now();
         let mut remote = self.sftp.create(remote_path).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
         })?;
+        let create_elapsed = create_started.elapsed().as_millis();
+
+        let copy_started = Instant::now();
         io::copy(&mut local, &mut remote).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
         })?;
+        let copy_elapsed = copy_started.elapsed().as_millis();
+        println!(
+            "[sync] upload detail remote={} ensure_ms={} open_ms={} create_ms={} copy_ms={}",
+            remote_path.display(),
+            ensure_elapsed,
+            open_elapsed,
+            create_elapsed,
+            copy_elapsed
+        );
+        Ok(())
+    }
+
+    fn ensure_parent_dir(&mut self, remote_path: &Path) -> Result<()> {
+        let Some(parent) = remote_path.parent() else {
+            return Ok(());
+        };
+        self.ensure_dir(parent)
+    }
+
+    fn ensure_dir(&mut self, dir: &Path) -> Result<()> {
+        if self.ensured_dirs.contains(dir) {
+            return Ok(());
+        }
+        let mut current = PathBuf::new();
+        for component in dir.components() {
+            current.push(component.as_os_str());
+            let path = current.as_path();
+            if path.as_os_str().is_empty() || self.ensured_dirs.contains(path) {
+                continue;
+            }
+            match self.sftp.mkdir(path, 0o755) {
+                Ok(()) => {
+                    self.ensured_dirs.insert(path.to_path_buf());
+                }
+                Err(_) if self.sftp.stat(path).is_ok() => {
+                    self.ensured_dirs.insert(path.to_path_buf());
+                }
+                Err(source) => {
+                    return Err(err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                        .with_path(path.display()));
+                }
+            }
+        }
+        self.ensured_dirs.insert(dir.to_path_buf());
         Ok(())
     }
 
@@ -211,34 +303,6 @@ fn passphrase(config: &AppConfig) -> Option<String> {
     } else {
         std::env::var(&config.remote.passphrase_env).ok()
     }
-}
-
-fn ensure_parent_dir(sftp: &Sftp, remote_path: &Path) -> Result<()> {
-    let Some(parent) = remote_path.parent() else {
-        return Ok(());
-    };
-    ensure_dir(sftp, parent)
-}
-
-fn ensure_dir(sftp: &Sftp, dir: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in dir.components() {
-        current.push(component.as_os_str());
-        let path = current.as_path();
-        if path.as_os_str().is_empty() {
-            continue;
-        }
-        match sftp.mkdir(path, 0o755) {
-            Ok(()) => {}
-            Err(_) if sftp.stat(path).is_ok() => {}
-            Err(source) => {
-                return Err(
-                    err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(path.display())
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn remote_path(remote_root: &RemotePath, relative_path: &Path) -> String {
