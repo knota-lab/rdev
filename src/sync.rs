@@ -337,13 +337,7 @@ fn build_remote_delete_command(
 
 fn delta_rsync_args(config: &AppConfig) -> Vec<String> {
     let mut args = vec!["-azR".to_owned()];
-    args.extend(
-        config
-            .sync
-            .exclude
-            .iter()
-            .map(|exclude| format!("--exclude={exclude}")),
-    );
+    args.extend(rsync_filter_args(&config.sync.exclude));
     args
 }
 
@@ -411,14 +405,34 @@ fn common_rsync_args(config: &AppConfig, request: &SyncRequest) -> Vec<String> {
     if request.delete {
         args.push("--delete".to_owned());
     }
-    args.extend(
-        config
-            .sync
-            .exclude
-            .iter()
-            .map(|exclude| format!("--exclude={exclude}")),
-    );
+    args.extend(rsync_filter_args(&config.sync.exclude));
     args
+}
+
+fn rsync_filter_args(excludes: &[String]) -> Vec<String> {
+    excludes
+        .iter()
+        .rev()
+        .filter_map(|rule| {
+            let trimmed = rule.trim();
+            if trimmed.is_empty() {
+                None
+            } else if let Some(include) = trimmed.strip_prefix('!') {
+                Some(format!("--include={}", rsync_path_pattern(include.trim())))
+            } else {
+                Some(format!("--exclude={}", rsync_path_pattern(trimmed)))
+            }
+        })
+        .collect()
+}
+
+fn rsync_path_pattern(pattern: &str) -> String {
+    let normalized = pattern.trim().trim_matches('/').replace('\\', "/");
+    if normalized.is_empty() || !normalized.contains('/') {
+        normalized
+    } else {
+        format!("**/{normalized}/***")
+    }
 }
 
 fn remote_dest(config: &AppConfig, remote_root: &RemotePath, watch_dir: &Path) -> String {
@@ -584,6 +598,7 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert!(commands[1].contains("wsl bash -lc"));
         assert!(commands[1].contains("--dry-run"));
+        assert!(commands[1].contains("--exclude=data"));
         assert!(
             commands[1].contains("/mnt/j/RustWorkspace/project/backend/"),
             "unexpected command: {}",
@@ -633,8 +648,36 @@ mod tests {
         let commands = runner.commands.borrow();
         assert_eq!(commands.len(), 2);
         assert!(commands[1].contains("rsync -azR"));
+        assert!(commands[1].contains("--exclude=data"));
         assert!(commands[1].contains("'src/main.rs'"));
         assert!(commands[1].contains("'root@example.com:/root/project/'"));
+    }
+
+    #[test]
+    fn maps_negated_exclude_to_rsync_include() {
+        let mut config = AppConfig::template("root@example.com", 22, "/root/project");
+        config.sync.rsync_mode = RsyncMode::Wsl;
+        config.sync.exclude = vec!["data".to_owned(), "!src/data".to_owned()];
+        let runner = FakeRunner::success(2);
+        let backend = RsyncSyncBackend::new(&config, &runner);
+
+        let report = backend.sync_delta(super::SyncDeltaRequest {
+            project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            uploads: vec![PathBuf::from("knota-fold/src/data/mod.rs")],
+            deletes: Vec::new(),
+        });
+
+        assert!(report.is_ok());
+        let commands = runner.commands.borrow();
+        let include_index = match commands[1].find("--include=**/src/data/***") {
+            Some(index) => index,
+            None => panic!("missing include rule: {}", commands[1]),
+        };
+        let exclude_index = match commands[1].find("--exclude=data") {
+            Some(index) => index,
+            None => panic!("missing exclude rule: {}", commands[1]),
+        };
+        assert!(include_index < exclude_index);
     }
 
     #[test]

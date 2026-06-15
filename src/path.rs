@@ -63,6 +63,71 @@ pub struct PathMapper {
     remote_root: RemotePath,
 }
 
+pub fn is_sync_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
+    let Ok(relative) = path.strip_prefix(local_root) else {
+        return true;
+    };
+    let components = relative_normal_components(relative);
+    if components.is_empty() {
+        return false;
+    }
+    let mut excluded = false;
+    for rule in excludes {
+        let rule = parse_exclude_rule(rule);
+        if exclude_matches(&components, rule.pattern) {
+            excluded = !rule.include;
+        }
+    }
+    excluded
+}
+
+struct ExcludeRule<'a> {
+    include: bool,
+    pattern: &'a str,
+}
+
+fn parse_exclude_rule(rule: &str) -> ExcludeRule<'_> {
+    let trimmed = rule.trim();
+    let Some(pattern) = trimmed.strip_prefix('!') else {
+        return ExcludeRule {
+            include: false,
+            pattern: trimmed,
+        };
+    };
+    ExcludeRule {
+        include: true,
+        pattern: pattern.trim(),
+    }
+}
+
+fn exclude_matches(components: &[String], pattern: &str) -> bool {
+    let exclude_components = exclude_components(pattern);
+    match exclude_components.as_slice() {
+        [] => false,
+        [name] => components.iter().any(|component| component == name),
+        parts => components
+            .windows(parts.len())
+            .any(|window| window == parts),
+    }
+}
+
+fn exclude_components(exclude: &str) -> Vec<String> {
+    exclude
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn relative_normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 impl PathMapper {
     pub fn new(
         local_root: PathBuf,
@@ -149,7 +214,7 @@ fn normalize_relative_path(path: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PathMapper, RelativePath, RemotePath};
+    use super::{is_sync_excluded, PathMapper, RelativePath, RemotePath};
 
     #[test]
     fn rejects_broad_remote_paths() {
@@ -210,5 +275,59 @@ mod tests {
         let remote = mapper.relative_to_remote_abs(&relative);
 
         assert_eq!(remote.as_str(), "/root/project/src/main.rs");
+    }
+
+    #[test]
+    fn excludes_matching_path_component() {
+        let root = PathBuf::from("J:\\project");
+
+        assert!(is_sync_excluded(
+            &PathBuf::from("J:\\project\\data\\db"),
+            &root,
+            &["data".to_owned()]
+        ));
+        assert!(is_sync_excluded(
+            &PathBuf::from("J:\\project\\src\\data\\db"),
+            &root,
+            &["data".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn include_rule_overrides_previous_exclude() {
+        let root = PathBuf::from("J:\\workspace");
+        let excludes = ["data".to_owned(), "!src/data".to_owned()];
+
+        assert!(is_sync_excluded(
+            &PathBuf::from("J:\\workspace\\knota-fold\\data\\db"),
+            &root,
+            &excludes
+        ));
+        assert!(!is_sync_excluded(
+            &PathBuf::from("J:\\workspace\\knota-fold\\src\\data\\mod.rs"),
+            &root,
+            &excludes
+        ));
+    }
+
+    #[test]
+    fn supports_path_excludes() {
+        let root = PathBuf::from("J:\\workspace");
+
+        assert!(is_sync_excluded(
+            &PathBuf::from("J:\\workspace\\knota-fold\\data\\db"),
+            &root,
+            &["knota-fold/data".to_owned()]
+        ));
+        assert!(!is_sync_excluded(
+            &PathBuf::from("J:\\workspace\\other\\data\\db"),
+            &root,
+            &["knota-fold/data".to_owned()]
+        ));
+        assert!(is_sync_excluded(
+            &PathBuf::from("J:\\workspace\\other\\knota-fold\\data\\db"),
+            &root,
+            &["knota-fold/data".to_owned()]
+        ));
     }
 }

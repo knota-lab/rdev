@@ -17,6 +17,7 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use crate::config::{AppConfig, SyncBackendKind};
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
+use crate::path::is_sync_excluded;
 use crate::process::ProcessRunner;
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest, SyncRequest};
@@ -107,9 +108,12 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
 
         match receiver.recv_timeout(timeout) {
             Ok(event) => {
-                if let Some(changes) =
-                    collect_event_changes(&event, watch.local_root, &watch.config.sync.exclude)
-                {
+                let filter = EventFilter {
+                    local_root: watch.local_root,
+                    watch_dirs: &watch.config.sync.watch_dirs,
+                    excludes: &watch.config.sync.exclude,
+                };
+                if let Some(changes) = collect_event_changes(&event, &filter) {
                     pending.merge(changes);
                     last_event_at = Instant::now();
                 }
@@ -433,17 +437,19 @@ impl PendingChanges {
     }
 }
 
-fn collect_event_changes(
-    event: &Event,
-    local_root: &Path,
-    excludes: &[String],
-) -> Option<PendingChanges> {
+struct EventFilter<'a> {
+    local_root: &'a Path,
+    watch_dirs: &'a [PathBuf],
+    excludes: &'a [String],
+}
+
+fn collect_event_changes(event: &Event, filter: &EventFilter<'_>) -> Option<PendingChanges> {
     let mut changes = PendingChanges::default();
     for path in &event.paths {
-        if is_excluded(path, local_root, excludes) {
+        if filter.is_excluded(path) {
             continue;
         }
-        let Ok(relative) = path.strip_prefix(local_root) else {
+        let Ok(relative) = path.strip_prefix(filter.local_root) else {
             continue;
         };
         if relative.as_os_str().is_empty() {
@@ -477,14 +483,27 @@ fn reconcile_existing_paths(mut changes: PendingChanges, local_root: &Path) -> P
     changes
 }
 
-fn is_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
-    let Ok(relative) = path.strip_prefix(local_root) else {
-        return true;
-    };
-    relative.components().any(|component| {
+impl<'a> EventFilter<'a> {
+    fn is_excluded(&self, path: &Path) -> bool {
+        for watch_dir in self.watch_dirs {
+            let source = local_source(self.local_root, watch_dir);
+            if path.starts_with(&source) {
+                return is_sync_excluded(path, &source, self.excludes);
+            }
+        }
+        true
+    }
+}
+
+fn local_source(local_root: &Path, watch_dir: &Path) -> PathBuf {
+    if watch_dir.components().all(|component| {
         let item = component.as_os_str().to_string_lossy();
-        excludes.iter().any(|exclude| exclude == item.as_ref())
-    })
+        item == "."
+    }) {
+        local_root.to_path_buf()
+    } else {
+        local_root.join(watch_dir)
+    }
 }
 
 #[cfg(test)]
@@ -494,8 +513,8 @@ mod tests {
     use notify::{Event, EventKind};
 
     use super::{
-        collect_event_changes, is_excluded, reconcile_existing_paths, request_stop,
-        resolve_local_root, stop_requested,
+        collect_event_changes, reconcile_existing_paths, request_stop, resolve_local_root,
+        stop_requested, EventFilter,
     };
 
     #[test]
@@ -517,12 +536,47 @@ mod tests {
             attrs: notify::event::EventAttributes::new(),
         };
 
-        assert!(collect_event_changes(&event, &local_root, &["data".to_owned()]).is_none());
-        assert!(is_excluded(
-            &PathBuf::from("J:\\project\\data\\db"),
-            &local_root,
-            &["data".to_owned()]
-        ));
+        let filter = EventFilter {
+            local_root: &local_root,
+            watch_dirs: &[PathBuf::from(".")],
+            excludes: &["data".to_owned()],
+        };
+        assert!(collect_event_changes(&event, &filter).is_none());
+        assert!(filter.is_excluded(&PathBuf::from("J:\\project\\data\\db")));
+    }
+
+    #[test]
+    fn does_not_filter_nested_matching_path_name() {
+        let local_root = PathBuf::from("J:\\project");
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![PathBuf::from("J:\\project\\src\\data\\mod.rs")],
+            attrs: notify::event::EventAttributes::new(),
+        };
+
+        let filter = EventFilter {
+            local_root: &local_root,
+            watch_dirs: &[PathBuf::from(".")],
+            excludes: &["data".to_owned(), "!src/data".to_owned()],
+        };
+        assert!(collect_event_changes(&event, &filter).is_some());
+        assert!(!filter.is_excluded(&PathBuf::from("J:\\project\\src\\data\\mod.rs")));
+    }
+
+    #[test]
+    fn filters_relative_to_watch_dir_source() {
+        let local_root = PathBuf::from("J:\\knota-fold-workspace");
+        let filter = EventFilter {
+            local_root: &local_root,
+            watch_dirs: &[PathBuf::from(".")],
+            excludes: &["data".to_owned(), "!src/data".to_owned()],
+        };
+        assert!(filter.is_excluded(&PathBuf::from(
+            "J:\\knota-fold-workspace\\knota-fold\\data\\db"
+        )));
+        assert!(!filter.is_excluded(&PathBuf::from(
+            "J:\\knota-fold-workspace\\knota-fold\\src\\data\\mod.rs"
+        )));
     }
 
     #[test]
@@ -539,8 +593,13 @@ mod tests {
             attrs: notify::event::EventAttributes::new(),
         };
 
-        let upload = collect_event_changes(&modify, &local_root, &[]);
-        let delete = collect_event_changes(&remove, &local_root, &[]);
+        let filter = EventFilter {
+            local_root: &local_root,
+            watch_dirs: &[PathBuf::from(".")],
+            excludes: &[],
+        };
+        let upload = collect_event_changes(&modify, &filter);
+        let delete = collect_event_changes(&remove, &filter);
 
         assert!(upload.is_some());
         assert!(delete.is_some());

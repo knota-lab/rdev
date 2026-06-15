@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 use crate::config::AppConfig;
 use crate::error::{err, err_with_source, ErrorInfo, Result};
 use crate::error_info;
-use crate::path::RemotePath;
+use crate::path::{is_sync_excluded, RemotePath};
 use crate::sync::{SyncBackend, SyncDeltaRequest, SyncReport, SyncRequest};
 
 const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -458,11 +458,7 @@ fn append_project_tar<W: Write>(
             .into_iter()
             .filter_entry(|entry| {
                 entry.path() == source
-                    || !is_excluded(
-                        entry.path(),
-                        &upload.request.project_root,
-                        &upload.config.sync.exclude,
-                    )
+                    || !is_excluded(entry.path(), &source, &upload.config.sync.exclude)
             })
         {
             let entry =
@@ -501,13 +497,7 @@ fn local_source(project_root: &Path, watch_dir: &Path) -> PathBuf {
 }
 
 fn is_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
-    let Ok(relative) = path.strip_prefix(local_root) else {
-        return true;
-    };
-    relative.components().any(|component| {
-        let item = component.as_os_str().to_string_lossy();
-        excludes.iter().any(|exclude| exclude == item.as_ref())
-    })
+    is_sync_excluded(path, local_root, excludes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
