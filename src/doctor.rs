@@ -61,7 +61,7 @@ fn run_doctor_with_exec(
 ) -> Result<DoctorReport> {
     let mut checks = Vec::new();
     validate_config(config)?;
-    checks.push(DoctorCheck::ok("config", "loaded .rdev.toml"));
+    checks.push(DoctorCheck::ok("config", "loaded"));
 
     let remote_path = RemotePath::parse(config.remote.path.as_str())?;
     checks.push(DoctorCheck::ok("remote.path", remote_path.as_str()));

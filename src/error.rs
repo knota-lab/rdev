@@ -237,7 +237,7 @@ mod tests {
         let zh = localized_message(error_info::CONFIG_NOT_FOUND, Language::ZhCn);
         let en = localized_message(error_info::CONFIG_NOT_FOUND, Language::EnUs);
 
-        assert_eq!(zh, "未找到 .rdev.toml 配置文件");
-        assert_eq!(en, "Could not find .rdev.toml");
+        assert_eq!(zh, "未找到 .rdev/config.toml 配置文件");
+        assert_eq!(en, "Could not find .rdev/config.toml");
     }
 }

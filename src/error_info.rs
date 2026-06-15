@@ -2,8 +2,8 @@ use crate::error::{ErrorInfo, ErrorSeverity, RdevExitCode};
 
 pub const CONFIG_NOT_FOUND: ErrorInfo = ErrorInfo {
     code: "config.not_found",
-    message_zh: "未找到 .rdev.toml 配置文件",
-    message_en: "Could not find .rdev.toml",
+    message_zh: "未找到 .rdev/config.toml 配置文件",
+    message_en: "Could not find .rdev/config.toml",
     severity: ErrorSeverity::User,
     exit_code: RdevExitCode::Config,
 };

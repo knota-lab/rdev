@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{err_with_source, Result};
 use crate::error_info;
 
-pub const CONFIG_FILE_NAME: &str = ".rdev.toml";
+pub const CONFIG_DIR_NAME: &str = ".rdev";
+pub const CONFIG_FILE_NAME: &str = "config.toml";
+pub const LEGACY_CONFIG_FILE_NAME: &str = ".rdev.toml";
 pub const CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,11 +94,21 @@ pub struct CommandConfig {
 }
 
 impl AppConfig {
+    pub fn path_in_dir(dir: &Path) -> PathBuf {
+        dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME)
+    }
+
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
-        let path = dir.join(CONFIG_FILE_NAME);
-        let raw = fs::read_to_string(&path).map_err(|source| {
-            err_with_source(error_info::CONFIG_NOT_FOUND, source).with_path(path.display())
-        })?;
+        let path = Self::path_in_dir(dir);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => {
+                let legacy_path = dir.join(LEGACY_CONFIG_FILE_NAME);
+                fs::read_to_string(&legacy_path).map_err(|source| {
+                    err_with_source(error_info::CONFIG_NOT_FOUND, source).with_path(path.display())
+                })?
+            }
+        };
         Self::parse(&raw)
     }
 
@@ -163,6 +175,7 @@ impl Default for CommandConfig {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, DeletePolicy, SyncDirection, CONFIG_VERSION};
+    use std::fs;
 
     #[test]
     fn parses_valid_config() {
@@ -218,5 +231,92 @@ remote_env = {}
         assert_eq!(config.sync.full_sync_threshold, 32);
         assert_eq!(config.sync.backend, super::SyncBackendKind::Auto);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
+    }
+
+    #[test]
+    fn loads_config_from_rdev_directory_first() {
+        let root = std::env::temp_dir().join(format!("rdev-config-test-{}", std::process::id()));
+        let _cleanup_before = fs::remove_dir_all(&root);
+        if let Err(error) = fs::create_dir_all(root.join(".rdev")) {
+            panic!("create dir: {error}");
+        }
+        let raw = r#"
+version = 1
+
+[remote]
+host = "root@example.com"
+port = 22
+path = "/root/project"
+
+[sync]
+local_path = "."
+watch_dirs = ["."]
+exclude = [".git"]
+use_gitignore = true
+debounce_ms = 300
+direction = "push"
+delete = true
+delete_policy = "propagate"
+full_sync_threshold = 32
+
+[command]
+default_shell = "bash"
+remote_env = {}
+"#;
+        if let Err(error) = fs::write(root.join(".rdev").join("config.toml"), raw) {
+            panic!("write config: {error}");
+        }
+
+        let config = match AppConfig::load_from_dir(&root) {
+            Ok(config) => config,
+            Err(error) => panic!("load config: {error}"),
+        };
+
+        assert_eq!(config.remote.path, "/root/project");
+        let _cleanup_after = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loads_legacy_config_file_for_compatibility() {
+        let root =
+            std::env::temp_dir().join(format!("rdev-legacy-config-test-{}", std::process::id()));
+        let _cleanup_before = fs::remove_dir_all(&root);
+        if let Err(error) = fs::create_dir_all(&root) {
+            panic!("create dir: {error}");
+        }
+        let raw = r#"
+version = 1
+
+[remote]
+host = "root@example.com"
+port = 22
+path = "/root/project"
+
+[sync]
+local_path = "."
+watch_dirs = ["."]
+exclude = [".git"]
+use_gitignore = true
+debounce_ms = 300
+direction = "push"
+delete = true
+delete_policy = "propagate"
+full_sync_threshold = 32
+
+[command]
+default_shell = "bash"
+remote_env = {}
+"#;
+        if let Err(error) = fs::write(root.join(".rdev.toml"), raw) {
+            panic!("write legacy config: {error}");
+        }
+
+        let config = match AppConfig::load_from_dir(&root) {
+            Ok(config) => config,
+            Err(error) => panic!("load config: {error}"),
+        };
+
+        assert_eq!(config.remote.path, "/root/project");
+        let _cleanup_after = fs::remove_dir_all(&root);
     }
 }

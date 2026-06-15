@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::auth::run_auth_check;
 use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs, SyncArgs};
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
-use crate::config::{AppConfig, SyncBackendKind, CONFIG_FILE_NAME};
+use crate::config::{AppConfig, SyncBackendKind, CONFIG_DIR_NAME};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
@@ -43,7 +43,10 @@ fn init(args: InitArgs, cwd: &Path) -> Result<String> {
     })?;
     RemotePath::parse(remote_path.as_str())?;
 
-    let config_path = cwd.join(CONFIG_FILE_NAME);
+    let config_dir = cwd.join(CONFIG_DIR_NAME);
+    fs::create_dir_all(&config_dir)
+        .map_err(|source| err_with_source(error_info::CONFIG_INVALID, source))?;
+    let config_path = AppConfig::path_in_dir(cwd);
     let config = AppConfig::template(&host, args.port, &remote_path);
     let raw = toml::to_string_pretty(&config)
         .map_err(|source| err_with_source(error_info::CONFIG_INVALID, source))?;
