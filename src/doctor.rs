@@ -3,6 +3,7 @@ use crate::error::{err, err_with_source, ErrorInfo, Result};
 use crate::error_info;
 use crate::path::RemotePath;
 use crate::process::{ProcessCommand, ProcessRunner};
+use crate::sftp::SftpDeltaBackend;
 
 const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -45,6 +46,19 @@ impl DoctorCheck {
 }
 
 pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<DoctorReport> {
+    let ssh_backend = SftpDeltaBackend::new(config);
+    run_doctor_with_exec(config, runner, &ssh_backend)
+}
+
+pub trait RemoteExecChecker {
+    fn check_exec(&self) -> Result<()>;
+}
+
+fn run_doctor_with_exec(
+    config: &AppConfig,
+    runner: &impl ProcessRunner,
+    exec_checker: &impl RemoteExecChecker,
+) -> Result<DoctorReport> {
     let mut checks = Vec::new();
     validate_config(config)?;
     checks.push(DoctorCheck::ok("config", "loaded .rdev.toml"));
@@ -71,6 +85,9 @@ pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<Doc
     check_remote_rsync(runner, &remote)?;
     checks.push(DoctorCheck::ok("remote.rsync", "available"));
 
+    exec_checker.check_exec()?;
+    checks.push(DoctorCheck::ok("remote.ssh_exec", "available"));
+
     check_remote_path_writable(runner, &remote, &remote_path)?;
     checks.push(DoctorCheck::ok(
         "remote.path.writable",
@@ -78,6 +95,12 @@ pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<Doc
     ));
 
     Ok(DoctorReport::new(checks))
+}
+
+impl RemoteExecChecker for SftpDeltaBackend<'_> {
+    fn check_exec(&self) -> Result<()> {
+        SftpDeltaBackend::check_exec(self)
+    }
 }
 
 fn validate_config(config: &AppConfig) -> Result<()> {
@@ -336,7 +359,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::process::{ProcessCommand, ProcessOutput, ProcessRunner};
 
-    use super::run_doctor;
+    use super::{run_doctor_with_exec, RemoteExecChecker};
 
     #[derive(Debug)]
     struct FakeRunner {
@@ -386,12 +409,27 @@ mod tests {
         }
     }
 
+    struct FakeExecChecker;
+
+    impl RemoteExecChecker for FakeExecChecker {
+        fn check_exec(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_test_doctor(
+        config: &AppConfig,
+        runner: &impl ProcessRunner,
+    ) -> crate::error::Result<super::DoctorReport> {
+        run_doctor_with_exec(config, runner, &FakeExecChecker)
+    }
+
     #[test]
     fn doctor_runs_expected_checks() {
         let config = AppConfig::template("root@example.com", 22, "/root/project");
         let runner = FakeRunner::success(6);
 
-        let report = run_doctor(&config, &runner);
+        let report = run_test_doctor(&config, &runner);
 
         assert!(report.is_ok());
         let report = match report {
@@ -401,6 +439,7 @@ mod tests {
         let output = report.format_text();
         assert!(output.contains("config ok"));
         assert!(output.contains("remote.tar ok"));
+        assert!(output.contains("remote.ssh_exec ok"));
         assert!(output.contains("remote.path.writable ok"));
         assert_eq!(runner.commands.borrow().len(), 6);
         assert!(runner
@@ -415,7 +454,7 @@ mod tests {
         let config = AppConfig::template("root@example.com", 22, "/root");
         let runner = FakeRunner::success(5);
 
-        let report = run_doctor(&config, &runner);
+        let report = run_test_doctor(&config, &runner);
 
         assert!(report.is_err());
         assert!(runner.commands.borrow().is_empty());
@@ -434,7 +473,7 @@ mod tests {
             Some(0),
         ]);
 
-        let report = run_doctor(&config, &runner);
+        let report = run_test_doctor(&config, &runner);
 
         assert!(report.is_ok());
         let commands = runner.commands.borrow();

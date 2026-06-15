@@ -30,6 +30,12 @@ impl<'a> SftpDeltaBackend<'a> {
         }
     }
 
+    pub fn check_exec(&self) -> Result<()> {
+        self.with_client(|client| {
+            client.exec_checked(&sh_c(":"), TarCheck::new(error_info::SYNC_SSH_TAR_FAILED))
+        })
+    }
+
     fn sync_delta_impl(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
         println!(
