@@ -43,6 +43,8 @@ pub struct SyncConfig {
     pub delete_policy: DeletePolicy,
     pub full_sync_threshold: usize,
     #[serde(default)]
+    pub backend: SyncBackendKind,
+    #[serde(default)]
     pub rsync_mode: RsyncMode,
     #[serde(default)]
     pub rsync_local_path: String,
@@ -63,6 +65,15 @@ pub enum DeletePolicy {
     KeepTarget,
     TrashTarget,
     Confirm,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncBackendKind {
+    #[default]
+    Auto,
+    Rsync,
+    Ssh,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +144,7 @@ impl Default for SyncConfig {
             delete: true,
             delete_policy: DeletePolicy::Propagate,
             full_sync_threshold: 32,
+            backend: SyncBackendKind::Auto,
             rsync_mode: RsyncMode::Auto,
             rsync_local_path: String::new(),
         }
@@ -172,6 +184,7 @@ direction = "push"
 delete = true
 delete_policy = "propagate"
 full_sync_threshold = 32
+backend = "auto"
 rsync_mode = "auto"
 
 [command]
@@ -203,6 +216,7 @@ remote_env = {}
         assert!(config.sync.exclude.iter().any(|item| item == "data"));
         assert!(config.sync.exclude.iter().any(|item| item == ".codegraph"));
         assert_eq!(config.sync.full_sync_threshold, 32);
+        assert_eq!(config.sync.backend, super::SyncBackendKind::Auto);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
     }
 }

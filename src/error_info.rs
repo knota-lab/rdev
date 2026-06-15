@@ -72,6 +72,14 @@ pub const REMOTE_PATH_NOT_WRITABLE: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Remote,
 };
 
+pub const REMOTE_TAR_NOT_FOUND: ErrorInfo = ErrorInfo {
+    code: "remote.tar_not_found",
+    message_zh: "远端未找到 tar 工具",
+    message_en: "Remote tar tool not found",
+    severity: ErrorSeverity::Remote,
+    exit_code: RdevExitCode::Remote,
+};
+
 pub const SYNC_RSYNC_FAILED: ErrorInfo = ErrorInfo {
     code: "sync.rsync_failed",
     message_zh: "rsync 同步失败",
@@ -84,6 +92,14 @@ pub const SYNC_SFTP_FAILED: ErrorInfo = ErrorInfo {
     code: "sync.sftp_failed",
     message_zh: "SFTP 同步失败",
     message_en: "SFTP sync failed",
+    severity: ErrorSeverity::Remote,
+    exit_code: RdevExitCode::Sync,
+};
+
+pub const SYNC_SSH_TAR_FAILED: ErrorInfo = ErrorInfo {
+    code: "sync.ssh_tar_failed",
+    message_zh: "SSH Tar 同步失败",
+    message_en: "SSH tar sync failed",
     severity: ErrorSeverity::Remote,
     exit_code: RdevExitCode::Sync,
 };

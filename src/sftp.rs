@@ -1,18 +1,21 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ssh2::{Session, Sftp};
+use walkdir::WalkDir;
 
 use crate::config::AppConfig;
-use crate::error::{err, err_with_source, Result};
+use crate::error::{err, err_with_source, ErrorInfo, Result};
 use crate::error_info;
 use crate::path::RemotePath;
-use crate::sync::{SyncDeltaRequest, SyncReport};
+use crate::sync::{SyncBackend, SyncDeltaRequest, SyncReport, SyncRequest};
+
+const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub struct SftpDeltaBackend<'a> {
     config: &'a AppConfig,
@@ -27,7 +30,7 @@ impl<'a> SftpDeltaBackend<'a> {
         }
     }
 
-    pub fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
+    fn sync_delta_impl(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
         println!(
             "[sync] delta start transport=internal-sftp uploads={} deletes={}",
@@ -66,7 +69,35 @@ impl<'a> SftpDeltaBackend<'a> {
         Ok(SyncReport::completed_sftp(request.uploads, request.deletes))
     }
 
-    pub fn warm_up(&self) -> Result<()> {
+    fn sync_full_impl(&self, request: SyncRequest) -> Result<SyncReport> {
+        let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
+        if request.dry_run {
+            println!("[sync] full dry-run transport=ssh-tar");
+            return Ok(SyncReport::completed_ssh_tar(
+                self.config.sync.watch_dirs.clone(),
+                true,
+            ));
+        }
+        let started = Instant::now();
+        println!("[sync] full start transport=ssh-tar");
+        self.with_client(|client| {
+            client.upload_tar(TarUpload {
+                config: self.config,
+                request: &request,
+                remote_root: &remote_root,
+            })
+        })?;
+        println!(
+            "[sync] full done transport=ssh-tar elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(SyncReport::completed_ssh_tar(
+            self.config.sync.watch_dirs.clone(),
+            request.dry_run,
+        ))
+    }
+
+    fn warm_up_impl(&self) -> Result<()> {
         let started = Instant::now();
         self.with_client(|_| Ok(()))?;
         println!(
@@ -88,9 +119,23 @@ impl<'a> SftpDeltaBackend<'a> {
     }
 }
 
+impl SyncBackend for SftpDeltaBackend<'_> {
+    fn warm_up(&self) -> Result<()> {
+        self.warm_up_impl()
+    }
+
+    fn sync_full(&self, request: SyncRequest) -> Result<SyncReport> {
+        self.sync_full_impl(request)
+    }
+
+    fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
+        self.sync_delta_impl(request)
+    }
+}
+
 struct SftpClient {
     session: Session,
-    sftp: Sftp,
+    sftp: Option<Sftp>,
     ensured_dirs: BTreeSet<PathBuf>,
 }
 
@@ -109,14 +154,24 @@ impl SftpClient {
                 .with_remote(config.remote.host.clone())
         })?;
         authenticate(&session, &endpoint.user, config)?;
-        let sftp = session
-            .sftp()
-            .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
         Ok(Self {
             session,
-            sftp,
+            sftp: None,
             ensured_dirs: BTreeSet::new(),
         })
+    }
+
+    fn sftp(&mut self) -> Result<&mut Sftp> {
+        if self.sftp.is_none() {
+            self.sftp = Some(
+                self.session
+                    .sftp()
+                    .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?,
+            );
+        }
+        self.sftp
+            .as_mut()
+            .ok_or_else(|| err(error_info::INTERNAL_UNEXPECTED))
     }
 
     fn upload(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
@@ -134,7 +189,7 @@ impl SftpClient {
         let open_elapsed = open_started.elapsed().as_millis();
 
         let create_started = Instant::now();
-        let mut remote = self.sftp.create(remote_path).map_err(|source| {
+        let mut remote = self.sftp()?.create(remote_path).map_err(|source| {
             err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
         })?;
         let create_elapsed = create_started.elapsed().as_millis();
@@ -173,11 +228,11 @@ impl SftpClient {
             if path.as_os_str().is_empty() || self.ensured_dirs.contains(path) {
                 continue;
             }
-            match self.sftp.mkdir(path, 0o755) {
+            match self.sftp()?.mkdir(path, 0o755) {
                 Ok(()) => {
                     self.ensured_dirs.insert(path.to_path_buf());
                 }
-                Err(_) if self.sftp.stat(path).is_ok() => {
+                Err(_) if self.sftp()?.stat(path).is_ok() => {
                     self.ensured_dirs.insert(path.to_path_buf());
                 }
                 Err(source) => {
@@ -202,6 +257,7 @@ impl SftpClient {
         channel
             .exec(&command)
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
+        let _output = read_channel_stdout(&mut channel);
         channel
             .wait_close()
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
@@ -216,6 +272,236 @@ impl SftpClient {
                 .with_exit_code(Some(code)))
         }
     }
+
+    fn upload_tar(&mut self, upload: TarUpload<'_>) -> Result<()> {
+        let remote_root = shell_quote(upload.remote_root.as_str());
+        self.exec_checked(
+            &sh_c(&format!("mkdir -p {remote_root}")),
+            TarCheck::new(error_info::SYNC_SSH_TAR_FAILED)
+                .with_hint("failed to create remote directory"),
+        )?;
+        self.exec_checked(
+            &sh_c(&format!("test -d {remote_root}")),
+            TarCheck::new(error_info::SYNC_SSH_TAR_FAILED)
+                .with_hint("remote path is not a directory"),
+        )?;
+        self.exec_checked(
+            &sh_c(&format!("test -w {remote_root}")),
+            TarCheck::new(error_info::SYNC_SSH_TAR_FAILED)
+                .with_hint("remote directory is not writable"),
+        )?;
+        let command = sh_c(&format!(
+            "tar -xf - -C {}",
+            shell_quote(upload.remote_root.as_str())
+        ));
+        let mut channel = self
+            .session
+            .channel_session()
+            .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+        channel
+            .exec(&command)
+            .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+        let finish_result = {
+            let mut archive = tar::Builder::new(&mut channel);
+            append_project_tar(&mut archive, upload)?;
+            archive.finish()
+        };
+        finish_result.map_err(|source| tar_channel_error(source, &command, &mut channel))?;
+        channel
+            .send_eof()
+            .map_err(|source| tar_channel_error(source, &command, &mut channel))?;
+        channel
+            .wait_eof()
+            .map_err(|source| tar_channel_error(source, &command, &mut channel))?;
+        channel
+            .wait_close()
+            .map_err(|source| tar_channel_error(source, &command, &mut channel))?;
+        let stderr = read_channel_stderr(&mut channel);
+        let code = channel.exit_status().map_err(|source| {
+            err_with_source(error_info::SYNC_SSH_TAR_FAILED, source).with_command(command.clone())
+        })?;
+        if code == 0 {
+            Ok(())
+        } else {
+            let mut error = err(error_info::SYNC_SSH_TAR_FAILED)
+                .with_command(command)
+                .with_exit_code(Some(code));
+            if !stderr.is_empty() {
+                error = error.with_hint(stderr);
+            }
+            Err(error)
+        }
+    }
+
+    fn exec_checked(&mut self, command: &str, check: TarCheck) -> Result<()> {
+        let mut channel = self.session.channel_session().map_err(|source| {
+            check
+                .error_with_source(source)
+                .with_command(command.to_owned())
+        })?;
+        channel.exec(command).map_err(|source| {
+            check
+                .error_with_source(source)
+                .with_command(command.to_owned())
+        })?;
+        let stdout = read_channel_stdout(&mut channel);
+        let stderr = read_channel_stderr(&mut channel);
+        channel.wait_close().map_err(|source| {
+            check
+                .error_with_source(source)
+                .with_command(command.to_owned())
+        })?;
+        let code = channel.exit_status().map_err(|source| {
+            check
+                .error_with_source(source)
+                .with_command(command.to_owned())
+        })?;
+        if code == 0 {
+            Ok(())
+        } else {
+            let mut error = err(check.info)
+                .with_command(command.to_owned())
+                .with_exit_code(Some(code));
+            if !stderr.is_empty() {
+                error = error.with_hint(stderr);
+            } else if !stdout.is_empty() {
+                error = error.with_hint(stdout);
+            } else if let Some(hint) = check.hint {
+                error = error.with_hint(hint);
+            }
+            Err(error)
+        }
+    }
+}
+
+struct TarCheck {
+    info: ErrorInfo,
+    hint: Option<&'static str>,
+}
+
+impl TarCheck {
+    fn new(info: ErrorInfo) -> Self {
+        Self { info, hint: None }
+    }
+
+    fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    fn error_with_source(
+        &self,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> crate::error::RdevError {
+        let mut error = err_with_source(self.info, source);
+        if let Some(hint) = self.hint {
+            error = error.with_hint(hint);
+        }
+        error
+    }
+}
+
+fn sh_c(script: &str) -> String {
+    format!("sh -c {}", shell_quote(&with_remote_path(script)))
+}
+
+fn with_remote_path(command: &str) -> String {
+    format!("PATH={}:$PATH; {}", shell_quote(REMOTE_BASE_PATH), command)
+}
+
+fn tar_channel_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+    command: &str,
+    channel: &mut ssh2::Channel,
+) -> crate::error::RdevError {
+    let mut error =
+        err_with_source(error_info::SYNC_SSH_TAR_FAILED, source).with_command(command.to_owned());
+    let stderr = read_channel_stderr(channel);
+    if !stderr.is_empty() {
+        error = error.with_hint(stderr);
+    }
+    error
+}
+
+fn read_channel_stderr(channel: &mut ssh2::Channel) -> String {
+    let mut stderr = String::new();
+    let _read_result = channel.stderr().read_to_string(&mut stderr);
+    stderr.trim().to_owned()
+}
+
+fn read_channel_stdout(channel: &mut ssh2::Channel) -> String {
+    let mut stdout = String::new();
+    let _read_result = channel.read_to_string(&mut stdout);
+    stdout.trim().to_owned()
+}
+
+struct TarUpload<'a> {
+    config: &'a AppConfig,
+    request: &'a SyncRequest,
+    remote_root: &'a RemotePath,
+}
+
+fn append_project_tar<W: Write>(
+    archive: &mut tar::Builder<W>,
+    upload: TarUpload<'_>,
+) -> Result<()> {
+    for watch_dir in &upload.config.sync.watch_dirs {
+        let source = local_source(&upload.request.project_root, watch_dir);
+        for entry in WalkDir::new(&source)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.path() == source
+                    || !is_excluded(
+                        entry.path(),
+                        &upload.request.project_root,
+                        &upload.config.sync.exclude,
+                    )
+            })
+        {
+            let entry =
+                entry.map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+            let path = entry.path();
+            if path == source {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(&upload.request.project_root) else {
+                continue;
+            };
+            let archive_name = path_to_forward_slashes(relative);
+            if entry.file_type().is_dir() {
+                archive
+                    .append_dir(archive_name, path)
+                    .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+            } else if entry.file_type().is_file() {
+                archive
+                    .append_path_with_name(path, archive_name)
+                    .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn local_source(project_root: &Path, watch_dir: &Path) -> PathBuf {
+    if watch_dir.components().all(|component| {
+        let item = component.as_os_str().to_string_lossy();
+        item == "."
+    }) {
+        project_root.to_path_buf()
+    } else {
+        project_root.join(watch_dir)
+    }
+}
+
+fn is_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
+    let Ok(relative) = path.strip_prefix(local_root) else {
+        return true;
+    };
+    relative.components().any(|component| {
+        let item = component.as_os_str().to_string_lossy();
+        excludes.iter().any(|exclude| exclude == item.as_ref())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

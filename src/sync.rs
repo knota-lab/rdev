@@ -21,6 +21,16 @@ pub struct SyncDeltaRequest {
     pub deletes: Vec<PathBuf>,
 }
 
+pub trait SyncBackend {
+    fn warm_up(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_full(&self, request: SyncRequest) -> Result<SyncReport>;
+
+    fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     mode: SyncMode,
@@ -34,6 +44,7 @@ impl SyncReport {
             SyncMode::NativeRsync => "native",
             SyncMode::WslRsync => "wsl",
             SyncMode::Sftp => "sftp",
+            SyncMode::SshTar => "ssh-tar",
         };
         let action = if self.dry_run { "dry-run" } else { "sync" };
         format!(
@@ -54,6 +65,18 @@ impl SyncReport {
             dry_run: false,
         }
     }
+
+    pub fn completed_ssh_tar(watch_dirs: Vec<PathBuf>, dry_run: bool) -> Self {
+        let synced_roots = watch_dirs
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        Self {
+            mode: SyncMode::SshTar,
+            synced_roots,
+            dry_run,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +84,7 @@ enum SyncMode {
     NativeRsync,
     WslRsync,
     Sftp,
+    SshTar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +233,19 @@ where
         } else {
             Err(tool_rsync_error(output, display))
         }
+    }
+}
+
+impl<R> SyncBackend for RsyncSyncBackend<'_, R>
+where
+    R: ProcessRunner,
+{
+    fn sync_full(&self, request: SyncRequest) -> Result<SyncReport> {
+        RsyncSyncBackend::sync_full(self, request)
+    }
+
+    fn sync_delta(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
+        RsyncSyncBackend::sync_delta(self, request)
     }
 }
 

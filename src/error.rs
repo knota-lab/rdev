@@ -175,6 +175,9 @@ pub fn format_error(error: &RdevError) -> String {
     if let Some(hint) = &error.hint {
         output.push_str(&format!("\n[hint] {hint}"));
     }
+    if let Some(source) = error.source() {
+        output.push_str(&format!("\n[source] {source}"));
+    }
     append_context(&mut output, "command", error.context.command.as_deref());
     append_context(&mut output, "path", error.context.path.as_deref());
     append_context(&mut output, "remote", error.context.remote.as_deref());

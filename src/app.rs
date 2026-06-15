@@ -4,13 +4,14 @@ use std::path::Path;
 use crate::auth::run_auth_check;
 use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs, SyncArgs};
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
-use crate::config::{AppConfig, CONFIG_FILE_NAME};
+use crate::config::{AppConfig, SyncBackendKind, CONFIG_FILE_NAME};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
 use crate::process::SystemProcessRunner;
-use crate::sync::{RsyncSyncBackend, SyncRequest};
+use crate::sftp::SftpDeltaBackend;
+use crate::sync::{RsyncSyncBackend, SyncBackend, SyncRequest};
 use crate::up::{run_up, UpRequest};
 
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
@@ -74,13 +75,26 @@ fn run_command(args: RunArgs, cwd: &Path) -> Result<String> {
 fn sync(args: SyncArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
     let runner = SystemProcessRunner::default();
-    let backend = RsyncSyncBackend::new(&config, &runner);
+    let rsync_backend = RsyncSyncBackend::new(&config, &runner);
+    let ssh_backend = SftpDeltaBackend::new(&config);
+    let backend = sync_backend(&config, &rsync_backend, &ssh_backend);
     let report = backend.sync_full(SyncRequest {
         dry_run: args.dry_run,
         delete: config.sync.delete && !args.no_delete,
         project_root: resolve_local_root(cwd, &config.sync.local_path),
     })?;
     Ok(report.format_text())
+}
+
+fn sync_backend<'a>(
+    config: &AppConfig,
+    rsync: &'a dyn SyncBackend,
+    ssh: &'a dyn SyncBackend,
+) -> &'a dyn SyncBackend {
+    match config.sync.backend {
+        SyncBackendKind::Rsync => rsync,
+        SyncBackendKind::Ssh | SyncBackendKind::Auto => ssh,
+    }
 }
 
 fn up(args: crate::cli::UpArgs, cwd: &Path) -> Result<String> {

@@ -4,6 +4,8 @@ use crate::error_info;
 use crate::path::RemotePath;
 use crate::process::{ProcessCommand, ProcessRunner};
 
+const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorReport {
     checks: Vec<DoctorCheck>,
@@ -62,6 +64,9 @@ pub fn run_doctor(config: &AppConfig, runner: &impl ProcessRunner) -> Result<Doc
     let remote = RemoteTarget::from_config(config);
     check_remote_sh(runner, &remote)?;
     checks.push(DoctorCheck::ok("remote.sh", "available"));
+
+    check_remote_tar(runner, &remote)?;
+    checks.push(DoctorCheck::ok("remote.tar", "available"));
 
     check_remote_rsync(runner, &remote)?;
     checks.push(DoctorCheck::ok("remote.rsync", "available"));
@@ -238,6 +243,13 @@ fn check_remote_rsync(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Res
     )
 }
 
+fn check_remote_tar(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(remote, "command -v tar", error_info::REMOTE_TAR_NOT_FOUND),
+    )
+}
+
 fn check_remote_path_writable(
     runner: &impl ProcessRunner,
     remote: &RemoteTarget,
@@ -296,7 +308,7 @@ fn check_remote_command(
 }
 
 fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
-    let remote_shell = format!("sh -lc {}", shell_quote(remote_command));
+    let remote_shell = format!("sh -c {}", shell_quote(&with_remote_path(remote_command)));
     ProcessCommand::new("ssh")
         .arg("-p")
         .arg(remote.port.to_string())
@@ -306,6 +318,10 @@ fn ssh_command(remote: &RemoteTarget, remote_command: &str) -> ProcessCommand {
         .arg("ConnectTimeout=5")
         .arg(remote.host.clone())
         .arg(remote_shell)
+}
+
+fn with_remote_path(command: &str) -> String {
+    format!("PATH={}:$PATH; {}", shell_quote(REMOTE_BASE_PATH), command)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -373,7 +389,7 @@ mod tests {
     #[test]
     fn doctor_runs_expected_checks() {
         let config = AppConfig::template("root@example.com", 22, "/root/project");
-        let runner = FakeRunner::success(5);
+        let runner = FakeRunner::success(6);
 
         let report = run_doctor(&config, &runner);
 
@@ -384,13 +400,14 @@ mod tests {
         };
         let output = report.format_text();
         assert!(output.contains("config ok"));
+        assert!(output.contains("remote.tar ok"));
         assert!(output.contains("remote.path.writable ok"));
-        assert_eq!(runner.commands.borrow().len(), 5);
+        assert_eq!(runner.commands.borrow().len(), 6);
         assert!(runner
             .commands
             .borrow()
             .iter()
-            .any(|command| command.contains("sh -lc")));
+            .any(|command| command.contains("sh -c")));
     }
 
     #[test]
@@ -407,7 +424,15 @@ mod tests {
     #[test]
     fn doctor_falls_back_to_wsl_rsync_in_auto_mode() {
         let config = AppConfig::template("root@example.com", 22, "/root/project");
-        let runner = FakeRunner::from_codes([Some(0), Some(1), Some(0), Some(0), Some(0), Some(0)]);
+        let runner = FakeRunner::from_codes([
+            Some(0),
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        ]);
 
         let report = run_doctor(&config, &runner);
 

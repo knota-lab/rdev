@@ -14,12 +14,12 @@ use std::thread;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SyncBackendKind};
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::process::ProcessRunner;
 use crate::sftp::SftpDeltaBackend;
-use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
+use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest, SyncRequest};
 
 const RDEV_DIR: &str = ".rdev";
 const STOP_FILE: &str = "stop";
@@ -39,21 +39,51 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     let _guard = UpStateGuard::new(request.project_root.clone());
     let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
     let rsync_backend = RsyncSyncBackend::new(config, runner);
-    let delta_backend = SftpDeltaBackend::new(config);
+    let ssh_backend = SftpDeltaBackend::new(config);
+    let backend = sync_backend(config, &rsync_backend, &ssh_backend);
     if request.initial_sync {
-        let report = rsync_backend.sync_full(SyncRequest {
+        let report = backend.sync_full(SyncRequest {
             dry_run: false,
             delete: config.sync.delete,
             project_root: local_root.clone(),
         })?;
         println!("{}", report.format_text());
     }
-    delta_backend.warm_up()?;
+    run_watch_loop(WatchLoop {
+        config,
+        request: &request,
+        local_root: &local_root,
+        backend,
+        shutdown,
+    })
+}
+
+fn sync_backend<'a>(
+    config: &AppConfig,
+    rsync: &'a dyn SyncBackend,
+    ssh: &'a dyn SyncBackend,
+) -> &'a dyn SyncBackend {
+    match config.sync.backend {
+        SyncBackendKind::Rsync => rsync,
+        SyncBackendKind::Ssh | SyncBackendKind::Auto => ssh,
+    }
+}
+
+struct WatchLoop<'a> {
+    config: &'a AppConfig,
+    request: &'a UpRequest,
+    local_root: &'a Path,
+    backend: &'a dyn SyncBackend,
+    shutdown: Arc<AtomicBool>,
+}
+
+fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
+    watch.backend.warm_up()?;
     let (sender, receiver) = mpsc::channel();
-    install_stdin_shutdown(Arc::clone(&shutdown));
-    let mut watcher = build_watcher(request.poll, sender)?;
-    for watch_dir in &config.sync.watch_dirs {
-        let watch_path = local_root.join(watch_dir);
+    install_stdin_shutdown(Arc::clone(&watch.shutdown));
+    let mut watcher = build_watcher(watch.request.poll, sender)?;
+    for watch_dir in &watch.config.sync.watch_dirs {
+        let watch_path = watch.local_root.join(watch_dir);
         watcher
             .watch(&watch_path, RecursiveMode::Recursive)
             .map_err(|source| {
@@ -64,11 +94,11 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     }
     print_stop_hint();
 
-    let debounce = Duration::from_millis(config.sync.debounce_ms.max(50));
+    let debounce = Duration::from_millis(watch.config.sync.debounce_ms.max(50));
     let mut pending = PendingChanges::default();
     let mut synced_files = SyncedFiles::default();
     let mut last_event_at = Instant::now();
-    while !shutdown_requested(&shutdown, &request.project_root) {
+    while !shutdown_requested(&watch.shutdown, &watch.request.project_root) {
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
@@ -78,7 +108,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         match receiver.recv_timeout(timeout) {
             Ok(event) => {
                 if let Some(changes) =
-                    collect_event_changes(&event, &local_root, &config.sync.exclude)
+                    collect_event_changes(&event, watch.local_root, &watch.config.sync.exclude)
                 {
                     pending.merge(changes);
                     last_event_at = Instant::now();
@@ -87,17 +117,17 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if pending.has_changes() && last_event_at.elapsed() >= debounce {
                     let changes = pending.take();
-                    let changes = reconcile_existing_paths(changes, &local_root);
-                    let changes = synced_files.filter_changed(changes, &local_root);
+                    let changes = reconcile_existing_paths(changes, watch.local_root);
+                    let changes = synced_files.filter_changed(changes, watch.local_root);
                     if !changes.has_changes() {
                         continue;
                     }
-                    let report = delta_backend.sync_delta(SyncDeltaRequest {
-                        project_root: local_root.clone(),
+                    let report = watch.backend.sync_delta(SyncDeltaRequest {
+                        project_root: watch.local_root.to_path_buf(),
                         uploads: changes.uploads.iter().cloned().collect(),
                         deletes: changes.deletes.iter().cloned().collect(),
                     })?;
-                    synced_files.record(&changes, &local_root);
+                    synced_files.record(&changes, watch.local_root);
                     println!("{}", report.format_text());
                 }
             }
