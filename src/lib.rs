@@ -13,5 +13,7 @@ pub mod error_info;
 pub mod path;
 pub mod process;
 pub mod sftp;
+pub mod ssh;
+pub mod ssh_tar;
 pub mod sync;
 pub mod up;
