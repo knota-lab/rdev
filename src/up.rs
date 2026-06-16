@@ -58,7 +58,8 @@ impl UpStatus {
 }
 
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
-    let shutdown = install_shutdown_handler()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let interrupt = install_interrupt_handler()?;
     ensure_no_running_instance(&request.project_root)?;
     clear_stop_request(&request.project_root)?;
     write_pid_file(&request.project_root)?;
@@ -72,11 +73,18 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
             dry_run: false,
             delete: config.sync.delete,
             project_root: local_root.clone(),
-            cancelled: Some(Arc::clone(&shutdown)),
+            cancelled: Some(Arc::clone(&interrupt)),
         };
         confirm_initial_sync(config, &sync_request)?;
-        let report = backend.sync_full(sync_request)?;
-        println!("{}", report.format_text());
+        match backend.sync_full(sync_request) {
+            Ok(report) => println!("{}", report.format_text()),
+            Err(error) if interrupt.load(Ordering::SeqCst) && is_sync_cancelled(&error) => {
+                println!("{error}");
+                println!("[sync] initial sync cancelled; watch continues");
+                interrupt.store(false, Ordering::SeqCst);
+            }
+            Err(error) => return Err(error),
+        }
     }
     run_watch_loop(WatchLoop {
         config,
@@ -84,6 +92,7 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         local_root: &local_root,
         backend,
         shutdown,
+        interrupt,
     })
 }
 
@@ -251,6 +260,7 @@ struct WatchLoop<'a> {
     local_root: &'a Path,
     backend: &'a dyn SyncBackend,
     shutdown: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
 }
 
 fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
@@ -277,6 +287,10 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
     let mut synced_files = SyncedFiles::default();
     let mut last_event_at = Instant::now();
     while !shutdown_requested(&watch.shutdown, &watch.request.project_root) {
+        if watch.interrupt.swap(false, Ordering::SeqCst) {
+            println!("[console] interrupted");
+            print_prompt();
+        }
         if handle_console_commands(&watch, &sessions, &console_receiver)? {
             watch.shutdown.store(true, Ordering::SeqCst);
             break;
@@ -307,11 +321,12 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
                     if !changes.has_changes() {
                         continue;
                     }
+                    watch.interrupt.store(false, Ordering::SeqCst);
                     let result = watch.backend.sync_delta(SyncDeltaRequest {
                         project_root: watch.local_root.to_path_buf(),
                         uploads: changes.uploads.iter().cloned().collect(),
                         deletes: changes.deletes.iter().cloned().collect(),
-                        cancelled: Some(Arc::clone(&watch.shutdown)),
+                        cancelled: Some(Arc::clone(&watch.interrupt)),
                     });
                     match result {
                         Ok(report) => {
@@ -320,7 +335,12 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
                         }
                         Err(error) => {
                             println!("{error}");
-                            println!("[sync] delta failed; watch continues");
+                            if is_sync_cancelled(&error) {
+                                println!("[sync] delta cancelled; watch continues");
+                                watch.interrupt.store(false, Ordering::SeqCst);
+                            } else {
+                                println!("[sync] delta failed; watch continues");
+                            }
                         }
                     }
                 }
@@ -404,13 +424,21 @@ fn handle_console_command(
             println!("{}", SessionManager::restart(sessions, &selector)?);
         }
         ConsoleCommand::Sync => {
-            let report = watch.backend.sync_full(SyncRequest {
+            watch.interrupt.store(false, Ordering::SeqCst);
+            match watch.backend.sync_full(SyncRequest {
                 dry_run: false,
                 delete: watch.config.sync.delete,
                 project_root: watch.local_root.to_path_buf(),
-                cancelled: Some(Arc::clone(&watch.shutdown)),
-            })?;
-            println!("{}", report.format_text());
+                cancelled: Some(Arc::clone(&watch.interrupt)),
+            }) {
+                Ok(report) => println!("{}", report.format_text()),
+                Err(error) if is_sync_cancelled(&error) => {
+                    println!("{error}");
+                    println!("[sync] sync cancelled");
+                    watch.interrupt.store(false, Ordering::SeqCst);
+                }
+                Err(error) => return Err(error),
+            }
         }
         ConsoleCommand::Quit => {
             let mut manager = lock_sessions_for_console(sessions)?;
@@ -495,6 +523,10 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 
 fn shutdown_requested(shutdown: &AtomicBool, project_root: &Path) -> bool {
     shutdown.load(Ordering::SeqCst) || stop_requested(project_root)
+}
+
+fn is_sync_cancelled(error: &crate::error::RdevError) -> bool {
+    error.info.code == error_info::SYNC_CANCELLED.code
 }
 
 fn print_stop_hint() {
@@ -647,14 +679,14 @@ fn terminate_other_pid(pid: u32) -> Result<()> {
     }
 }
 
-fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&shutdown);
+fn install_interrupt_handler() -> Result<Arc<AtomicBool>> {
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&interrupt);
     ctrlc::set_handler(move || {
         signal.store(true, Ordering::SeqCst);
     })
     .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
-    Ok(shutdown)
+    Ok(interrupt)
 }
 
 fn install_console_input(shutdown: Arc<AtomicBool>) -> mpsc::Receiver<String> {
@@ -664,7 +696,12 @@ fn install_console_input(shutdown: Arc<AtomicBool>) -> mpsc::Receiver<String> {
         loop {
             line.clear();
             match io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
                     shutdown.store(true, Ordering::SeqCst);
                     return;
                 }

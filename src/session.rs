@@ -665,7 +665,7 @@ struct RemoteSession {
 
 impl RemoteSession {
     fn shell_command(&self, command: &str) -> Command {
-        let remote_command = format!("cd {} && exec {command}", shell_quote(&self.remote_root));
+        let remote_command = format!("cd {} && {command}", shell_quote(&self.remote_root));
         let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
         let mut ssh = Command::new("ssh");
         ssh.arg("-p")
@@ -762,7 +762,7 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_console_command, ConsoleCommand};
+    use super::{parse_console_command, ConsoleCommand, RemoteSession};
 
     #[test]
     fn parses_new_session_command() {
@@ -814,6 +814,28 @@ mod tests {
                 lines: 10
             }
         );
+    }
+
+    #[test]
+    fn remote_session_runs_compound_command_under_shell() {
+        let remote = RemoteSession {
+            host: "root@example.test".to_owned(),
+            port: 2222,
+            remote_root: "/root/project".to_owned(),
+        };
+
+        let command = remote.shell_command("cd app && pwd");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "root@example.test"));
+        let remote_shell = args.last().map(String::as_str).unwrap_or_default();
+        assert!(remote_shell.starts_with("sh -lc "));
+        assert!(remote_shell.contains("/root/project"));
+        assert!(remote_shell.contains("&& cd app && pwd"));
+        assert!(!remote_shell.contains("exec cd app"));
     }
 
     #[test]
