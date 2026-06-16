@@ -166,6 +166,7 @@ impl SessionManager {
         };
         let mut child = build(&command)
             .current_dir(cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -668,10 +669,16 @@ impl RemoteSession {
         let remote_command = format!("cd {} && {command}", shell_quote(&self.remote_root));
         let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
         let mut ssh = Command::new("ssh");
-        ssh.arg("-p")
+        ssh.arg("-n")
+            .arg("-T")
+            .arg("-p")
             .arg(self.port.to_string())
             .arg("-o")
             .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ServerAliveInterval=15")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3")
             .arg(self.host.clone())
             .arg(remote_shell);
         ssh
@@ -830,6 +837,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
+        assert!(args.iter().any(|arg| arg == "-n"));
+        assert!(args.iter().any(|arg| arg == "-T"));
+        assert!(args.iter().any(|arg| arg == "ServerAliveInterval=15"));
+        assert!(args.iter().any(|arg| arg == "ServerAliveCountMax=3"));
         assert!(args.iter().any(|arg| arg == "root@example.test"));
         let remote_shell = args.last().map(String::as_str).unwrap_or_default();
         assert!(remote_shell.starts_with("sh -lc "));
