@@ -1,0 +1,513 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use crate::error::{err, err_with_source, Result};
+use crate::error_info;
+
+const MAX_LOG_LINES: usize = 500;
+
+pub type SharedSessions = Arc<Mutex<SessionManager>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleCommand {
+    Help,
+    Sessions,
+    NewSession { name: String, command: String },
+    Logs { selector: Option<String> },
+    Focus { selector: String },
+    Stop { selector: String },
+    Restart { selector: String },
+    Sync,
+    Quit,
+    Empty,
+    Unknown(String),
+}
+
+#[derive(Debug)]
+pub struct SessionManager {
+    next_id: u32,
+    sessions: BTreeMap<u32, ManagedSession>,
+    names: BTreeMap<String, u32>,
+    focused: Option<u32>,
+    cwd: PathBuf,
+}
+
+#[derive(Debug)]
+struct ManagedSession {
+    id: u32,
+    name: String,
+    command: String,
+    status: SessionStatus,
+    child: Option<Child>,
+    logs: VecDeque<String>,
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStatus {
+    Running,
+    Exited,
+    Stopped,
+}
+
+impl SessionManager {
+    pub fn shared(cwd: PathBuf) -> SharedSessions {
+        Arc::new(Mutex::new(Self {
+            next_id: 1,
+            sessions: BTreeMap::new(),
+            names: BTreeMap::new(),
+            focused: None,
+            cwd,
+        }))
+    }
+
+    pub fn start(shared: &SharedSessions, name: String, command: String) -> Result<String> {
+        validate_session_name(&name)?;
+        let cwd = {
+            let manager = lock_sessions(shared)?;
+            if manager.names.contains_key(&name) {
+                return Err(err(error_info::WATCH_EVENT_FAILED)
+                    .with_hint(format!("session already exists: {name}")));
+            }
+            manager.cwd.clone()
+        };
+        let mut child = shell_command(&command)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let id = {
+            let mut manager = lock_sessions(shared)?;
+            let id = manager.next_id;
+            manager.next_id += 1;
+            manager.names.insert(name.clone(), id);
+            manager.focused = Some(id);
+            manager.sessions.insert(
+                id,
+                ManagedSession {
+                    id,
+                    name: name.clone(),
+                    command: command.clone(),
+                    status: SessionStatus::Running,
+                    child: Some(child),
+                    logs: VecDeque::new(),
+                    exit_code: None,
+                },
+            );
+            id
+        };
+        spawn_log_reader(LogReader {
+            shared: Arc::clone(shared),
+            id,
+            stream: "stdout",
+            reader: stdout,
+        });
+        spawn_log_reader(LogReader {
+            shared: Arc::clone(shared),
+            id,
+            stream: "stderr",
+            reader: stderr,
+        });
+        thread::sleep(Duration::from_millis(200));
+        let mut manager = lock_sessions(shared)?;
+        manager.refresh();
+        let Some(session) = manager.sessions.get(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        if session.status != SessionStatus::Running {
+            return Ok(format!(
+                "session exited id={id} name={name} exit={} command={command}; run logs {name}",
+                session
+                    .exit_code
+                    .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+            ));
+        }
+        Ok(format!(
+            "session started id={id} name={name} command={command}"
+        ))
+    }
+
+    pub fn list(&mut self) -> String {
+        self.refresh();
+        if self.sessions.is_empty() {
+            return "sessions: <none>".to_owned();
+        }
+        let mut lines = vec!["sessions:".to_owned()];
+        for session in self.sessions.values() {
+            let focus = if Some(session.id) == self.focused {
+                "*"
+            } else {
+                " "
+            };
+            let exit = session
+                .exit_code
+                .map_or_else(|| "-".to_owned(), |code| code.to_string());
+            lines.push(format!(
+                "{focus} {} {} status={} exit={} command={}",
+                session.id,
+                session.name,
+                session.status.label(),
+                exit,
+                session.command
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub fn logs(&mut self, selector: Option<&str>) -> Result<String> {
+        self.refresh();
+        let id = self.resolve_or_focused(selector)?;
+        let Some(session) = self.sessions.get(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        if session.logs.is_empty() {
+            return Ok(format!("logs {}: <empty>", session.name));
+        }
+        Ok(session.logs.iter().cloned().collect::<Vec<_>>().join("\n"))
+    }
+
+    pub fn focus(&mut self, selector: &str) -> Result<String> {
+        self.refresh();
+        let id = self.resolve(selector)?;
+        self.focused = Some(id);
+        let Some(session) = self.sessions.get(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        Ok(format!("focused {} ({})", session.name, session.id))
+    }
+
+    pub fn stop(&mut self, selector: &str) -> Result<String> {
+        self.refresh();
+        let id = self.resolve(selector)?;
+        self.stop_id(id)
+    }
+
+    pub fn restart(shared: &SharedSessions, selector: &str) -> Result<String> {
+        let (name, command) = {
+            let mut manager = lock_sessions(shared)?;
+            manager.refresh();
+            let id = manager.resolve(selector)?;
+            let Some(session) = manager.sessions.get(&id) else {
+                return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            };
+            (session.name.clone(), session.command.clone())
+        };
+        {
+            let mut manager = lock_sessions(shared)?;
+            let _stopped = manager.stop(&name)?;
+            manager.remove_session(&name)?;
+        }
+        Self::start(shared, name, command)
+    }
+
+    pub fn stop_all(&mut self) {
+        let ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let _ignored = self.stop_id(id);
+        }
+    }
+
+    fn stop_id(&mut self, id: u32) -> Result<String> {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        if session.status != SessionStatus::Running {
+            return Ok(format!(
+                "session already {}: {}",
+                session.status.label(),
+                session.name
+            ));
+        }
+        if let Some(mut child) = session.child.take() {
+            terminate_child(&mut child)?;
+            let status = child
+                .wait()
+                .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+            session.exit_code = status.code();
+        }
+        session.status = SessionStatus::Stopped;
+        push_log(session, "[rdev] stopped".to_owned());
+        Ok(format!("session stopped: {}", session.name))
+    }
+
+    fn remove_session(&mut self, name: &str) -> Result<()> {
+        let Some(id) = self.names.remove(name) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        self.sessions.remove(&id);
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
+        Ok(())
+    }
+
+    fn resolve_or_focused(&self, selector: Option<&str>) -> Result<u32> {
+        match selector {
+            Some(selector) => self.resolve(selector),
+            None => self
+                .focused
+                .ok_or_else(|| err(error_info::WATCH_EVENT_FAILED).with_hint("no focused session")),
+        }
+    }
+
+    fn resolve(&self, selector: &str) -> Result<u32> {
+        if let Ok(id) = selector.parse::<u32>() {
+            if self.sessions.contains_key(&id) {
+                return Ok(id);
+            }
+        }
+        self.names
+            .get(selector)
+            .copied()
+            .ok_or_else(|| err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"))
+    }
+
+    fn refresh(&mut self) {
+        for session in self.sessions.values_mut() {
+            if session.status != SessionStatus::Running {
+                continue;
+            }
+            let Some(child) = session.child.as_mut() else {
+                continue;
+            };
+            if let Ok(Some(status)) = child.try_wait() {
+                session.exit_code = status.code();
+                session.status = SessionStatus::Exited;
+                session.child = None;
+                push_log(
+                    session,
+                    format!("[rdev] exited code={}", status_code_label(status.code())),
+                );
+            }
+        }
+    }
+
+    fn push_log(&mut self, id: u32, line: String) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            push_log(session, line);
+        }
+    }
+}
+
+impl SessionStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+pub fn parse_console_command(line: &str) -> ConsoleCommand {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return ConsoleCommand::Empty;
+    }
+    if matches!(trimmed, "help" | "?") {
+        return ConsoleCommand::Help;
+    }
+    if matches!(trimmed, "ps" | "sessions") {
+        return ConsoleCommand::Sessions;
+    }
+    if matches!(trimmed, "quit" | "exit") {
+        return ConsoleCommand::Quit;
+    }
+    if trimmed == "sync" {
+        return ConsoleCommand::Sync;
+    }
+    if let Some(rest) = trimmed.strip_prefix("logs") {
+        let selector = optional_arg(rest);
+        return ConsoleCommand::Logs { selector };
+    }
+    if let Some(rest) = trimmed.strip_prefix("focus ") {
+        return ConsoleCommand::Focus {
+            selector: rest.trim().to_owned(),
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("stop ") {
+        return ConsoleCommand::Stop {
+            selector: rest.trim().to_owned(),
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("restart ") {
+        return ConsoleCommand::Restart {
+            selector: rest.trim().to_owned(),
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("new session ") {
+        return parse_new_session(rest);
+    }
+    ConsoleCommand::Unknown(trimmed.to_owned())
+}
+
+pub fn help_text() -> &'static str {
+    "commands: help, sessions|ps, new session <name> -- <local-command>, logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit"
+}
+
+fn parse_new_session(rest: &str) -> ConsoleCommand {
+    let Some((name, command)) = rest.split_once(" -- ") else {
+        return ConsoleCommand::Unknown(
+            "new session requires: new session <name> -- <command>".to_owned(),
+        );
+    };
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() || command.is_empty() {
+        return ConsoleCommand::Unknown("new session requires name and command".to_owned());
+    }
+    ConsoleCommand::NewSession {
+        name: name.to_owned(),
+        command: command.to_owned(),
+    }
+}
+
+fn optional_arg(rest: &str) -> Option<String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut shell = Command::new("powershell");
+        shell.arg("-NoProfile").arg("-Command").arg(command);
+        shell
+    }
+    #[cfg(not(windows))]
+    {
+        let mut shell = Command::new("sh");
+        shell.arg("-lc").arg(command);
+        shell
+    }
+}
+
+struct LogReader<R> {
+    shared: SharedSessions,
+    id: u32,
+    stream: &'static str,
+    reader: Option<R>,
+}
+
+fn spawn_log_reader<R>(task: LogReader<R>)
+where
+    R: std::io::Read + Send + 'static,
+{
+    if let Some(reader) = task.reader {
+        thread::spawn(move || {
+            let reader = BufReader::new(reader);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => format!("[rdev] {} read error: {error}", task.stream),
+                };
+                if let Ok(mut manager) = task.shared.lock() {
+                    manager.push_log(task.id, format!("[{}] {line}", task.stream));
+                }
+            }
+        });
+    }
+}
+
+fn lock_sessions(shared: &SharedSessions) -> Result<std::sync::MutexGuard<'_, SessionManager>> {
+    shared
+        .lock()
+        .map_err(|_| err(error_info::WATCH_EVENT_FAILED).with_hint("session manager poisoned"))
+}
+
+fn validate_session_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(err(error_info::WATCH_EVENT_FAILED)
+            .with_hint("session name may only contain ascii letters, numbers, _, -, ."))
+    }
+}
+
+fn push_log(session: &mut ManagedSession, line: String) {
+    if session.logs.len() >= MAX_LOG_LINES {
+        session.logs.pop_front();
+    }
+    session.logs.push_back(line);
+}
+
+fn status_code_label(code: Option<i32>) -> String {
+    code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+}
+
+#[cfg(windows)]
+fn terminate_child(child: &mut Child) -> Result<()> {
+    let output = Command::new("taskkill")
+        .arg("/PID")
+        .arg(child.id().to_string())
+        .arg("/T")
+        .arg("/F")
+        .output()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        child
+            .kill()
+            .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_child(child: &mut Child) -> Result<()> {
+    child
+        .kill()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_console_command, ConsoleCommand};
+
+    #[test]
+    fn parses_new_session_command() {
+        let command = parse_console_command("new session web -- pnpm dev");
+
+        assert_eq!(
+            command,
+            ConsoleCommand::NewSession {
+                name: "web".to_owned(),
+                command: "pnpm dev".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_logs_without_selector() {
+        assert_eq!(
+            parse_console_command("logs"),
+            ConsoleCommand::Logs { selector: None }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_command() {
+        assert_eq!(
+            parse_console_command("new session web"),
+            ConsoleCommand::Unknown(
+                "new session requires: new session <name> -- <command>".to_owned()
+            )
+        );
+    }
+}

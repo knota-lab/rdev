@@ -8,9 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(windows)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(not(windows))]
 use std::thread;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -20,6 +17,9 @@ use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::path::is_sync_excluded;
 use crate::process::ProcessRunner;
+use crate::session::{
+    help_text, parse_console_command, ConsoleCommand, SessionManager, SharedSessions,
+};
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest, SyncRequest};
 use walkdir::WalkDir;
@@ -255,7 +255,8 @@ struct WatchLoop<'a> {
 fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
     watch.backend.warm_up()?;
     let (sender, receiver) = mpsc::channel();
-    install_stdin_shutdown(Arc::clone(&watch.shutdown));
+    let console_receiver = install_console_input(Arc::clone(&watch.shutdown));
+    let sessions = SessionManager::shared(watch.local_root.to_path_buf());
     let mut watcher = build_watcher(watch.request.poll, sender)?;
     for watch_dir in &watch.config.sync.watch_dirs {
         let watch_path = watch.local_root.join(watch_dir);
@@ -268,12 +269,17 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
         println!("[watch] {}", watch_path.display());
     }
     print_stop_hint();
+    print_prompt();
 
     let debounce = Duration::from_millis(watch.config.sync.debounce_ms.max(50));
     let mut pending = PendingChanges::default();
     let mut synced_files = SyncedFiles::default();
     let mut last_event_at = Instant::now();
     while !shutdown_requested(&watch.shutdown, &watch.request.project_root) {
+        if handle_console_commands(&watch, &sessions, &console_receiver)? {
+            watch.shutdown.store(true, Ordering::SeqCst);
+            break;
+        }
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
@@ -314,8 +320,96 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
             }
         }
     }
+    if let Ok(mut sessions) = sessions.lock() {
+        sessions.stop_all();
+    }
     println!("[watch] stopped");
     Ok(())
+}
+
+fn handle_console_commands(
+    watch: &WatchLoop<'_>,
+    sessions: &SharedSessions,
+    receiver: &mpsc::Receiver<String>,
+) -> Result<bool> {
+    let mut should_quit = false;
+    while let Ok(line) = receiver.try_recv() {
+        let command = parse_console_command(&line);
+        match handle_console_command(watch, sessions, command) {
+            Ok(quit) => {
+                should_quit = quit;
+            }
+            Err(error) => {
+                println!("{error}");
+            }
+        }
+        if should_quit {
+            break;
+        }
+        print_prompt();
+    }
+    Ok(should_quit)
+}
+
+fn handle_console_command(
+    watch: &WatchLoop<'_>,
+    sessions: &SharedSessions,
+    command: ConsoleCommand,
+) -> Result<bool> {
+    match command {
+        ConsoleCommand::Help => println!("{}", help_text()),
+        ConsoleCommand::Sessions => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.list());
+        }
+        ConsoleCommand::NewSession { name, command } => {
+            println!("{}", SessionManager::start(sessions, name, command)?);
+        }
+        ConsoleCommand::Logs { selector } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.logs(selector.as_deref())?);
+        }
+        ConsoleCommand::Focus { selector } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.focus(&selector)?);
+        }
+        ConsoleCommand::Stop { selector } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.stop(&selector)?);
+        }
+        ConsoleCommand::Restart { selector } => {
+            println!("{}", SessionManager::restart(sessions, &selector)?);
+        }
+        ConsoleCommand::Sync => {
+            let report = watch.backend.sync_full(SyncRequest {
+                dry_run: false,
+                delete: watch.config.sync.delete,
+                project_root: watch.local_root.to_path_buf(),
+                cancelled: Some(Arc::clone(&watch.shutdown)),
+            })?;
+            println!("{}", report.format_text());
+        }
+        ConsoleCommand::Quit => return Ok(true),
+        ConsoleCommand::Empty => {}
+        ConsoleCommand::Unknown(message) => {
+            println!("[console] unknown command: {message}");
+            println!("{}", help_text());
+        }
+    }
+    Ok(false)
+}
+
+fn lock_sessions_for_console(
+    sessions: &SharedSessions,
+) -> Result<std::sync::MutexGuard<'_, SessionManager>> {
+    sessions
+        .lock()
+        .map_err(|_| err(error_info::WATCH_EVENT_FAILED).with_hint("session manager poisoned"))
+}
+
+fn print_prompt() {
+    print!("rdev> ");
+    let _flush = io::stdout().flush();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,20 +462,11 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 }
 
 fn shutdown_requested(shutdown: &AtomicBool, project_root: &Path) -> bool {
-    if shutdown.load(Ordering::SeqCst) || stop_requested(project_root) {
-        return true;
-    }
-    quit_key_pressed()
+    shutdown.load(Ordering::SeqCst) || stop_requested(project_root)
 }
 
-#[cfg(windows)]
 fn print_stop_hint() {
-    println!("[watch] press q to stop");
-}
-
-#[cfg(not(windows))]
-fn print_stop_hint() {
-    println!("[watch] press q then Enter to stop");
+    println!("[console] type help for commands; type quit to stop");
 }
 
 struct UpStateGuard {
@@ -540,49 +625,26 @@ fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
     Ok(shutdown)
 }
 
-fn install_stdin_shutdown(shutdown: Arc<AtomicBool>) {
-    #[cfg(windows)]
-    {
-        let _unused = shutdown;
-    }
-    #[cfg(not(windows))]
+fn install_console_input(shutdown: Arc<AtomicBool>) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut line = String::new();
         loop {
             line.clear();
             match io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) if line.trim().eq_ignore_ascii_case("q") => {
+                Ok(0) | Err(_) => {
                     shutdown.store(true, Ordering::SeqCst);
                     return;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    if sender.send(line.trim_end().to_owned()).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
-}
-
-#[cfg(windows)]
-fn quit_key_pressed() -> bool {
-    const KEY_DOWN: i16 = 0x8000u16 as i16;
-    const Q_KEY: i32 = b'Q' as i32;
-    static SEEN_DOWN: AtomicUsize = AtomicUsize::new(0);
-
-    let pressed =
-        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(Q_KEY) }
-            & KEY_DOWN
-            != 0;
-    if pressed {
-        SEEN_DOWN.swap(1, Ordering::SeqCst) == 0
-    } else {
-        SEEN_DOWN.store(0, Ordering::SeqCst);
-        false
-    }
-}
-
-#[cfg(not(windows))]
-fn quit_key_pressed() -> bool {
-    false
+    receiver
 }
 
 fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {
