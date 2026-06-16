@@ -307,13 +307,21 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
                     if !changes.has_changes() {
                         continue;
                     }
-                    let report = watch.backend.sync_delta(SyncDeltaRequest {
+                    let result = watch.backend.sync_delta(SyncDeltaRequest {
                         project_root: watch.local_root.to_path_buf(),
                         uploads: changes.uploads.iter().cloned().collect(),
                         deletes: changes.deletes.iter().cloned().collect(),
-                    })?;
-                    synced_files.record(&changes, watch.local_root);
-                    println!("{}", report.format_text());
+                    });
+                    match result {
+                        Ok(report) => {
+                            synced_files.record(&changes, watch.local_root);
+                            println!("{}", report.format_text());
+                        }
+                        Err(error) => {
+                            println!("{error}");
+                            println!("[sync] delta failed; watch continues");
+                        }
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

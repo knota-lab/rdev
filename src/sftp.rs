@@ -44,6 +44,10 @@ impl<'a> SftpDeltaBackend<'a> {
             for path in &request.uploads {
                 let item_started = Instant::now();
                 let local_path = request.project_root.join(path);
+                if !local_path.exists() {
+                    println!("[sync] upload skipped vanished path={}", path.display());
+                    continue;
+                }
                 let remote_path = remote_path(&remote_root, path);
                 client.upload(&local_path, Path::new(&remote_path))?;
                 println!(

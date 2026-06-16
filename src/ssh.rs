@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs::File;
+use std::fs::File as FsFile;
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -65,15 +65,24 @@ impl SshClient {
         let ensure_elapsed = ensure_started.elapsed().as_millis();
 
         let open_started = Instant::now();
-        let mut local = File::open(local_path).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(local_path.display())
-        })?;
+        let mut local = match FsFile::open(local_path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                println!(
+                    "[sync] upload skipped vanished local={}",
+                    local_path.display()
+                );
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                    .with_path(local_path.display()));
+            }
+        };
         let open_elapsed = open_started.elapsed().as_millis();
 
         let create_started = Instant::now();
-        let mut remote = self.sftp()?.create(remote_path).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
-        })?;
+        let mut remote = self.create_remote_file(remote_path)?;
         let create_elapsed = create_started.elapsed().as_millis();
 
         let copy_started = Instant::now();
@@ -90,6 +99,23 @@ impl SshClient {
             copy_elapsed
         );
         Ok(())
+    }
+
+    fn create_remote_file(&mut self, remote_path: &Path) -> Result<ssh2::File> {
+        match self.sftp()?.create(remote_path) {
+            Ok(file) => Ok(file),
+            Err(first_error) => {
+                self.invalidate_parent_dir(remote_path);
+                self.ensure_parent_dir(remote_path)?;
+                self.sftp()?.create(remote_path).map_err(|source| {
+                    err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                        .with_path(remote_path.display())
+                        .with_hint(format!(
+                            "retry after parent dir refresh; first error: {first_error}"
+                        ))
+                })
+            }
+        }
     }
 
     pub(crate) fn remove(&mut self, remote_path: &Path) -> Result<()> {
@@ -178,6 +204,13 @@ impl SshClient {
             return Ok(());
         };
         self.ensure_dir(parent)
+    }
+
+    fn invalidate_parent_dir(&mut self, remote_path: &Path) {
+        if let Some(parent) = remote_path.parent() {
+            self.ensured_dirs
+                .retain(|dir| dir != parent && !dir.starts_with(parent));
+        }
     }
 
     fn ensure_dir(&mut self, dir: &Path) -> Result<()> {
