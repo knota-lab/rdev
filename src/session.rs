@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::error::{err, err_with_source, Result};
@@ -13,6 +13,7 @@ use crate::path::RemotePath;
 use crate::ssh::shell_quote;
 
 const MAX_LOG_LINES: usize = 500;
+const CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub type SharedSessions = Arc<Mutex<SessionManager>>;
 
@@ -295,10 +296,7 @@ impl SessionManager {
         }
         if let Some(mut child) = session.child.take() {
             terminate_child(&mut child)?;
-            let status = child
-                .wait()
-                .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
-            session.exit_code = status.code();
+            session.exit_code = wait_child_exit(&mut child)?;
         }
         session.status = SessionStatus::Stopped;
         push_log(session, "[rdev] stopped".to_owned());
@@ -362,6 +360,20 @@ impl SessionManager {
             push_log(session, line);
         }
     }
+}
+
+fn wait_child_exit(child: &mut Child) -> Result<Option<i32>> {
+    let started = Instant::now();
+    while started.elapsed() < CHILD_WAIT_TIMEOUT {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(source) => {
+                return Err(err_with_source(error_info::WATCH_EVENT_FAILED, source));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]

@@ -284,7 +284,7 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
         let timeout = if pending.has_changes() {
             debounce.saturating_sub(last_event_at.elapsed())
         } else {
-            Duration::from_millis(500)
+            Duration::from_millis(100)
         };
 
         match receiver.recv_timeout(timeout) {
@@ -330,6 +330,7 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
         }
     }
     if let Ok(mut sessions) = sessions.lock() {
+        println!("[watch] stopping sessions");
         sessions.stop_all();
     }
     println!("[watch] stopped");
