@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ssh2::{Session, Sftp};
 use walkdir::WalkDir;
@@ -16,6 +16,7 @@ use crate::path::{is_sync_excluded, RemotePath};
 use crate::sync::{SyncBackend, SyncDeltaRequest, SyncReport, SyncRequest};
 
 const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const SSH_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct SftpDeltaBackend<'a> {
     config: &'a AppConfig,
@@ -152,6 +153,16 @@ impl SftpClient {
             err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
                 .with_remote(config.remote.host.clone())
         })?;
+        tcp.set_read_timeout(Some(SSH_IO_TIMEOUT))
+            .map_err(|source| {
+                err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
+                    .with_remote(config.remote.host.clone())
+            })?;
+        tcp.set_write_timeout(Some(SSH_IO_TIMEOUT))
+            .map_err(|source| {
+                err_with_source(error_info::REMOTE_SSH_CONNECT_FAILED, source)
+                    .with_remote(config.remote.host.clone())
+            })?;
         let mut session = Session::new()
             .map_err(|source| err_with_source(error_info::SYNC_SFTP_FAILED, source))?;
         session.set_tcp_stream(tcp);
@@ -280,6 +291,9 @@ impl SftpClient {
     }
 
     fn upload_tar(&mut self, upload: TarUpload<'_>) -> Result<()> {
+        if upload.request.is_cancelled() {
+            return Err(err(error_info::SYNC_CANCELLED));
+        }
         let remote_root = shell_quote(upload.remote_root.as_str());
         self.exec_checked(
             &sh_c(&format!("mkdir -p {remote_root}")),
@@ -447,10 +461,61 @@ struct TarUpload<'a> {
     remote_root: &'a RemotePath,
 }
 
+#[derive(Debug)]
+struct TarProgress {
+    started: Instant,
+    last_printed: Instant,
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+}
+
+impl TarProgress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_printed: now,
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+        }
+    }
+
+    fn record_file(&mut self, bytes: u64) {
+        self.files += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.print_if_due();
+    }
+
+    fn record_dir(&mut self) {
+        self.dirs += 1;
+        self.print_if_due();
+    }
+
+    fn print_if_due(&mut self) {
+        if self.last_printed.elapsed() >= Duration::from_secs(2) {
+            self.print("progress");
+            self.last_printed = Instant::now();
+        }
+    }
+
+    fn print(&self, label: &str) {
+        println!(
+            "[sync] tar {label} files={} dirs={} bytes={} elapsed_ms={}",
+            self.files,
+            self.dirs,
+            self.bytes,
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+
 fn append_project_tar<W: Write>(
     archive: &mut tar::Builder<W>,
     upload: TarUpload<'_>,
 ) -> Result<()> {
+    let mut progress = TarProgress::new();
     for watch_dir in &upload.config.sync.watch_dirs {
         let source = local_source(&upload.request.project_root, watch_dir);
         for entry in WalkDir::new(&source)
@@ -461,6 +526,9 @@ fn append_project_tar<W: Write>(
                     || !is_excluded(entry.path(), &source, &upload.config.sync.exclude)
             })
         {
+            if upload.request.is_cancelled() {
+                return Err(err(error_info::SYNC_CANCELLED));
+            }
             let entry =
                 entry.map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
             let path = entry.path();
@@ -475,13 +543,17 @@ fn append_project_tar<W: Write>(
                 archive
                     .append_dir(archive_name, path)
                     .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+                progress.record_dir();
             } else if entry.file_type().is_file() {
+                let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
                 archive
                     .append_path_with_name(path, archive_name)
                     .map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+                progress.record_file(bytes);
             }
         }
     }
+    progress.print("done");
     Ok(())
 }
 

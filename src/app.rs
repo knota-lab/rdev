@@ -85,6 +85,7 @@ fn sync(args: SyncArgs, cwd: &Path) -> Result<String> {
         dry_run: args.dry_run,
         delete: config.sync.delete && !args.no_delete,
         project_root: resolve_local_root(cwd, &config.sync.local_path),
+        cancelled: None,
     })?;
     Ok(report.format_text())
 }

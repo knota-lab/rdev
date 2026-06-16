@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::config::{AppConfig, RsyncMode};
 use crate::error::{err, err_with_source, Result};
@@ -12,6 +14,15 @@ pub struct SyncRequest {
     pub dry_run: bool,
     pub delete: bool,
     pub project_root: PathBuf,
+    pub cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl SyncRequest {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -591,6 +602,7 @@ mod tests {
             dry_run: true,
             delete: true,
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            cancelled: None,
         });
 
         assert!(report.is_ok());
@@ -619,6 +631,7 @@ mod tests {
             dry_run: true,
             delete: true,
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            cancelled: None,
         });
 
         assert!(result.is_err());
@@ -738,6 +751,7 @@ mod tests {
             dry_run: true,
             delete: true,
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
+            cancelled: None,
         });
 
         assert!(report.is_ok());

@@ -104,6 +104,14 @@ pub const SYNC_SSH_TAR_FAILED: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Sync,
 };
 
+pub const SYNC_CANCELLED: ErrorInfo = ErrorInfo {
+    code: "sync.cancelled",
+    message_zh: "同步已取消",
+    message_en: "Sync was cancelled",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Sync,
+};
+
 pub const SYNC_DELETE_REJECTED: ErrorInfo = ErrorInfo {
     code: "sync.delete_rejected",
     message_zh: "删除动作被路径保护拒绝",

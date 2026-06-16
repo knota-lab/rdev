@@ -1,6 +1,7 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,10 +22,13 @@ use crate::path::is_sync_excluded;
 use crate::process::ProcessRunner;
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest, SyncRequest};
+use walkdir::WalkDir;
 
 const RDEV_DIR: &str = ".rdev";
 const STOP_FILE: &str = "stop";
 const PID_FILE: &str = "up.pid";
+const LARGE_FULL_SYNC_FILES: u64 = 1_000;
+const LARGE_FULL_SYNC_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct UpRequest {
@@ -43,11 +47,14 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
     let ssh_backend = SftpDeltaBackend::new(config);
     let backend = sync_backend(config, &rsync_backend, &ssh_backend);
     if request.initial_sync {
-        let report = backend.sync_full(SyncRequest {
+        let sync_request = SyncRequest {
             dry_run: false,
             delete: config.sync.delete,
             project_root: local_root.clone(),
-        })?;
+            cancelled: Some(Arc::clone(&shutdown)),
+        };
+        confirm_initial_sync(config, &sync_request)?;
+        let report = backend.sync_full(sync_request)?;
         println!("{}", report.format_text());
     }
     run_watch_loop(WatchLoop {
@@ -57,6 +64,128 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         backend,
         shutdown,
     })
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SyncScanStats {
+    files: u64,
+    dirs: u64,
+    excluded: u64,
+    bytes: u64,
+}
+
+impl SyncScanStats {
+    fn is_large(&self) -> bool {
+        self.files > LARGE_FULL_SYNC_FILES || self.bytes > LARGE_FULL_SYNC_BYTES
+    }
+}
+
+fn confirm_initial_sync(config: &AppConfig, request: &SyncRequest) -> Result<()> {
+    let stats = scan_initial_sync(config, request)?;
+    println!(
+        "[sync] scan done files={} dirs={} excluded={} bytes={} ({})",
+        stats.files,
+        stats.dirs,
+        stats.excluded,
+        stats.bytes,
+        format_bytes(stats.bytes)
+    );
+    if !stats.is_large() {
+        return Ok(());
+    }
+    println!(
+        "[warn] initial sync is large: files={} bytes={} ({})",
+        stats.files,
+        stats.bytes,
+        format_bytes(stats.bytes)
+    );
+    print!("[warn] continue initial sync? [y/N]: ");
+    io::stdout()
+        .flush()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if request.is_cancelled() {
+        return Err(err(error_info::SYNC_CANCELLED));
+    }
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if request.is_cancelled() {
+        return Err(err(error_info::SYNC_CANCELLED));
+    }
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(err(error_info::SYNC_CANCELLED).with_hint("initial sync was not confirmed"))
+    }
+}
+
+fn scan_initial_sync(config: &AppConfig, request: &SyncRequest) -> Result<SyncScanStats> {
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut stats = SyncScanStats::default();
+    for watch_dir in &config.sync.watch_dirs {
+        let source = local_source(&request.project_root, watch_dir);
+        let excluded = Cell::new(0_u64);
+        for entry in WalkDir::new(&source)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                let keep = entry.path() == source
+                    || !is_sync_excluded(entry.path(), &source, &config.sync.exclude);
+                if !keep {
+                    excluded.set(excluded.get() + 1);
+                }
+                keep
+            })
+        {
+            if request.is_cancelled() {
+                return Err(err(error_info::SYNC_CANCELLED));
+            }
+            let entry =
+                entry.map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+            if entry.path() == source {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                stats.dirs += 1;
+            } else if entry.file_type().is_file() {
+                stats.files += 1;
+                stats.bytes = stats
+                    .bytes
+                    .saturating_add(entry.metadata().map_or(0, |m| m.len()));
+            }
+            if last_progress.elapsed() >= Duration::from_secs(2) {
+                println!(
+                    "[sync] scan progress files={} dirs={} excluded={} bytes={} elapsed_ms={}",
+                    stats.files,
+                    stats.dirs,
+                    stats.excluded + excluded.get(),
+                    stats.bytes,
+                    started.elapsed().as_millis()
+                );
+                last_progress = Instant::now();
+            }
+        }
+        stats.excluded += excluded.get();
+    }
+    Ok(stats)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn sync_backend<'a>(
@@ -510,11 +639,13 @@ fn local_source(local_root: &Path, watch_dir: &Path) -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::config::AppConfig;
+    use crate::sync::SyncRequest;
     use notify::{Event, EventKind};
 
     use super::{
         collect_event_changes, reconcile_existing_paths, request_stop, resolve_local_root,
-        stop_requested, EventFilter,
+        scan_initial_sync, stop_requested, EventFilter,
     };
 
     #[test]
@@ -632,5 +763,46 @@ mod tests {
         assert!(stop_requested(&root));
 
         let _cleanup_after = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn initial_sync_scan_respects_negated_excludes_anywhere() {
+        let root = std::env::temp_dir().join(format!("rdev-scan-test-{}", std::process::id()));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        write_test_file(&root.join("knota-fold\\data\\db.bin"), b"skip");
+        write_test_file(&root.join("knota-fold\\src\\data\\mod.rs"), b"keep");
+
+        let mut config = AppConfig::template("root@example.com", 22, "/root/project");
+        config.sync.watch_dirs = vec![PathBuf::from(".")];
+        config.sync.exclude = vec!["data".to_owned(), "!src/data".to_owned()];
+        let request = SyncRequest {
+            dry_run: false,
+            delete: true,
+            project_root: root.clone(),
+            cancelled: None,
+        };
+
+        let stats = match scan_initial_sync(&config, &request) {
+            Ok(stats) => stats,
+            Err(error) => panic!("scan should succeed: {error}"),
+        };
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.bytes, 4);
+        assert!(stats.excluded >= 1);
+
+        let _cleanup_after = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_test_file(path: &std::path::Path, bytes: &[u8]) {
+        let Some(parent) = path.parent() else {
+            panic!("test path should have parent");
+        };
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            panic!("create test dir: {error}");
+        }
+        if let Err(error) = std::fs::write(path, bytes) {
+            panic!("write test file: {error}");
+        }
     }
 }
