@@ -384,6 +384,14 @@ fn handle_console_command(
             let mut manager = lock_sessions_for_console(sessions)?;
             println!("{}", manager.logs(selector.as_deref())?);
         }
+        ConsoleCommand::Tail { selector, lines } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.tail_logs(selector.as_deref(), lines)?);
+        }
+        ConsoleCommand::ClearLogs { selector } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.clear_logs(selector.as_deref())?);
+        }
         ConsoleCommand::Focus { selector } => {
             let mut manager = lock_sessions_for_console(sessions)?;
             println!("{}", manager.focus(&selector)?);
@@ -404,7 +412,16 @@ fn handle_console_command(
             })?;
             println!("{}", report.format_text());
         }
-        ConsoleCommand::Quit => return Ok(true),
+        ConsoleCommand::Quit => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            if manager.has_running() {
+                println!("{}", manager.running_summary());
+                println!("[console] type quit! to stop sessions and exit");
+            } else {
+                return Ok(true);
+            }
+        }
+        ConsoleCommand::QuitForce => return Ok(true),
         ConsoleCommand::Empty => {}
         ConsoleCommand::Unknown(message) => {
             println!("[console] unknown command: {message}");

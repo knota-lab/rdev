@@ -21,14 +21,36 @@ pub type SharedSessions = Arc<Mutex<SessionManager>>;
 pub enum ConsoleCommand {
     Help,
     Sessions,
-    NewSession { name: String, command: String },
-    NewRemoteSession { name: String, command: String },
-    Logs { selector: Option<String> },
-    Focus { selector: String },
-    Stop { selector: String },
-    Restart { selector: String },
+    NewSession {
+        name: String,
+        command: String,
+    },
+    NewRemoteSession {
+        name: String,
+        command: String,
+    },
+    Logs {
+        selector: Option<String>,
+    },
+    Tail {
+        selector: Option<String>,
+        lines: usize,
+    },
+    ClearLogs {
+        selector: Option<String>,
+    },
+    Focus {
+        selector: String,
+    },
+    Stop {
+        selector: String,
+    },
+    Restart {
+        selector: String,
+    },
     Sync,
     Quit,
+    QuitForce,
     Empty,
     Unknown(String),
 }
@@ -42,7 +64,7 @@ pub struct SessionManager {
     cwd: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSessionSpec {
     name: String,
     command: String,
@@ -69,6 +91,7 @@ struct ManagedSession {
     id: u32,
     name: String,
     kind: SessionKind,
+    launch: SessionLaunch,
     command: String,
     status: SessionStatus,
     child: Option<Child>,
@@ -89,6 +112,12 @@ enum SessionKind {
     Remote,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionLaunch {
+    Local,
+    Remote(RemoteSessionSpec),
+}
+
 impl SessionManager {
     pub fn shared(cwd: PathBuf) -> SharedSessions {
         Arc::new(Mutex::new(Self {
@@ -101,24 +130,18 @@ impl SessionManager {
     }
 
     pub fn start(shared: &SharedSessions, name: String, command: String) -> Result<String> {
-        Self::start_with_command(
-            shared,
-            StartSpec::new(name, command, SessionKind::Local),
-            shell_command,
-        )
+        Self::start_with_command(shared, StartSpec::local(name, command), shell_command)
     }
 
     pub fn start_remote(shared: &SharedSessions, spec: RemoteSessionSpec) -> Result<String> {
         let remote = RemoteSession {
-            host: spec.host,
+            host: spec.host.clone(),
             port: spec.port,
-            remote_root: spec.remote_root,
+            remote_root: spec.remote_root.clone(),
         };
-        Self::start_with_command(
-            shared,
-            StartSpec::new(spec.name, spec.command, SessionKind::Remote),
-            |command| remote.shell_command(command),
-        )
+        Self::start_with_command(shared, StartSpec::remote(spec), |command| {
+            remote.shell_command(command)
+        })
     }
 
     fn start_with_command(
@@ -130,6 +153,7 @@ impl SessionManager {
             name,
             command,
             kind,
+            launch,
         } = spec;
         validate_session_name(&name)?;
         let cwd = {
@@ -160,6 +184,7 @@ impl SessionManager {
                     id,
                     name: name.clone(),
                     kind,
+                    launch,
                     command: command.clone(),
                     status: SessionStatus::Running,
                     child: Some(child),
@@ -242,6 +267,36 @@ impl SessionManager {
         Ok(session.logs.iter().cloned().collect::<Vec<_>>().join("\n"))
     }
 
+    pub fn tail_logs(&mut self, selector: Option<&str>, lines: usize) -> Result<String> {
+        self.refresh();
+        let id = self.resolve_or_focused(selector)?;
+        let Some(session) = self.sessions.get(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        if session.logs.is_empty() {
+            return Ok(format!("logs {}: <empty>", session.name));
+        }
+        let lines = lines.max(1);
+        let skip = session.logs.len().saturating_sub(lines);
+        Ok(session
+            .logs
+            .iter()
+            .skip(skip)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    pub fn clear_logs(&mut self, selector: Option<&str>) -> Result<String> {
+        self.refresh();
+        let id = self.resolve_or_focused(selector)?;
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+        };
+        session.logs.clear();
+        Ok(format!("logs cleared: {}", session.name))
+    }
+
     pub fn focus(&mut self, selector: &str) -> Result<String> {
         self.refresh();
         let id = self.resolve(selector)?;
@@ -259,21 +314,54 @@ impl SessionManager {
     }
 
     pub fn restart(shared: &SharedSessions, selector: &str) -> Result<String> {
-        let (name, command) = {
+        let (name, command, launch) = {
             let mut manager = lock_sessions(shared)?;
             manager.refresh();
             let id = manager.resolve(selector)?;
             let Some(session) = manager.sessions.get(&id) else {
                 return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
             };
-            (session.name.clone(), session.command.clone())
+            (
+                session.name.clone(),
+                session.command.clone(),
+                session.launch.clone(),
+            )
         };
         {
             let mut manager = lock_sessions(shared)?;
             let _stopped = manager.stop(&name)?;
             manager.remove_session(&name)?;
         }
-        Self::start(shared, name, command)
+        match launch {
+            SessionLaunch::Local => Self::start(shared, name, command),
+            SessionLaunch::Remote(mut spec) => {
+                spec.name = name;
+                spec.command = command;
+                Self::start_remote(shared, spec)
+            }
+        }
+    }
+
+    pub fn has_running(&mut self) -> bool {
+        self.refresh();
+        self.sessions
+            .values()
+            .any(|session| session.status == SessionStatus::Running)
+    }
+
+    pub fn running_summary(&mut self) -> String {
+        self.refresh();
+        let running = self
+            .sessions
+            .values()
+            .filter(|session| session.status == SessionStatus::Running)
+            .map(|session| format!("{}({})", session.name, session.id))
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            "running sessions: <none>".to_owned()
+        } else {
+            format!("running sessions: {}", running.join(", "))
+        }
     }
 
     pub fn stop_all(&mut self) {
@@ -381,14 +469,25 @@ struct StartSpec {
     name: String,
     command: String,
     kind: SessionKind,
+    launch: SessionLaunch,
 }
 
 impl StartSpec {
-    fn new(name: String, command: String, kind: SessionKind) -> Self {
+    fn local(name: String, command: String) -> Self {
         Self {
             name,
             command,
-            kind,
+            kind: SessionKind::Local,
+            launch: SessionLaunch::Local,
+        }
+    }
+
+    fn remote(spec: RemoteSessionSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            command: spec.command.clone(),
+            kind: SessionKind::Remote,
+            launch: SessionLaunch::Remote(spec),
         }
     }
 }
@@ -423,6 +522,9 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if matches!(trimmed, "ps" | "sessions") {
         return ConsoleCommand::Sessions;
     }
+    if matches!(trimmed, "quit!" | "exit!") {
+        return ConsoleCommand::QuitForce;
+    }
     if matches!(trimmed, "quit" | "exit") {
         return ConsoleCommand::Quit;
     }
@@ -432,6 +534,13 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if let Some(rest) = trimmed.strip_prefix("logs") {
         let selector = optional_arg(rest);
         return ConsoleCommand::Logs { selector };
+    }
+    if let Some(rest) = trimmed.strip_prefix("tail") {
+        return parse_tail(rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("clear-logs") {
+        let selector = optional_arg(rest);
+        return ConsoleCommand::ClearLogs { selector };
     }
     if let Some(rest) = trimmed.strip_prefix("focus ") {
         return ConsoleCommand::Focus {
@@ -458,7 +567,7 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
 }
 
 pub fn help_text() -> &'static str {
-    "commands: help, sessions|ps, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit"
+    "commands: help, sessions|ps, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit, quit!"
 }
 
 fn parse_new_session(rest: &str) -> ConsoleCommand {
@@ -501,6 +610,34 @@ fn optional_arg(rest: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+fn parse_tail(rest: &str) -> ConsoleCommand {
+    let args = rest.split_whitespace().collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => ConsoleCommand::Tail {
+            selector: None,
+            lines: 50,
+        },
+        [single] => match single.parse::<usize>() {
+            Ok(lines) => ConsoleCommand::Tail {
+                selector: None,
+                lines,
+            },
+            Err(_) => ConsoleCommand::Tail {
+                selector: Some((*single).to_owned()),
+                lines: 50,
+            },
+        },
+        [selector, lines] => match lines.parse::<usize>() {
+            Ok(lines) => ConsoleCommand::Tail {
+                selector: Some((*selector).to_owned()),
+                lines,
+            },
+            Err(_) => ConsoleCommand::Unknown("tail usage: tail [name|id] [lines]".to_owned()),
+        },
+        _ => ConsoleCommand::Unknown("tail usage: tail [name|id] [lines]".to_owned()),
     }
 }
 
@@ -658,6 +795,24 @@ mod tests {
         assert_eq!(
             parse_console_command("logs"),
             ConsoleCommand::Logs { selector: None }
+        );
+    }
+
+    #[test]
+    fn parses_tail_command() {
+        assert_eq!(
+            parse_console_command("tail web 20"),
+            ConsoleCommand::Tail {
+                selector: Some("web".to_owned()),
+                lines: 20
+            }
+        );
+        assert_eq!(
+            parse_console_command("tail 10"),
+            ConsoleCommand::Tail {
+                selector: None,
+                lines: 10
+            }
         );
     }
 
