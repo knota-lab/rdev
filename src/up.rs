@@ -18,7 +18,8 @@ use crate::error_info;
 use crate::path::is_sync_excluded;
 use crate::process::ProcessRunner;
 use crate::session::{
-    help_text, parse_console_command, ConsoleCommand, SessionManager, SharedSessions,
+    help_text, parse_console_command, ConsoleCommand, RemoteSessionSpec, SessionManager,
+    SharedSessions,
 };
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest, SyncRequest};
@@ -364,6 +365,10 @@ fn handle_console_command(
         }
         ConsoleCommand::NewSession { name, command } => {
             println!("{}", SessionManager::start(sessions, name, command)?);
+        }
+        ConsoleCommand::NewRemoteSession { name, command } => {
+            let spec = RemoteSessionSpec::from_config(watch.config, name, command)?;
+            println!("{}", SessionManager::start_remote(sessions, spec)?);
         }
         ConsoleCommand::Logs { selector } => {
             let mut manager = lock_sessions_for_console(sessions)?;

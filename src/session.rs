@@ -6,8 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::config::AppConfig;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
+use crate::path::RemotePath;
+use crate::ssh::shell_quote;
 
 const MAX_LOG_LINES: usize = 500;
 
@@ -18,6 +21,7 @@ pub enum ConsoleCommand {
     Help,
     Sessions,
     NewSession { name: String, command: String },
+    NewRemoteSession { name: String, command: String },
     Logs { selector: Option<String> },
     Focus { selector: String },
     Stop { selector: String },
@@ -37,10 +41,33 @@ pub struct SessionManager {
     cwd: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteSessionSpec {
+    name: String,
+    command: String,
+    host: String,
+    port: u16,
+    remote_root: String,
+}
+
+impl RemoteSessionSpec {
+    pub fn from_config(config: &AppConfig, name: String, command: String) -> Result<Self> {
+        let remote_root = RemotePath::parse(config.remote.path.as_str())?;
+        Ok(Self {
+            name,
+            command,
+            host: config.remote.host.clone(),
+            port: config.remote.port,
+            remote_root: remote_root.as_str().to_owned(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ManagedSession {
     id: u32,
     name: String,
+    kind: SessionKind,
     command: String,
     status: SessionStatus,
     child: Option<Child>,
@@ -55,6 +82,12 @@ enum SessionStatus {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    Local,
+    Remote,
+}
+
 impl SessionManager {
     pub fn shared(cwd: PathBuf) -> SharedSessions {
         Arc::new(Mutex::new(Self {
@@ -67,6 +100,36 @@ impl SessionManager {
     }
 
     pub fn start(shared: &SharedSessions, name: String, command: String) -> Result<String> {
+        Self::start_with_command(
+            shared,
+            StartSpec::new(name, command, SessionKind::Local),
+            shell_command,
+        )
+    }
+
+    pub fn start_remote(shared: &SharedSessions, spec: RemoteSessionSpec) -> Result<String> {
+        let remote = RemoteSession {
+            host: spec.host,
+            port: spec.port,
+            remote_root: spec.remote_root,
+        };
+        Self::start_with_command(
+            shared,
+            StartSpec::new(spec.name, spec.command, SessionKind::Remote),
+            |command| remote.shell_command(command),
+        )
+    }
+
+    fn start_with_command(
+        shared: &SharedSessions,
+        spec: StartSpec,
+        build: impl FnOnce(&str) -> Command,
+    ) -> Result<String> {
+        let StartSpec {
+            name,
+            command,
+            kind,
+        } = spec;
         validate_session_name(&name)?;
         let cwd = {
             let manager = lock_sessions(shared)?;
@@ -76,7 +139,7 @@ impl SessionManager {
             }
             manager.cwd.clone()
         };
-        let mut child = shell_command(&command)
+        let mut child = build(&command)
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -95,6 +158,7 @@ impl SessionManager {
                 ManagedSession {
                     id,
                     name: name.clone(),
+                    kind,
                     command: command.clone(),
                     status: SessionStatus::Running,
                     child: Some(child),
@@ -124,14 +188,16 @@ impl SessionManager {
         };
         if session.status != SessionStatus::Running {
             return Ok(format!(
-                "session exited id={id} name={name} exit={} command={command}; run logs {name}",
+                "session exited id={id} name={name} kind={} exit={} command={command}; run logs {name}",
+                session.kind.label(),
                 session
                     .exit_code
                     .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
             ));
         }
         Ok(format!(
-            "session started id={id} name={name} command={command}"
+            "session started id={id} name={name} kind={} command={command}",
+            kind.label()
         ))
     }
 
@@ -151,9 +217,10 @@ impl SessionManager {
                 .exit_code
                 .map_or_else(|| "-".to_owned(), |code| code.to_string());
             lines.push(format!(
-                "{focus} {} {} status={} exit={} command={}",
+                "{focus} {} {} kind={} status={} exit={} command={}",
                 session.id,
                 session.name,
+                session.kind.label(),
                 session.status.label(),
                 exit,
                 session.command
@@ -297,12 +364,38 @@ impl SessionManager {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StartSpec {
+    name: String,
+    command: String,
+    kind: SessionKind,
+}
+
+impl StartSpec {
+    fn new(name: String, command: String, kind: SessionKind) -> Self {
+        Self {
+            name,
+            command,
+            kind,
+        }
+    }
+}
+
 impl SessionStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Exited => "exited",
             Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl SessionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
         }
     }
 }
@@ -346,11 +439,14 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if let Some(rest) = trimmed.strip_prefix("new session ") {
         return parse_new_session(rest);
     }
+    if let Some(rest) = trimmed.strip_prefix("new remote-session ") {
+        return parse_new_remote_session(rest);
+    }
     ConsoleCommand::Unknown(trimmed.to_owned())
 }
 
 pub fn help_text() -> &'static str {
-    "commands: help, sessions|ps, new session <name> -- <local-command>, logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit"
+    "commands: help, sessions|ps, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit"
 }
 
 fn parse_new_session(rest: &str) -> ConsoleCommand {
@@ -365,6 +461,23 @@ fn parse_new_session(rest: &str) -> ConsoleCommand {
         return ConsoleCommand::Unknown("new session requires name and command".to_owned());
     }
     ConsoleCommand::NewSession {
+        name: name.to_owned(),
+        command: command.to_owned(),
+    }
+}
+
+fn parse_new_remote_session(rest: &str) -> ConsoleCommand {
+    let Some((name, command)) = rest.split_once(" -- ") else {
+        return ConsoleCommand::Unknown(
+            "new remote-session requires: new remote-session <name> -- <command>".to_owned(),
+        );
+    };
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() || command.is_empty() {
+        return ConsoleCommand::Unknown("new remote-session requires name and command".to_owned());
+    }
+    ConsoleCommand::NewRemoteSession {
         name: name.to_owned(),
         command: command.to_owned(),
     }
@@ -391,6 +504,28 @@ fn shell_command(command: &str) -> Command {
         let mut shell = Command::new("sh");
         shell.arg("-lc").arg(command);
         shell
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSession {
+    host: String,
+    port: u16,
+    remote_root: String,
+}
+
+impl RemoteSession {
+    fn shell_command(&self, command: &str) -> Command {
+        let remote_command = format!("cd {} && exec {command}", shell_quote(&self.remote_root));
+        let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
+        let mut ssh = Command::new("ssh");
+        ssh.arg("-p")
+            .arg(self.port.to_string())
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(self.host.clone())
+            .arg(remote_shell);
+        ssh
     }
 }
 
@@ -489,6 +624,19 @@ mod tests {
             ConsoleCommand::NewSession {
                 name: "web".to_owned(),
                 command: "pnpm dev".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_new_remote_session_command() {
+        let command = parse_console_command("new remote-session web -- pnpm preview --host");
+
+        assert_eq!(
+            command,
+            ConsoleCommand::NewRemoteSession {
+                name: "web".to_owned(),
+                command: "pnpm preview --host".to_owned()
             }
         );
     }
