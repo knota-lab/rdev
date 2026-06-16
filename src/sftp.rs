@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::error::{err, Result};
 use crate::error_info;
 use crate::path::RemotePath;
-use crate::ssh::{sh_c, RemoteCheck, SshClient};
+use crate::ssh::{sh_c, RemoteCheck, SshClient, UploadRequest};
 use crate::ssh_tar::{upload_tar, TarUpload};
 use crate::sync::{SyncBackend, SyncDeltaRequest, SyncReport, SyncRequest};
 
@@ -42,6 +42,9 @@ impl<'a> SftpDeltaBackend<'a> {
         let started = Instant::now();
         self.with_client(|client| {
             for path in &request.uploads {
+                if request.is_cancelled() {
+                    return Err(err(error_info::SYNC_CANCELLED));
+                }
                 let item_started = Instant::now();
                 let local_path = request.project_root.join(path);
                 if !local_path.exists() {
@@ -49,7 +52,11 @@ impl<'a> SftpDeltaBackend<'a> {
                     continue;
                 }
                 let remote_path = remote_path(&remote_root, path);
-                client.upload(&local_path, Path::new(&remote_path))?;
+                client.upload(UploadRequest {
+                    local_path: &local_path,
+                    remote_path: Path::new(&remote_path),
+                    cancelled: request.cancelled.as_ref(),
+                })?;
                 println!(
                     "[sync] upload ok path={} elapsed_ms={}",
                     path.display(),
@@ -57,6 +64,9 @@ impl<'a> SftpDeltaBackend<'a> {
                 );
             }
             for path in &request.deletes {
+                if request.is_cancelled() {
+                    return Err(err(error_info::SYNC_CANCELLED));
+                }
                 let item_started = Instant::now();
                 let remote_path = remote_path(&remote_root, path);
                 client.remove(Path::new(&remote_path))?;

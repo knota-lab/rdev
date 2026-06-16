@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs::File as FsFile;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ssh2::{Session, Sftp};
@@ -13,11 +15,18 @@ use crate::error_info;
 
 pub(crate) const SSH_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
 pub(crate) struct SshClient {
     session: Session,
     sftp: Option<Sftp>,
     ensured_dirs: BTreeSet<PathBuf>,
+}
+
+pub(crate) struct UploadRequest<'a> {
+    pub(crate) local_path: &'a Path,
+    pub(crate) remote_path: &'a Path,
+    pub(crate) cancelled: Option<&'a Arc<AtomicBool>>,
 }
 
 impl SshClient {
@@ -56,43 +65,49 @@ impl SshClient {
         &mut self.session
     }
 
-    pub(crate) fn upload(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
-        if local_path.is_dir() {
-            return self.ensure_dir(remote_path);
+    pub(crate) fn upload(&mut self, request: UploadRequest<'_>) -> Result<()> {
+        if is_cancelled(request.cancelled) {
+            return Err(err(error_info::SYNC_CANCELLED));
+        }
+        if request.local_path.is_dir() {
+            return self.ensure_dir(request.remote_path);
         }
         let ensure_started = Instant::now();
-        self.ensure_parent_dir(remote_path)?;
+        self.ensure_parent_dir(request.remote_path)?;
         let ensure_elapsed = ensure_started.elapsed().as_millis();
 
         let open_started = Instant::now();
-        let mut local = match FsFile::open(local_path) {
+        let mut local = match FsFile::open(request.local_path) {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 println!(
                     "[sync] upload skipped vanished local={}",
-                    local_path.display()
+                    request.local_path.display()
                 );
                 return Ok(());
             }
             Err(source) => {
                 return Err(err_with_source(error_info::SYNC_SFTP_FAILED, source)
-                    .with_path(local_path.display()));
+                    .with_path(request.local_path.display()));
             }
         };
         let open_elapsed = open_started.elapsed().as_millis();
 
         let create_started = Instant::now();
-        let mut remote = self.create_remote_file(remote_path)?;
+        let mut remote = self.create_remote_file(request.remote_path)?;
         let create_elapsed = create_started.elapsed().as_millis();
 
         let copy_started = Instant::now();
-        io::copy(&mut local, &mut remote).map_err(|source| {
-            err_with_source(error_info::SYNC_SFTP_FAILED, source).with_path(remote_path.display())
+        copy_file_cancellable(CopyRequest {
+            local: &mut local,
+            remote: &mut remote,
+            remote_path: request.remote_path,
+            cancelled: request.cancelled,
         })?;
         let copy_elapsed = copy_started.elapsed().as_millis();
         println!(
             "[sync] upload detail remote={} ensure_ms={} open_ms={} create_ms={} copy_ms={}",
-            remote_path.display(),
+            request.remote_path.display(),
             ensure_elapsed,
             open_elapsed,
             create_elapsed,
@@ -242,6 +257,13 @@ impl SshClient {
     }
 }
 
+struct CopyRequest<'a> {
+    local: &'a mut FsFile,
+    remote: &'a mut ssh2::File,
+    remote_path: &'a Path,
+    cancelled: Option<&'a Arc<AtomicBool>>,
+}
+
 pub(crate) struct RemoteCheck {
     info: ErrorInfo,
     hint: Option<&'static str>,
@@ -287,6 +309,33 @@ fn read_channel_stdout(channel: &mut ssh2::Channel) -> String {
     let mut stdout = String::new();
     let _read_result = channel.read_to_string(&mut stdout);
     stdout.trim().to_owned()
+}
+
+fn copy_file_cancellable(request: CopyRequest<'_>) -> Result<()> {
+    let mut buffer = vec![0_u8; UPLOAD_CHUNK_SIZE];
+    loop {
+        if is_cancelled(request.cancelled) {
+            return Err(err(error_info::SYNC_CANCELLED).with_path(request.remote_path.display()));
+        }
+        let read = request.local.read(&mut buffer).map_err(|source| {
+            err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                .with_path(request.remote_path.display())
+        })?;
+        if read == 0 {
+            return Ok(());
+        }
+        request
+            .remote
+            .write_all(&buffer[..read])
+            .map_err(|source| {
+                err_with_source(error_info::SYNC_SFTP_FAILED, source)
+                    .with_path(request.remote_path.display())
+            })?;
+    }
+}
+
+fn is_cancelled(cancelled: Option<&Arc<AtomicBool>>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
 fn with_remote_path(command: &str) -> String {

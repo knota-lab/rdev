@@ -311,6 +311,7 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
                         project_root: watch.local_root.to_path_buf(),
                         uploads: changes.uploads.iter().cloned().collect(),
                         deletes: changes.deletes.iter().cloned().collect(),
+                        cancelled: Some(Arc::clone(&watch.shutdown)),
                     });
                     match result {
                         Ok(report) => {

@@ -30,6 +30,15 @@ pub struct SyncDeltaRequest {
     pub project_root: PathBuf,
     pub uploads: Vec<PathBuf>,
     pub deletes: Vec<PathBuf>,
+    pub cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl SyncDeltaRequest {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
 }
 
 pub trait SyncBackend {
@@ -655,6 +664,7 @@ mod tests {
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
             uploads: vec![PathBuf::from("src/main.rs")],
             deletes: Vec::new(),
+            cancelled: None,
         });
 
         assert!(report.is_ok());
@@ -678,6 +688,7 @@ mod tests {
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
             uploads: vec![PathBuf::from("knota-fold/src/data/mod.rs")],
             deletes: Vec::new(),
+            cancelled: None,
         });
 
         assert!(report.is_ok());
@@ -704,11 +715,13 @@ mod tests {
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
             uploads: vec![PathBuf::from("src/main.rs")],
             deletes: Vec::new(),
+            cancelled: None,
         });
         let second = backend.sync_delta(super::SyncDeltaRequest {
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
             uploads: vec![PathBuf::from("src/lib.rs")],
             deletes: Vec::new(),
+            cancelled: None,
         });
 
         assert!(first.is_ok());
@@ -730,6 +743,7 @@ mod tests {
             project_root: PathBuf::from("J:\\RustWorkspace\\project"),
             uploads: Vec::new(),
             deletes: vec![PathBuf::from("src/old.rs")],
+            cancelled: None,
         });
 
         assert!(report.is_ok());
