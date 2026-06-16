@@ -128,6 +128,14 @@ pub const WATCH_EVENT_FAILED: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Watch,
 };
 
+pub const WATCH_ALREADY_RUNNING: ErrorInfo = ErrorInfo {
+    code: "watch.already_running",
+    message_zh: "当前项目已有 up 进程在运行",
+    message_en: "An up process is already running for this project",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Watch,
+};
+
 pub const INTERNAL_UNEXPECTED: ErrorInfo = ErrorInfo {
     code: "internal.unexpected",
     message_zh: "发生未预期的内部错误",

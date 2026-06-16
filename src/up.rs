@@ -37,8 +37,28 @@ pub struct UpRequest {
     pub poll: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpStatus {
+    pid: Option<u32>,
+    running: bool,
+    stop_requested: bool,
+}
+
+impl UpStatus {
+    pub fn format_text(&self) -> String {
+        let pid = self
+            .pid
+            .map_or_else(|| "<none>".to_owned(), |pid| pid.to_string());
+        format!(
+            "up.running={}\nup.pid={pid}\nup.stop_requested={}",
+            self.running, self.stop_requested
+        )
+    }
+}
+
 pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpRequest) -> Result<()> {
     let shutdown = install_shutdown_handler()?;
+    ensure_no_running_instance(&request.project_root)?;
     clear_stop_request(&request.project_root)?;
     write_pid_file(&request.project_root)?;
     let _guard = UpStateGuard::new(request.project_root.clone());
@@ -64,6 +84,31 @@ pub fn run_up(config: &AppConfig, runner: &impl ProcessRunner, request: UpReques
         backend,
         shutdown,
     })
+}
+
+pub fn up_status(project_root: &Path) -> Result<UpStatus> {
+    let pid = read_pid_file(project_root)?;
+    let running = pid.is_some_and(is_pid_running);
+    Ok(UpStatus {
+        pid,
+        running,
+        stop_requested: stop_requested(project_root),
+    })
+}
+
+fn ensure_no_running_instance(project_root: &Path) -> Result<()> {
+    let status = up_status(project_root)?;
+    if status.running {
+        let pid = status
+            .pid
+            .map_or_else(|| "<unknown>".to_owned(), |pid| pid.to_string());
+        return Err(err(error_info::WATCH_ALREADY_RUNNING)
+            .with_hint(format!("pid={pid}; 请先运行 rdev stop 或等待当前 up 退出")));
+    }
+    if status.pid.is_some() {
+        clear_pid_file(project_root)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -424,6 +469,36 @@ fn terminate_pid(pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn is_pid_running(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let Ok(output) = Command::new("tasklist")
+        .arg("/FI")
+        .arg(filter)
+        .arg("/FO")
+        .arg("CSV")
+        .arg("/NH")
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&format!("\",\"{pid}\",")))
+}
+
+#[cfg(not(windows))]
+fn is_pid_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
 fn terminate_other_pid(pid: u32) -> Result<()> {
     let output = Command::new("taskkill")
         .arg("/PID")
@@ -644,8 +719,9 @@ mod tests {
     use notify::{Event, EventKind};
 
     use super::{
-        collect_event_changes, reconcile_existing_paths, request_stop, resolve_local_root,
-        scan_initial_sync, stop_requested, EventFilter,
+        collect_event_changes, ensure_no_running_instance, pid_file, reconcile_existing_paths,
+        request_stop, resolve_local_root, scan_initial_sync, stop_requested, up_status,
+        EventFilter, UpStatus,
     };
 
     #[test]
@@ -761,6 +837,45 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(stop_requested(&root));
+
+        let _cleanup_after = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn formats_up_status() {
+        let status = UpStatus {
+            pid: Some(123),
+            running: true,
+            stop_requested: false,
+        };
+
+        assert_eq!(
+            status.format_text(),
+            "up.running=true\nup.pid=123\nup.stop_requested=false"
+        );
+    }
+
+    #[test]
+    fn stale_pid_is_cleared_before_up_starts() {
+        let root = std::env::temp_dir().join(format!("rdev-stale-pid-test-{}", std::process::id()));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        let dir = root.join(".rdev");
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            panic!("create rdev dir: {error}");
+        }
+        if let Err(error) = std::fs::write(pid_file(&root), "4294967294") {
+            panic!("write pid file: {error}");
+        }
+
+        let result = ensure_no_running_instance(&root);
+        let status = match up_status(&root) {
+            Ok(status) => status,
+            Err(error) => panic!("status should load: {error}"),
+        };
+
+        assert!(result.is_ok());
+        assert_eq!(status.pid, None);
+        assert!(!status.running);
 
         let _cleanup_after = std::fs::remove_dir_all(&root);
     }

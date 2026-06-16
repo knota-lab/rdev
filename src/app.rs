@@ -22,6 +22,7 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Run(args) => run_command(args, cwd),
         Command::Sync(args) => sync(args, cwd),
         Command::Up(args) => up(args, cwd),
+        Command::Status => status(cwd),
         Command::Stop => stop(cwd),
         Command::Ssh(args) => ssh(args, cwd),
     }
@@ -119,6 +120,10 @@ fn up(args: crate::cli::UpArgs, cwd: &Path) -> Result<String> {
 fn stop(cwd: &Path) -> Result<String> {
     crate::up::request_stop(cwd)?;
     Ok("stop requested".to_owned())
+}
+
+fn status(cwd: &Path) -> Result<String> {
+    Ok(crate::up::up_status(cwd)?.format_text())
 }
 
 fn format_command_output(output: CommandExit) -> String {

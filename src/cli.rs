@@ -21,6 +21,7 @@ pub enum Command {
     Run(RunArgs),
     Sync(SyncArgs),
     Up(UpArgs),
+    Status,
     Stop,
     Ssh(SshArgs),
 }
