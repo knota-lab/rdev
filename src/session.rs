@@ -92,6 +92,7 @@ struct ManagedSession {
     name: String,
     kind: SessionKind,
     launch: SessionLaunch,
+    remote_control: Option<RemoteSessionControl>,
     command: String,
     status: SessionStatus,
     child: Option<Child>,
@@ -118,6 +119,13 @@ enum SessionLaunch {
     Remote(RemoteSessionSpec),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteSessionControl {
+    host: String,
+    port: u16,
+    pid_file: String,
+}
+
 impl SessionManager {
     pub fn shared(cwd: PathBuf) -> SharedSessions {
         Arc::new(Mutex::new(Self {
@@ -139,8 +147,9 @@ impl SessionManager {
             port: spec.port,
             remote_root: spec.remote_root.clone(),
         };
+        let session_name = spec.name.clone();
         Self::start_with_command(shared, StartSpec::remote(spec), |command| {
-            remote.shell_command(command)
+            remote.shell_command(&session_name, command)
         })
     }
 
@@ -154,6 +163,7 @@ impl SessionManager {
             command,
             kind,
             launch,
+            remote_control,
         } = spec;
         validate_session_name(&name)?;
         let cwd = {
@@ -186,6 +196,7 @@ impl SessionManager {
                     name: name.clone(),
                     kind,
                     launch,
+                    remote_control,
                     command: command.clone(),
                     status: SessionStatus::Running,
                     child: Some(child),
@@ -383,6 +394,11 @@ impl SessionManager {
                 session.name
             ));
         }
+        if let Some(control) = &session.remote_control {
+            if let Err(error) = terminate_remote_session(control) {
+                push_log(session, format!("[rdev] remote stop failed: {error}"));
+            }
+        }
         if let Some(mut child) = session.child.take() {
             terminate_child(&mut child)?;
             session.exit_code = wait_child_exit(&mut child)?;
@@ -471,6 +487,7 @@ struct StartSpec {
     command: String,
     kind: SessionKind,
     launch: SessionLaunch,
+    remote_control: Option<RemoteSessionControl>,
 }
 
 impl StartSpec {
@@ -480,14 +497,21 @@ impl StartSpec {
             command,
             kind: SessionKind::Local,
             launch: SessionLaunch::Local,
+            remote_control: None,
         }
     }
 
     fn remote(spec: RemoteSessionSpec) -> Self {
+        let remote = RemoteSession {
+            host: spec.host.clone(),
+            port: spec.port,
+            remote_root: spec.remote_root.clone(),
+        };
         Self {
             name: spec.name.clone(),
             command: spec.command.clone(),
             kind: SessionKind::Remote,
+            remote_control: Some(remote.control(&spec.name)),
             launch: SessionLaunch::Remote(spec),
         }
     }
@@ -665,8 +689,8 @@ struct RemoteSession {
 }
 
 impl RemoteSession {
-    fn shell_command(&self, command: &str) -> Command {
-        let remote_command = format!("cd {} && {command}", shell_quote(&self.remote_root));
+    fn shell_command(&self, name: &str, command: &str) -> Command {
+        let remote_command = self.remote_session_command(name, command);
         let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
         let mut ssh = Command::new("ssh");
         ssh.arg("-n")
@@ -683,6 +707,67 @@ impl RemoteSession {
             .arg(remote_shell);
         ssh
     }
+
+    fn control(&self, name: &str) -> RemoteSessionControl {
+        RemoteSessionControl {
+            host: self.host.clone(),
+            port: self.port,
+            pid_file: format!("{}/.rdev/sessions/{}.pid", self.remote_root, name),
+        }
+    }
+
+    fn remote_session_command(&self, name: &str, command: &str) -> String {
+        let control = self.control(name);
+        format!(
+            "cd {root} && mkdir -p .rdev/sessions && pid_file={pid_file}; rm -f \"$pid_file\"; \
+             trap 'rm -f \"$pid_file\"' EXIT; \
+             if command -v setsid >/dev/null 2>&1; then setsid sh -lc {command} & else sh -lc {command} & fi; \
+             child=$!; echo \"$child\" > \"$pid_file\"; wait \"$child\"",
+            root = shell_quote(&self.remote_root),
+            pid_file = shell_quote(&control.pid_file),
+            command = shell_quote(command),
+        )
+    }
+}
+
+fn terminate_remote_session(control: &RemoteSessionControl) -> Result<()> {
+    let stop_command = remote_stop_command(control);
+    let remote_shell = format!("sh -lc {}", shell_quote(&stop_command));
+    let output = Command::new("ssh")
+        .arg("-n")
+        .arg("-T")
+        .arg("-p")
+        .arg(control.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(control.host.clone())
+        .arg(remote_shell)
+        .output()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(err(error_info::WATCH_EVENT_FAILED)
+            .with_hint(String::from_utf8_lossy(&output.stderr).trim()))
+    }
+}
+
+fn remote_stop_command(control: &RemoteSessionControl) -> String {
+    format!(
+        "pid_file={pid_file}; \
+         if [ -s \"$pid_file\" ]; then \
+           pid=$(cat \"$pid_file\"); \
+           kill -INT -\"$pid\" 2>/dev/null || kill -INT \"$pid\" 2>/dev/null || true; \
+           sleep 1; \
+           kill -TERM -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; \
+           sleep 1; \
+           kill -KILL -\"$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; \
+           rm -f \"$pid_file\"; \
+         fi",
+        pid_file = shell_quote(&control.pid_file),
+    )
 }
 
 struct LogReader<R> {
@@ -769,7 +854,7 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_console_command, ConsoleCommand, RemoteSession};
+    use super::{parse_console_command, remote_stop_command, ConsoleCommand, RemoteSession};
 
     #[test]
     fn parses_new_session_command() {
@@ -831,7 +916,7 @@ mod tests {
             remote_root: "/root/project".to_owned(),
         };
 
-        let command = remote.shell_command("cd app && pwd");
+        let command = remote.shell_command("web", "cd app && pwd");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -845,8 +930,26 @@ mod tests {
         let remote_shell = args.last().map(String::as_str).unwrap_or_default();
         assert!(remote_shell.starts_with("sh -lc "));
         assert!(remote_shell.contains("/root/project"));
-        assert!(remote_shell.contains("&& cd app && pwd"));
+        assert!(remote_shell.contains(".rdev/sessions/web.pid"));
+        assert!(remote_shell.contains("sh -lc"));
+        assert!(remote_shell.contains("cd app && pwd"));
         assert!(!remote_shell.contains("exec cd app"));
+    }
+
+    #[test]
+    fn remote_stop_prefers_interrupt_before_terminate() {
+        let remote = RemoteSession {
+            host: "root@example.test".to_owned(),
+            port: 2222,
+            remote_root: "/root/project".to_owned(),
+        };
+        let stop_command = remote_stop_command(&remote.control("web"));
+
+        let int = stop_command.find("kill -INT").unwrap_or(usize::MAX);
+        let term = stop_command.find("kill -TERM").unwrap_or(usize::MAX);
+        let kill = stop_command.find("kill -KILL").unwrap_or(usize::MAX);
+        assert!(int < term);
+        assert!(term < kill);
     }
 
     #[test]
