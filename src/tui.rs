@@ -427,12 +427,33 @@ impl TuiModel {
         self.input.drain(self.input_cursor..next);
     }
 
+    fn backspace_word_input(&mut self) {
+        self.exit_history_browse();
+        let previous = previous_word_boundary(&self.input, self.input_cursor);
+        self.input.drain(previous..self.input_cursor);
+        self.input_cursor = previous;
+    }
+
+    fn delete_word_input(&mut self) {
+        self.exit_history_browse();
+        let next = next_word_boundary(&self.input, self.input_cursor);
+        self.input.drain(self.input_cursor..next);
+    }
+
     fn move_input_left(&mut self) {
         self.input_cursor = previous_char_boundary(&self.input, self.input_cursor);
     }
 
     fn move_input_right(&mut self) {
         self.input_cursor = next_char_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_word_left(&mut self) {
+        self.input_cursor = previous_word_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_word_right(&mut self) {
+        self.input_cursor = next_word_boundary(&self.input, self.input_cursor);
     }
 
     fn move_input_home(&mut self) {
@@ -1147,7 +1168,13 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
             focus_by_digit(model, ch);
         }
         KeyCode::Char(ch) => model.insert_char(ch),
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.backspace_word_input();
+        }
         KeyCode::Backspace => model.backspace_input(),
+        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.delete_word_input();
+        }
         KeyCode::Delete => model.delete_input(),
         KeyCode::Enter => return submit_input(model),
         KeyCode::Esc => {
@@ -1158,6 +1185,12 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_next(),
         KeyCode::Up => model.history_prev(),
         KeyCode::Down => model.history_next(),
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.move_input_word_left();
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.move_input_word_right();
+        }
         KeyCode::Left => model.move_input_left(),
         KeyCode::Right => model.move_input_right(),
         KeyCode::Tab => model.focus_next(),
@@ -1423,6 +1456,70 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
         .map_or(text.len(), |(index, _)| cursor + index)
 }
 
+fn previous_word_boundary(text: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let mut chars = text[..cursor].char_indices().collect::<Vec<_>>();
+    while let Some((index, ch)) = chars.pop() {
+        if !ch.is_whitespace() {
+            chars.push((index, ch));
+            break;
+        }
+    }
+    let Some((_, last)) = chars.last().copied() else {
+        return 0;
+    };
+    let target = word_class(last);
+    while let Some((index, ch)) = chars.pop() {
+        if word_class(ch) != target {
+            return index + ch.len_utf8();
+        }
+    }
+    0
+}
+
+fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    if cursor >= text.len() {
+        return text.len();
+    }
+    let mut iter = text[cursor..].char_indices().peekable();
+    while let Some((_, ch)) = iter.peek().copied() {
+        if ch.is_whitespace() {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    let Some((_, first)) = iter.peek().copied() else {
+        return text.len();
+    };
+    let target = word_class(first);
+    for (index, ch) in iter {
+        if word_class(ch) != target {
+            return cursor + index;
+        }
+    }
+    text.len()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Symbol,
+    Whitespace,
+}
+
+fn word_class(ch: char) -> WordClass {
+    if ch.is_whitespace() {
+        WordClass::Whitespace
+    } else if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' | '~') {
+        WordClass::Word
+    } else {
+        WordClass::Symbol
+    }
+}
+
 fn lock_sessions(
     model: &TuiModel,
 ) -> Result<std::sync::MutexGuard<'_, crate::session::SessionManager>> {
@@ -1484,5 +1581,33 @@ fn events_height(area: Rect) -> u16 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word_boundary, previous_word_boundary};
+
+    #[test]
+    fn word_navigation_skips_shell_words() {
+        let input = "cd knota-studio && pnpm dev --host";
+
+        assert_eq!(previous_word_boundary(input, input.len()), 28);
+        assert_eq!(previous_word_boundary(input, 28), 24);
+        assert_eq!(previous_word_boundary(input, 18), 16);
+        assert_eq!(next_word_boundary(input, 0), 2);
+        assert_eq!(next_word_boundary(input, 3), 15);
+        assert_eq!(next_word_boundary(input, 16), 18);
+    }
+
+    #[test]
+    fn word_navigation_keeps_utf8_boundaries() {
+        let input = "echo 中文 路径/test";
+        let end = input.len();
+        let previous = previous_word_boundary(input, end);
+
+        assert!(input.is_char_boundary(previous));
+        assert_eq!(&input[previous..], "路径/test");
+        assert!(input.is_char_boundary(next_word_boundary(input, 5)));
     }
 }
