@@ -59,6 +59,8 @@ pub struct UpArgs {
     pub no_initial_sync: bool,
     #[arg(long)]
     pub poll: bool,
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Debug, Args)]

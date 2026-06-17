@@ -17,4 +17,5 @@ pub mod sftp;
 pub mod ssh;
 pub mod ssh_tar;
 pub mod sync;
+pub mod tui;
 pub mod up;

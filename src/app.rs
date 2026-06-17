@@ -12,6 +12,7 @@ use crate::path::{RelativePath, RemotePath};
 use crate::process::SystemProcessRunner;
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncRequest};
+use crate::tui::{run_tui, TuiRequest};
 use crate::up::{run_up, UpRequest};
 
 pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
@@ -104,6 +105,15 @@ fn sync_backend<'a>(
 
 fn up(args: crate::cli::UpArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
+    if args.tui {
+        run_tui(
+            &config,
+            TuiRequest {
+                project_root: cwd.to_path_buf(),
+            },
+        )?;
+        return Ok(String::new());
+    }
     let runner = SystemProcessRunner::default();
     run_up(
         &config,
