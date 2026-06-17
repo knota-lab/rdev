@@ -44,6 +44,7 @@ const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
 const EVENT_POLL: Duration = Duration::from_millis(100);
+const COMMAND_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
@@ -64,6 +65,10 @@ struct TuiModel {
     sync_logs: Vec<UiLogLine>,
     events: Vec<String>,
     input: String,
+    input_cursor: usize,
+    command_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     follow_logs: bool,
     log_scroll: u16,
     log_region: Option<LogRegion>,
@@ -240,6 +245,10 @@ impl TuiModel {
                 "type new session <name> -- <command>".to_owned(),
             ],
             input: String::new(),
+            input_cursor: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             follow_logs: true,
             log_scroll: 0,
             log_region: None,
@@ -385,6 +394,114 @@ impl TuiModel {
         if let Ok(mut manager) = self.sessions.lock() {
             let _ignored = manager.focus(&session_id.to_string());
         }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.exit_history_browse();
+        self.input.insert(self.input_cursor, ch);
+        self.input_cursor += ch.len_utf8();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.exit_history_browse();
+        self.input.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
+    }
+
+    fn backspace_input(&mut self) {
+        self.exit_history_browse();
+        if self.input_cursor == 0 {
+            return;
+        }
+        let previous = previous_char_boundary(&self.input, self.input_cursor);
+        self.input.drain(previous..self.input_cursor);
+        self.input_cursor = previous;
+    }
+
+    fn delete_input(&mut self) {
+        self.exit_history_browse();
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = next_char_boundary(&self.input, self.input_cursor);
+        self.input.drain(self.input_cursor..next);
+    }
+
+    fn move_input_left(&mut self) {
+        self.input_cursor = previous_char_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_right(&mut self) {
+        self.input_cursor = next_char_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_input_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    fn push_command_history(&mut self, command: &str) {
+        if command.is_empty() {
+            return;
+        }
+        if self
+            .command_history
+            .last()
+            .is_some_and(|previous| previous == command)
+        {
+            return;
+        }
+        self.command_history.push(command.to_owned());
+        if self.command_history.len() > COMMAND_HISTORY_LIMIT {
+            let overflow = self.command_history.len() - COMMAND_HISTORY_LIMIT;
+            self.command_history.drain(0..overflow);
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = self.input.clone();
+                self.command_history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.input = self.command_history[index].clone();
+        self.input_cursor = self.input.len();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.command_history.len() {
+            let next = index + 1;
+            self.history_index = Some(next);
+            self.input = self.command_history[next].clone();
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+        self.input_cursor = self.input.len();
+    }
+
+    fn exit_history_browse(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
     }
 }
 
@@ -929,7 +1046,7 @@ fn set_input_cursor(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
         return;
     }
     let prompt_width = UnicodeWidthStr::width(INPUT_PROMPT) as u16;
-    let input_width = UnicodeWidthStr::width(model.input.as_str()) as u16;
+    let input_width = UnicodeWidthStr::width(&model.input[..model.input_cursor]) as u16;
     let max_x = input_area.width.saturating_sub(1);
     let cursor_x = prompt_width.saturating_add(input_width).min(max_x);
     frame.set_cursor(input_area.x.saturating_add(cursor_x), input_area.y);
@@ -952,7 +1069,7 @@ fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -
     match event {
         Event::Key(key) => handle_key(model, sync, key),
         Event::Paste(text) => {
-            model.input.push_str(&text);
+            model.insert_text(&text);
             false
         }
         Event::Mouse(mouse) => {
@@ -1029,28 +1146,32 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         {
             focus_by_digit(model, ch);
         }
-        KeyCode::Char(ch) => model.input.push(ch),
-        KeyCode::Backspace => {
-            model.input.pop();
-        }
+        KeyCode::Char(ch) => model.insert_char(ch),
+        KeyCode::Backspace => model.backspace_input(),
+        KeyCode::Delete => model.delete_input(),
         KeyCode::Enter => return submit_input(model),
         KeyCode::Esc => {
-            model.input.clear();
+            model.clear_input();
             model.selection = None;
         }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_prev(),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_next(),
-        KeyCode::Up | KeyCode::Down => {}
+        KeyCode::Up => model.history_prev(),
+        KeyCode::Down => model.history_next(),
+        KeyCode::Left => model.move_input_left(),
+        KeyCode::Right => model.move_input_right(),
         KeyCode::Tab => model.focus_next(),
-        KeyCode::PageUp => {
+        KeyCode::PageUp if model.input.is_empty() => {
             model.follow_logs = false;
             model.log_scroll = model.log_scroll.saturating_add(5);
             model.clamp_log_scroll();
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown if model.input.is_empty() => {
             model.log_scroll = model.log_scroll.saturating_sub(5);
             model.clamp_log_scroll();
         }
+        KeyCode::Home if !model.input.is_empty() => model.move_input_home(),
+        KeyCode::End if !model.input.is_empty() => model.move_input_end(),
         KeyCode::Home => {
             model.follow_logs = false;
             model.log_scroll = 0;
@@ -1161,10 +1282,11 @@ fn byte_index_for_display_col(text: &str, col: u16) -> usize {
 
 fn submit_input(model: &mut TuiModel) -> bool {
     let command = model.input.trim().to_owned();
-    model.input.clear();
+    model.clear_input();
     if command.is_empty() {
         return false;
     }
+    model.push_command_history(&command);
     execute_console_command(model, parse_console_command(&command))
 }
 
@@ -1282,6 +1404,23 @@ fn focused_process_is_sync(model: &TuiModel) -> bool {
         .processes
         .get(model.focused)
         .is_some_and(|process| process.session_id.is_none())
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .last()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    if cursor >= text.len() {
+        return text.len();
+    }
+    text[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(text.len(), |(index, _)| cursor + index)
 }
 
 fn lock_sessions(
