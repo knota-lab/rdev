@@ -858,7 +858,6 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
 }
 
 fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
-    let scroll = clamped_log_scroll(model, area);
     let title = model.focused_process().map_or_else(
         || " Logs ".to_owned(),
         |process| format!(" Logs: {} ", process.name),
@@ -866,10 +865,10 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     frame.render_widget(Block::default().title(title).borders(Borders::ALL), area);
 
     let content = log_content_area(area);
-    let rows = model
-        .logs
-        .iter()
-        .map(UiLogLine::copy_text)
+    let all_rows = wrapped_log_rows(&model.logs, content.width);
+    let scroll = clamped_visual_log_scroll(all_rows.len(), content.height, model.log_scroll);
+    let rows = all_rows
+        .into_iter()
         .skip(scroll as usize)
         .take(content.height as usize)
         .collect::<Vec<_>>();
@@ -933,14 +932,40 @@ fn selected_line(text: &str, row: usize, selection: Option<TextSelection>) -> Li
     ])
 }
 
-fn clamped_log_scroll(model: &TuiModel, area: Rect) -> u16 {
-    let visible_rows = area.height.saturating_sub(2);
+fn wrapped_log_rows(logs: &[UiLogLine], width: u16) -> Vec<String> {
+    let width = width.max(1);
+    logs.iter()
+        .flat_map(|line| wrap_display_line(&line.copy_text(), width))
+        .collect()
+}
+
+fn wrap_display_line(text: &str, width: u16) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0u16;
+    for ch in text.chars() {
+        let char_width = ch.width().unwrap_or(0) as u16;
+        if current_width > 0 && current_width.saturating_add(char_width) > width {
+            rows.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(char_width);
+    }
+    rows.push(current);
+    rows
+}
+
+fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -> u16 {
     if visible_rows == 0 {
         return 0;
     }
-    let log_rows = model.logs.len() as u16;
-    let max_scroll = log_rows.saturating_sub(visible_rows);
-    model.log_scroll.min(max_scroll)
+    let max_scroll = (row_count as u16).saturating_sub(visible_rows);
+    scroll.min(max_scroll)
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -1568,12 +1593,45 @@ fn write_clipboard(_text: &str) -> Result<()> {
 
 fn parse_log_line(line: &str) -> UiLogLine {
     if let Some(text) = line.strip_prefix("[stdout] ") {
-        UiLogLine::stdout(text)
+        UiLogLine::stdout(strip_ansi_escapes(text))
     } else if let Some(text) = line.strip_prefix("[stderr] ") {
-        UiLogLine::stderr(text)
+        UiLogLine::stderr(strip_ansi_escapes(text))
     } else {
-        UiLogLine::rdev(line)
+        UiLogLine::rdev(strip_ansi_escapes(line))
     }
+}
+
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            output.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                let mut previous = '\0';
+                for next in chars.by_ref() {
+                    if next == '\u{7}' || (previous == '\u{1b}' && next == '\\') {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            _ => {}
+        }
+    }
+    output
 }
 
 fn events_height(area: Rect) -> u16 {
@@ -1586,7 +1644,9 @@ fn events_height(area: Rect) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_word_boundary, previous_word_boundary};
+    use super::{
+        next_word_boundary, previous_word_boundary, strip_ansi_escapes, wrap_display_line,
+    };
 
     #[test]
     fn word_navigation_skips_shell_words() {
@@ -1609,5 +1669,25 @@ mod tests {
         assert!(input.is_char_boundary(previous));
         assert_eq!(&input[previous..], "路径/test");
         assert!(input.is_char_boundary(next_word_boundary(input, 5)));
+    }
+
+    #[test]
+    fn log_wrapping_respects_display_width() {
+        assert_eq!(
+            wrap_display_line("abcdef", 3),
+            vec!["abc".to_owned(), "def".to_owned()]
+        );
+        assert_eq!(
+            wrap_display_line("中文ab", 4),
+            vec!["中文".to_owned(), "ab".to_owned()]
+        );
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences() {
+        assert_eq!(
+            strip_ansi_escapes("\u{1b}[32mgreen\u{1b}[0m text"),
+            "green text"
+        );
     }
 }
