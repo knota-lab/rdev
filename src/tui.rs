@@ -40,6 +40,7 @@ use crate::up::{
 const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
+const FRAME_TICK: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
@@ -145,7 +146,7 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
             .draw(|frame| draw(frame, &model))
             .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
 
-        if event::poll(Duration::from_millis(100))
+        if event::poll(FRAME_TICK)
             .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?
         {
             let event = event::read()
@@ -659,7 +660,7 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     let input_area = input_text_area(area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+        Block::default().style(Style::default().bg(Color::Rgb(12, 12, 12))),
         area,
     );
     let line = Line::from(vec![
@@ -689,9 +690,9 @@ fn set_input_cursor(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 fn input_text_area(area: Rect) -> Rect {
     if area.height >= 3 {
         Rect {
-            x: area.x,
+            x: area.x.saturating_add(1),
             y: area.y.saturating_add(1),
-            width: area.width,
+            width: area.width.saturating_sub(1),
             height: 1,
         }
     } else {
