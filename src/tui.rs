@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -55,6 +55,9 @@ const PROCESS_PANEL_MIN_WIDTH: u16 = 30;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 48;
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const COMMAND_HISTORY_LIMIT: usize = 100;
+const BG_MAIN: Color = Color::Rgb(10, 10, 10);
+const BG_RAIL: Color = Color::Rgb(22, 22, 22);
+const BG_INPUT: Color = Color::Rgb(36, 36, 36);
 
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
@@ -855,6 +858,10 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     );
 }
 
+fn fill_area(frame: &mut Frame<'_>, area: Rect, color: Color) {
+    frame.render_widget(Block::default().style(Style::default().bg(color)), area);
+}
+
 fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     if area.width < 80 {
         let chunks = Layout::default()
@@ -885,10 +892,26 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
 
 fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     let title = model.focused_process().map_or_else(
-        || " Logs ".to_owned(),
-        |process| format!(" Logs: {} ", process.name),
+        || "Logs".to_owned(),
+        |process| format!("Logs: {}", process.name),
     );
-    frame.render_widget(Block::default().title(title).borders(Borders::ALL), area);
+    fill_area(frame, area, BG_MAIN);
+    if area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect {
+                x: area.x.saturating_add(1),
+                y: area.y,
+                width: area.width.saturating_sub(1),
+                height: 1,
+            },
+        );
+    }
 
     let content = log_content_area(area);
     let all_rows = wrapped_log_rows(&model.logs, content.width);
@@ -918,8 +941,8 @@ fn log_content_area(area: Rect) -> Rect {
     Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        width: area.width.saturating_sub(1),
+        height: area.height.saturating_sub(1),
     }
 }
 
@@ -932,15 +955,12 @@ fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    frame.render_widget(
-        Block::default().title(" Control ").borders(Borders::LEFT),
-        area,
-    );
+    fill_area(frame, area, BG_RAIL);
     let content = Rect {
         x: area.x.saturating_add(2),
-        y: area.y,
+        y: area.y.saturating_add(1),
         width: area.width.saturating_sub(3),
-        height: area.height,
+        height: area.height.saturating_sub(1),
     };
     if content.height < 16 {
         let chunks = Layout::default()
@@ -967,6 +987,7 @@ fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_side_context(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    fill_area(frame, area, BG_RAIL);
     let focused = model
         .focused_process()
         .map_or("<none>", |process| process.name.as_str());
@@ -998,6 +1019,7 @@ fn draw_side_context(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    fill_area(frame, area, BG_RAIL);
     let mut items = vec![ListItem::new(Line::from(Span::styled(
         "Processes",
         Style::default()
@@ -1006,6 +1028,7 @@ fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     )))];
     items.extend(model.processes.iter().enumerate().map(|(index, process)| {
         let marker = if index == model.focused { ">" } else { " " };
+        let shortcut = process_shortcut_label(index);
         let style = if index == model.focused {
             process.status.style().add_modifier(Modifier::BOLD)
         } else {
@@ -1013,6 +1036,7 @@ fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
         };
         ListItem::new(Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{shortcut} "), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{:<12}", process.name), style),
             Span::styled(process.status.label(), process.status.style()),
         ]))
@@ -1022,6 +1046,7 @@ fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_process_details(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    fill_area(frame, area, BG_RAIL);
     let lines = model.focused_process().map_or_else(
         || {
             vec![
@@ -1064,26 +1089,36 @@ fn draw_process_details(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_compact_processes(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    fill_area(frame, area, BG_RAIL);
     let spans = model
         .processes
         .iter()
         .enumerate()
         .flat_map(|(index, process)| {
             let marker = if index == model.focused { "> " } else { "" };
+            let shortcut = process_shortcut_label(index);
             [
                 Span::styled(
-                    format!("{marker}{}:{} ", process.name, process.status.label()),
+                    format!(
+                        "{marker}{shortcut} {}:{} ",
+                        process.name,
+                        process.status.label()
+                    ),
                     process.status.style(),
                 ),
                 Span::raw(" "),
             ]
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .block(Block::default().title(" Processes ").borders(Borders::ALL)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn process_shortcut_label(index: usize) -> String {
+    if index < 9 {
+        (index + 1).to_string()
+    } else {
+        "-".to_owned()
+    }
 }
 
 fn draw_events(frame: &mut Frame<'_>, area: Rect, options: (&TuiModel, EventPanelMode)) {
@@ -1091,6 +1126,7 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, options: (&TuiModel, EventPane
     if area.height == 0 {
         return;
     }
+    fill_area(frame, area, BG_RAIL);
     let content = area;
     if content.height == 0 || content.width == 0 {
         return;
@@ -1151,10 +1187,7 @@ fn event_history_line(event: &UiEvent) -> Line<'static> {
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     let input_area = input_text_area(area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(36, 36, 36))),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(BG_INPUT)), area);
     let line = Line::from(vec![
         Span::styled(
             INPUT_PROMPT,
