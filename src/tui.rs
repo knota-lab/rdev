@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -492,6 +492,9 @@ fn handle_event(model: &mut TuiModel, event: Event) -> bool {
 }
 
 fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         model.sync_status = ProcessStatus::Cancelled;
         model.push_event("interrupt requested");
