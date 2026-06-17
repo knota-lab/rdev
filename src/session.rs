@@ -14,6 +14,9 @@ use crate::ssh::shell_quote;
 
 const MAX_LOG_LINES: usize = 500;
 const CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOTE_SESSION_SHELL: &str = "bash";
+const REMOTE_SESSION_ENV: &str = "for f in /etc/profile ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc; do [ -r \"$f\" ] && . \"$f\" >/dev/null 2>&1 || true; done; export PNPM_HOME=\"${PNPM_HOME:-$HOME/.local/share/pnpm}\"; case \":$PATH:\" in *\":$PNPM_HOME:\"*) ;; *) export PATH=\"$PNPM_HOME:$PATH\" ;; esac";
+const REMOTE_SESSION_RUNNER: &str = "echo \"$$\" > \"$RDEV_SESSION_PID_FILE\"; trap 'rm -f \"$RDEV_SESSION_PID_FILE\"' EXIT; eval \"$RDEV_SESSION_COMMAND\"";
 
 pub type SharedSessions = Arc<Mutex<SessionManager>>;
 
@@ -191,7 +194,9 @@ impl SessionManager {
             }
             manager.cwd.clone()
         };
-        let mut child = build(&command)
+        let mut process = build(&command);
+        let process_display = command_display(&process);
+        let mut child = process
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -217,7 +222,7 @@ impl SessionManager {
                     command: command.clone(),
                     status: SessionStatus::Running,
                     child: Some(child),
-                    logs: VecDeque::new(),
+                    logs: VecDeque::from([format!("[rdev] spawn {process_display}")]),
                     exit_code: None,
                 },
             );
@@ -728,7 +733,7 @@ struct RemoteSession {
 impl RemoteSession {
     fn shell_command(&self, name: &str, command: &str) -> Command {
         let remote_command = self.remote_session_command(name, command);
-        let remote_shell = format!("sh -lc {}", shell_quote(&remote_command));
+        let remote_shell = remote_session_shell(&remote_command);
         let mut ssh = Command::new("ssh");
         ssh.arg("-n")
             .arg("-T")
@@ -757,19 +762,21 @@ impl RemoteSession {
         let control = self.control(name);
         format!(
             "cd {root} && mkdir -p .rdev/sessions && pid_file={pid_file}; rm -f \"$pid_file\"; \
-             trap 'rm -f \"$pid_file\"' EXIT; \
-             if command -v setsid >/dev/null 2>&1; then setsid sh -lc {command} & else sh -lc {command} & fi; \
-             child=$!; echo \"$child\" > \"$pid_file\"; wait \"$child\"",
+             export RDEV_SESSION_PID_FILE=\"$pid_file\"; \
+             export RDEV_SESSION_COMMAND={session_command}; \
+             if command -v setsid >/dev/null 2>&1; then exec setsid {shell} -lc {runner}; else exec {shell} -lc {runner}; fi",
             root = shell_quote(&self.remote_root),
             pid_file = shell_quote(&control.pid_file),
-            command = shell_quote(command),
+            shell = REMOTE_SESSION_SHELL,
+            session_command = shell_quote(&remote_user_command(command)),
+            runner = shell_quote(REMOTE_SESSION_RUNNER),
         )
     }
 }
 
 fn terminate_remote_session(control: &RemoteSessionControl) -> Result<()> {
     let stop_command = remote_stop_command(control);
-    let remote_shell = format!("sh -lc {}", shell_quote(&stop_command));
+    let remote_shell = remote_session_shell(&stop_command);
     let output = Command::new("ssh")
         .arg("-n")
         .arg("-T")
@@ -789,6 +796,14 @@ fn terminate_remote_session(control: &RemoteSessionControl) -> Result<()> {
         Err(err(error_info::WATCH_EVENT_FAILED)
             .with_hint(String::from_utf8_lossy(&output.stderr).trim()))
     }
+}
+
+fn remote_session_shell(script: &str) -> String {
+    format!("{REMOTE_SESSION_SHELL} -lc {}", shell_quote(script))
+}
+
+fn remote_user_command(command: &str) -> String {
+    format!("{REMOTE_SESSION_ENV}; {command}")
 }
 
 fn remote_stop_command(control: &RemoteSessionControl) -> String {
@@ -858,6 +873,24 @@ fn push_log(session: &mut ManagedSession, line: String) {
         session.logs.pop_front();
     }
     session.logs.push_back(line);
+}
+
+fn command_display(command: &Command) -> String {
+    let mut parts = vec![command.get_program().to_string_lossy().into_owned()];
+    parts.extend(
+        command
+            .get_args()
+            .map(|arg| quote_display_arg(&arg.to_string_lossy())),
+    );
+    parts.join(" ")
+}
+
+fn quote_display_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.chars().any(char::is_whitespace) {
+        format!("{arg:?}")
+    } else {
+        arg.to_owned()
+    }
 }
 
 fn status_code_label(code: Option<i32>) -> String {
@@ -965,12 +998,16 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "ServerAliveCountMax=3"));
         assert!(args.iter().any(|arg| arg == "root@example.test"));
         let remote_shell = args.last().map(String::as_str).unwrap_or_default();
-        assert!(remote_shell.starts_with("sh -lc "));
+        assert!(remote_shell.starts_with("bash -lc "));
         assert!(remote_shell.contains("/root/project"));
         assert!(remote_shell.contains(".rdev/sessions/web.pid"));
-        assert!(remote_shell.contains("sh -lc"));
+        assert!(remote_shell.contains("bash -lc"));
+        assert!(remote_shell.contains("exec setsid"));
+        assert!(remote_shell.contains("RDEV_SESSION_COMMAND"));
         assert!(remote_shell.contains("cd app && pwd"));
         assert!(!remote_shell.contains("exec cd app"));
+        assert!(!remote_shell.contains(" & "));
+        assert!(!remote_shell.contains("wait \"$child\""));
     }
 
     #[test]

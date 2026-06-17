@@ -1,11 +1,12 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -17,7 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use notify::{RecursiveMode, Watcher};
 
@@ -40,7 +41,7 @@ use crate::up::{
 const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
-const FRAME_TICK: Duration = Duration::from_millis(250);
+const EVENT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
@@ -63,7 +64,8 @@ struct TuiModel {
     input: String,
     follow_logs: bool,
     log_scroll: u16,
-    started_at: Instant,
+    log_region: Option<LogRegion>,
+    selection: Option<TextSelection>,
 }
 
 struct TuiSyncRuntime {
@@ -91,7 +93,7 @@ enum ProcessStatus {
     Cancelled,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UiProcess {
     id: u32,
     session_id: Option<u32>,
@@ -101,17 +103,36 @@ struct UiProcess {
     command: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UiLogLine {
     stream: LogStream,
     text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LogStream {
     Stdout,
     Stderr,
     Rdev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogRegion {
+    content: Rect,
+    first_row: usize,
+    rows: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: CellPos,
+    cursor: CellPos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CellPos {
+    row: usize,
+    col: u16,
 }
 
 struct TerminalGuard {
@@ -123,8 +144,9 @@ impl Drop for TerminalGuard {
         let _ignored = disable_raw_mode();
         let _ignored = execute!(
             self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
         );
         let _ignored = self.terminal.show_cursor();
     }
@@ -138,15 +160,19 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
     let mut sync = TuiSyncRuntime::new(config, &request)?;
     let mut guard = init_terminal()?;
     let mut model = TuiModel::new(config, request);
+    let mut dirty = true;
     loop {
-        sync.process_events(TuiSyncContext { config, backend }, &mut model);
-        model.refresh_sessions();
-        guard
-            .terminal
-            .draw(|frame| draw(frame, &model))
-            .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+        dirty |= sync.process_events(TuiSyncContext { config, backend }, &mut model);
+        dirty |= model.refresh_sessions();
+        if dirty {
+            guard
+                .terminal
+                .draw(|frame| draw(frame, &mut model))
+                .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+            dirty = false;
+        }
 
-        if event::poll(FRAME_TICK)
+        if event::poll(EVENT_POLL)
             .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?
         {
             let event = event::read()
@@ -157,6 +183,7 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
                 }
                 return Ok(());
             }
+            dirty = true;
         }
     }
 }
@@ -194,11 +221,12 @@ impl TuiModel {
             input: String::new(),
             follow_logs: true,
             log_scroll: 0,
-            started_at: Instant::now(),
+            log_region: None,
+            selection: None,
         }
     }
 
-    fn refresh_sessions(&mut self) {
+    fn refresh_sessions(&mut self) -> bool {
         let previous_session = self
             .processes
             .get(self.focused)
@@ -210,7 +238,7 @@ impl TuiModel {
         };
         let Some(snapshot) = snapshot else {
             self.push_event("session manager unavailable");
-            return;
+            return true;
         };
         let mut processes = vec![UiProcess {
             id: 0,
@@ -229,15 +257,14 @@ impl TuiModel {
             command: session.command.clone(),
         }));
         let focused_session = previous_session.or(snapshot.focused);
-        self.focused = focused_session
+        let focused = focused_session
             .and_then(|id| {
                 processes
                     .iter()
                     .position(|process| process.session_id == Some(id))
             })
             .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)));
-        self.logs = if let Some(session_id) = processes.get(self.focused).and_then(|p| p.session_id)
-        {
+        let mut logs = if let Some(session_id) = processes.get(focused).and_then(|p| p.session_id) {
             snapshot
                 .sessions
                 .iter()
@@ -253,10 +280,17 @@ impl TuiModel {
         } else {
             self.sync_logs.clone()
         };
-        if self.logs.is_empty() {
-            self.logs.push(UiLogLine::rdev("logs: <empty>"));
+        if logs.is_empty() {
+            logs.push(UiLogLine::rdev("logs: <empty>"));
         }
+        let dirty = self.focused != focused || self.processes != processes || self.logs != logs;
+        self.focused = focused;
         self.processes = processes;
+        self.logs = logs;
+        if dirty {
+            self.selection = None;
+        }
+        dirty
     }
 
     fn focused_process(&self) -> Option<&UiProcess> {
@@ -270,6 +304,7 @@ impl TuiModel {
         self.focused = (self.focused + 1) % self.processes.len();
         self.follow_logs = true;
         self.log_scroll = 0;
+        self.selection = None;
         self.events
             .push(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
@@ -286,6 +321,7 @@ impl TuiModel {
         };
         self.follow_logs = true;
         self.log_scroll = 0;
+        self.selection = None;
         self.events
             .push(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
@@ -348,7 +384,8 @@ impl TuiSyncRuntime {
         })
     }
 
-    fn process_events(&mut self, context: TuiSyncContext<'_>, model: &mut TuiModel) {
+    fn process_events(&mut self, context: TuiSyncContext<'_>, model: &mut TuiModel) -> bool {
+        let mut dirty = false;
         while let Ok(event) = self.receiver.try_recv() {
             let filter = EventFilter {
                 local_root: &self.local_root,
@@ -360,20 +397,22 @@ impl TuiSyncRuntime {
                 self.last_event_at = Instant::now();
                 model.sync_status = ProcessStatus::Running;
                 model.push_sync_log("file change detected");
+                dirty = true;
             }
         }
         if !self.pending.has_changes() || self.last_event_at.elapsed() < self.debounce {
             if model.sync_status == ProcessStatus::Running {
                 model.sync_status = ProcessStatus::Idle;
+                dirty = true;
             }
-            return;
+            return dirty;
         }
         let changes = self.pending.take();
         let changes = reconcile_existing_paths(changes, &self.local_root);
         let changes = self.synced_files.filter_changed(changes, &self.local_root);
         if !changes.has_changes() {
             model.sync_status = ProcessStatus::Idle;
-            return;
+            return true;
         }
         model.sync_status = ProcessStatus::Running;
         let upload_count = changes.uploads.len();
@@ -398,6 +437,7 @@ impl TuiSyncRuntime {
                 model.push_sync_log(error.to_string());
             }
         }
+        true
     }
 }
 
@@ -420,6 +460,14 @@ impl UiLogLine {
         Self {
             stream: LogStream::Rdev,
             text: text.into(),
+        }
+    }
+
+    fn copy_text(&self) -> String {
+        match self.stream {
+            LogStream::Stdout => format!("[stdout] {}", self.text),
+            LogStream::Stderr => format!("[stderr] {}", self.text),
+            LogStream::Rdev => self.text.clone(),
         }
     }
 }
@@ -459,15 +507,20 @@ impl ProcessStatus {
 fn init_terminal() -> Result<TerminalGuard> {
     enable_raw_mode().map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)
         .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
     Ok(TerminalGuard { terminal })
 }
 
-fn draw(frame: &mut Frame<'_>, model: &TuiModel) {
+fn draw(frame: &mut Frame<'_>, model: &mut TuiModel) {
     let area = frame.size();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -487,7 +540,6 @@ fn draw(frame: &mut Frame<'_>, model: &TuiModel) {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    let uptime = model.started_at.elapsed().as_secs();
     let focused = model
         .focused_process()
         .map_or("<none>", |process| process.name.as_str());
@@ -499,7 +551,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
             format!(" sync={} ", model.sync_status.label()),
             model.sync_status.style(),
         ),
-        Span::raw(format!(" focus={focused} uptime={}s", uptime)),
+        Span::raw(format!(" focus={focused}")),
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::Black)),
@@ -507,7 +559,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     );
 }
 
-fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     if area.width < 80 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -530,31 +582,90 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     draw_process_panel(frame, chunks[1], model);
 }
 
-fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    let lines = model
-        .logs
-        .iter()
-        .map(|line| {
-            let (label, style) = match line.stream {
-                LogStream::Stdout => ("stdout", Style::default().fg(Color::Gray)),
-                LogStream::Stderr => ("stderr", Style::default().fg(Color::Red)),
-                LogStream::Rdev => ("rdev", Style::default().fg(Color::Yellow)),
-            };
-            Line::from(vec![
-                Span::styled(format!("[{label}] "), style),
-                Span::raw(line.text.as_str()),
-            ])
-        })
-        .collect::<Vec<_>>();
+fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
+    let scroll = clamped_log_scroll(model, area);
     let title = model.focused_process().map_or_else(
         || " Logs ".to_owned(),
         |process| format!(" Logs: {} ", process.name),
     );
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false })
-        .scroll((model.log_scroll, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Block::default().title(title).borders(Borders::ALL), area);
+
+    let content = log_content_area(area);
+    let rows = model
+        .logs
+        .iter()
+        .map(UiLogLine::copy_text)
+        .skip(scroll as usize)
+        .take(content.height as usize)
+        .collect::<Vec<_>>();
+    model.log_region = Some(LogRegion {
+        content,
+        first_row: scroll as usize,
+        rows: rows.clone(),
+    });
+    let lines = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let absolute_row = scroll as usize + index;
+            selected_line(row, absolute_row, model.selection)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+fn log_content_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn selected_line(text: &str, row: usize, selection: Option<TextSelection>) -> Line<'_> {
+    let Some(selection) = selection else {
+        return Line::from(Span::raw(text.to_owned()));
+    };
+    let (start, end) = ordered_selection(selection);
+    if row < start.row || row > end.row {
+        return Line::from(Span::raw(text.to_owned()));
+    }
+
+    let width = UnicodeWidthStr::width(text) as u16;
+    let start_col = if row == start.row {
+        start.col.min(width)
+    } else {
+        0
+    };
+    let end_col = if row == end.row {
+        end.col.min(width)
+    } else {
+        width
+    };
+    if start_col == end_col {
+        return Line::from(Span::raw(text.to_owned()));
+    }
+    let start_index = byte_index_for_display_col(text, start_col);
+    let end_index = byte_index_for_display_col(text, end_col);
+    Line::from(vec![
+        Span::raw(text[..start_index].to_owned()),
+        Span::styled(
+            text[start_index..end_index].to_owned(),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        Span::raw(text[end_index..].to_owned()),
+    ])
+}
+
+fn clamped_log_scroll(model: &TuiModel, area: Rect) -> u16 {
+    let visible_rows = area.height.saturating_sub(2);
+    if visible_rows == 0 {
+        return 0;
+    }
+    let log_rows = model.logs.len() as u16;
+    let max_scroll = log_rows.saturating_sub(visible_rows);
+    model.log_scroll.min(max_scroll)
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -660,7 +771,7 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     let input_area = input_text_area(area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(12, 12, 12))),
+        Block::default().style(Style::default().bg(Color::Rgb(36, 36, 36))),
         area,
     );
     let line = Line::from(vec![
@@ -703,16 +814,44 @@ fn input_text_area(area: Rect) -> Rect {
 fn handle_event(model: &mut TuiModel, event: Event) -> bool {
     match event {
         Event::Key(key) => handle_key(model, key),
+        Event::Paste(text) => {
+            model.input.push_str(&text);
+            false
+        }
         Event::Mouse(mouse) => {
             match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    model.selection =
+                        selection_pos(model, mouse.column, mouse.row).map(|pos| TextSelection {
+                            anchor: pos,
+                            cursor: pos,
+                        });
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(pos) = selection_pos(model, mouse.column, mouse.row) {
+                        if let Some(selection) = model.selection.as_mut() {
+                            selection.cursor = pos;
+                        }
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(pos) = selection_pos(model, mouse.column, mouse.row) {
+                        if let Some(selection) = model.selection.as_mut() {
+                            selection.cursor = pos;
+                        }
+                    }
+                }
                 MouseEventKind::ScrollUp => {
                     model.follow_logs = false;
-                    model.log_scroll = model.log_scroll.saturating_sub(1);
+                    model.log_scroll = model.log_scroll.saturating_add(1);
+                    model.clamp_log_scroll();
+                    model.selection = None;
                 }
                 MouseEventKind::ScrollDown => {
-                    model.log_scroll = model.log_scroll.saturating_add(1);
+                    model.log_scroll = model.log_scroll.saturating_sub(1);
+                    model.clamp_log_scroll();
+                    model.selection = None;
                 }
-                MouseEventKind::Down(_) => model.push_event("mouse click received"),
                 _ => {}
             }
             false
@@ -727,14 +866,17 @@ fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if copy_selection(model) {
+            return false;
+        }
         model.sync_status = ProcessStatus::Cancelled;
         model.push_event("interrupt requested");
         return false;
     }
     match key.code {
-        KeyCode::Char('?') => {
-            model.push_event("help: arrows focus, s stop, r restart, type quit to exit");
-        }
+        KeyCode::Char('?') => model.push_event(
+            "help: drag logs to select, ctrl+c copies selection, ctrl+arrows focus, quit",
+        ),
         KeyCode::Char('s') if model.input.is_empty() => stop_focused(model),
         KeyCode::Char('r') if model.input.is_empty() => restart_focused(model),
         KeyCode::Char('f') if model.input.is_empty() => {
@@ -752,16 +894,23 @@ fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
             model.input.pop();
         }
         KeyCode::Enter => return submit_input(model),
-        KeyCode::Esc => model.input.clear(),
+        KeyCode::Esc => {
+            model.input.clear();
+            model.selection = None;
+        }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_prev(),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_next(),
         KeyCode::Up | KeyCode::Down => {}
         KeyCode::Tab => model.focus_next(),
         KeyCode::PageUp => {
             model.follow_logs = false;
-            model.log_scroll = model.log_scroll.saturating_sub(5);
+            model.log_scroll = model.log_scroll.saturating_add(5);
+            model.clamp_log_scroll();
         }
-        KeyCode::PageDown => model.log_scroll = model.log_scroll.saturating_add(5),
+        KeyCode::PageDown => {
+            model.log_scroll = model.log_scroll.saturating_sub(5);
+            model.clamp_log_scroll();
+        }
         KeyCode::Home => {
             model.follow_logs = false;
             model.log_scroll = 0;
@@ -773,6 +922,101 @@ fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+impl TuiModel {
+    fn clamp_log_scroll(&mut self) {
+        self.log_scroll = self
+            .log_scroll
+            .min(self.logs.len().saturating_sub(1) as u16);
+    }
+}
+
+fn selection_pos(model: &TuiModel, x: u16, y: u16) -> Option<CellPos> {
+    let region = model.log_region.as_ref()?;
+    if !contains(region.content, x, y) || region.rows.is_empty() {
+        return None;
+    }
+    let visible_row = y.saturating_sub(region.content.y) as usize;
+    let row = region.first_row.saturating_add(visible_row);
+    let row_text = region.rows.get(visible_row)?;
+    let max_col = UnicodeWidthStr::width(row_text.as_str()) as u16;
+    let col = x.saturating_sub(region.content.x).min(max_col);
+    Some(CellPos { row, col })
+}
+
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+fn copy_selection(model: &mut TuiModel) -> bool {
+    let Some(text) = selected_text(model) else {
+        return false;
+    };
+    if text.is_empty() {
+        model.selection = None;
+        return false;
+    }
+    match write_clipboard(&text) {
+        Ok(()) => {
+            model.push_event(format!("copied {} lines", text.lines().count()));
+            model.selection = None;
+        }
+        Err(error) => model.push_event(error.to_string()),
+    }
+    true
+}
+
+fn selected_text(model: &TuiModel) -> Option<String> {
+    let selection = model.selection?;
+    let region = model.log_region.as_ref()?;
+    let (start, end) = ordered_selection(selection);
+    let mut lines = Vec::new();
+    for row in start.row..=end.row {
+        let visible_row = row.checked_sub(region.first_row)?;
+        let text = region.rows.get(visible_row)?;
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        let start_col = if row == start.row {
+            start.col.min(width)
+        } else {
+            0
+        };
+        let end_col = if row == end.row {
+            end.col.min(width)
+        } else {
+            width
+        };
+        if start_col > end_col {
+            return None;
+        }
+        let start_index = byte_index_for_display_col(text, start_col);
+        let end_index = byte_index_for_display_col(text, end_col);
+        lines.push(text[start_index..end_index].to_owned());
+    }
+    Some(lines.join("\n"))
+}
+
+fn ordered_selection(selection: TextSelection) -> (CellPos, CellPos) {
+    if selection.anchor <= selection.cursor {
+        (selection.anchor, selection.cursor)
+    } else {
+        (selection.cursor, selection.anchor)
+    }
+}
+
+fn byte_index_for_display_col(text: &str, col: u16) -> usize {
+    let mut width = 0;
+    for (index, ch) in text.char_indices() {
+        let next_width = width + ch.width().unwrap_or(0) as u16;
+        if next_width > col {
+            return index;
+        }
+        width = next_width;
+    }
+    text.len()
 }
 
 fn submit_input(model: &mut TuiModel) -> bool {
@@ -907,6 +1151,36 @@ fn push_result_event(model: &mut TuiModel, result: Result<String>) {
         Ok(message) => model.push_event(message),
         Err(error) => model.push_event(error.to_string()),
     }
+}
+
+#[cfg(windows)]
+fn write_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("powershell.exe")
+        .arg("-NonInteractive")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg("[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(err(error_info::WATCH_EVENT_FAILED).with_hint("Set-Clipboard failed"))
+    }
+}
+
+#[cfg(not(windows))]
+fn write_clipboard(_text: &str) -> Result<()> {
+    Err(err(error_info::WATCH_EVENT_FAILED).with_hint("clipboard copy is only wired on Windows"))
 }
 
 fn parse_log_line(line: &str) -> UiLogLine {
