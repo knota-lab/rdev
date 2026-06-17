@@ -1,7 +1,9 @@
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -31,8 +33,8 @@ use crate::session::{
     SharedSessions,
 };
 use crate::sftp::SftpDeltaBackend;
-use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest};
-use crate::sync_output::silent_output;
+use crate::sync::{RsyncSyncBackend, SyncDeltaRequest};
+use crate::sync_output::SyncOutput;
 use crate::up::{
     build_watcher, collect_event_changes, reconcile_existing_paths, resolve_local_root,
     sync_backend, EventFilter, PendingChanges, SyncedFiles,
@@ -71,6 +73,7 @@ struct TuiModel {
 struct TuiSyncRuntime {
     _watcher: notify::RecommendedWatcher,
     receiver: mpsc::Receiver<notify::Event>,
+    worker: TuiSyncWorker,
     pending: PendingChanges,
     synced_files: SyncedFiles,
     last_event_at: Instant,
@@ -78,9 +81,31 @@ struct TuiSyncRuntime {
     debounce: Duration,
 }
 
-struct TuiSyncContext<'a> {
-    config: &'a AppConfig,
-    backend: &'a dyn SyncBackend,
+struct TuiSyncWorker {
+    sender: mpsc::Sender<SyncJob>,
+    receiver: mpsc::Receiver<SyncWorkerEvent>,
+    in_flight: bool,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+struct SyncJob {
+    project_root: PathBuf,
+    changes: PendingChanges,
+    cancel: Arc<AtomicBool>,
+}
+
+enum SyncWorkerEvent {
+    Output(String),
+    Done {
+        changes: PendingChanges,
+        cancelled: bool,
+        result: std::result::Result<String, String>,
+    },
+}
+
+#[derive(Clone)]
+struct ChannelSyncOutput {
+    sender: mpsc::Sender<SyncWorkerEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,16 +178,12 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
-    let runner = SystemProcessRunner::default();
-    let rsync_backend = RsyncSyncBackend::new(config, &runner);
-    let ssh_backend = SftpDeltaBackend::new(config).with_output(silent_output());
-    let backend = sync_backend(config, &rsync_backend, &ssh_backend);
     let mut sync = TuiSyncRuntime::new(config, &request)?;
     let mut guard = init_terminal()?;
     let mut model = TuiModel::new(config, request);
     let mut dirty = true;
     loop {
-        dirty |= sync.process_events(TuiSyncContext { config, backend }, &mut model);
+        dirty |= sync.process_events(config, &mut model);
         dirty |= model.refresh_sessions();
         if dirty {
             guard
@@ -177,7 +198,7 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
         {
             let event = event::read()
                 .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
-            if handle_event(&mut model, event) {
+            if handle_event(&mut model, &mut sync, event) {
                 if let Ok(mut manager) = model.sessions.lock() {
                     manager.stop_all();
                 }
@@ -384,6 +405,7 @@ impl TuiSyncRuntime {
         Ok(Self {
             _watcher: watcher,
             receiver,
+            worker: TuiSyncWorker::spawn(config.clone()),
             pending: PendingChanges::default(),
             synced_files: SyncedFiles::default(),
             last_event_at: Instant::now(),
@@ -392,13 +414,51 @@ impl TuiSyncRuntime {
         })
     }
 
-    fn process_events(&mut self, context: TuiSyncContext<'_>, model: &mut TuiModel) -> bool {
+    fn process_events(&mut self, config: &AppConfig, model: &mut TuiModel) -> bool {
         let mut dirty = false;
+        while let Ok(event) = self.worker.receiver.try_recv() {
+            dirty = true;
+            match event {
+                SyncWorkerEvent::Output(line) => model.push_sync_log(line),
+                SyncWorkerEvent::Done {
+                    changes,
+                    cancelled,
+                    result,
+                } => {
+                    self.worker.in_flight = false;
+                    self.worker.cancel = None;
+                    match result {
+                        Ok(message) => {
+                            self.synced_files.record(&changes, &self.local_root);
+                            model.push_sync_log(message);
+                            model.sync_status = if self.pending.has_changes() {
+                                ProcessStatus::Running
+                            } else {
+                                ProcessStatus::Idle
+                            };
+                        }
+                        Err(error) => {
+                            if cancelled {
+                                model.sync_status = if self.pending.has_changes() {
+                                    ProcessStatus::Running
+                                } else {
+                                    ProcessStatus::Cancelled
+                                };
+                                model.push_sync_log("sync cancelled");
+                            } else {
+                                model.sync_status = ProcessStatus::Failed;
+                                model.push_sync_log(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         while let Ok(event) = self.receiver.try_recv() {
             let filter = EventFilter {
                 local_root: &self.local_root,
-                watch_dirs: &context.config.sync.watch_dirs,
-                excludes: &context.config.sync.exclude,
+                watch_dirs: &config.sync.watch_dirs,
+                excludes: &config.sync.exclude,
             };
             if let Some(changes) = collect_event_changes(&event, &filter) {
                 self.pending.merge(changes);
@@ -407,6 +467,10 @@ impl TuiSyncRuntime {
                 model.push_sync_log("file change detected");
                 dirty = true;
             }
+        }
+        if self.worker.in_flight {
+            model.sync_status = ProcessStatus::Running;
+            return dirty;
         }
         if !self.pending.has_changes() {
             if model.sync_status == ProcessStatus::Running {
@@ -431,24 +495,86 @@ impl TuiSyncRuntime {
         model.push_sync_log(format!(
             "delta start uploads={upload_count} deletes={delete_count}"
         ));
-        let result = context.backend.sync_delta(SyncDeltaRequest {
+        let cancel = Arc::new(AtomicBool::new(false));
+        match self.worker.sender.send(SyncJob {
             project_root: self.local_root.clone(),
-            uploads: changes.uploads.iter().cloned().collect(),
-            deletes: changes.deletes.iter().cloned().collect(),
-            cancelled: None,
-        });
-        match result {
-            Ok(report) => {
-                self.synced_files.record(&changes, &self.local_root);
-                model.sync_status = ProcessStatus::Idle;
-                model.push_sync_log(report.format_text());
+            changes,
+            cancel: Arc::clone(&cancel),
+        }) {
+            Ok(()) => {
+                self.worker.in_flight = true;
+                self.worker.cancel = Some(cancel);
             }
             Err(error) => {
                 model.sync_status = ProcessStatus::Failed;
-                model.push_sync_log(error.to_string());
+                model.push_sync_log(format!("sync worker stopped: {error}"));
             }
         }
         true
+    }
+
+    fn cancel_current(&mut self, model: &mut TuiModel) -> bool {
+        if let Some(cancel) = &self.worker.cancel {
+            cancel.store(true, Ordering::SeqCst);
+            model.sync_status = ProcessStatus::Cancelled;
+            model.push_sync_log("sync cancellation requested");
+            return true;
+        }
+        if self.pending.has_changes() {
+            self.pending = PendingChanges::default();
+            model.sync_status = ProcessStatus::Cancelled;
+            model.push_sync_log("pending sync cancelled");
+            return true;
+        }
+        false
+    }
+}
+
+impl TuiSyncWorker {
+    fn spawn(config: AppConfig) -> Self {
+        let (job_sender, job_receiver) = mpsc::channel::<SyncJob>();
+        let (event_sender, event_receiver) = mpsc::channel::<SyncWorkerEvent>();
+        thread::spawn({
+            let event_sender = event_sender.clone();
+            move || {
+                let runner = SystemProcessRunner::default();
+                let rsync_backend = RsyncSyncBackend::new(&config, &runner);
+                let ssh_backend =
+                    SftpDeltaBackend::new(&config).with_output(Arc::new(ChannelSyncOutput {
+                        sender: event_sender.clone(),
+                    }));
+                let backend = sync_backend(&config, &rsync_backend, &ssh_backend);
+                while let Ok(job) = job_receiver.recv() {
+                    let request = SyncDeltaRequest {
+                        project_root: job.project_root,
+                        uploads: job.changes.uploads.iter().cloned().collect(),
+                        deletes: job.changes.deletes.iter().cloned().collect(),
+                        cancelled: Some(Arc::clone(&job.cancel)),
+                    };
+                    let result = backend
+                        .sync_delta(request)
+                        .map(|report| report.format_text())
+                        .map_err(|error| error.to_string());
+                    let _send_result = event_sender.send(SyncWorkerEvent::Done {
+                        changes: job.changes,
+                        cancelled: job.cancel.load(Ordering::SeqCst),
+                        result,
+                    });
+                }
+            }
+        });
+        Self {
+            sender: job_sender,
+            receiver: event_receiver,
+            in_flight: false,
+            cancel: None,
+        }
+    }
+}
+
+impl SyncOutput for ChannelSyncOutput {
+    fn line(&self, line: String) {
+        let _send_result = self.sender.send(SyncWorkerEvent::Output(line));
     }
 }
 
@@ -822,9 +948,9 @@ fn input_text_area(area: Rect) -> Rect {
     }
 }
 
-fn handle_event(model: &mut TuiModel, event: Event) -> bool {
+fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -> bool {
     match event {
-        Event::Key(key) => handle_key(model, key),
+        Event::Key(key) => handle_key(model, sync, key),
         Event::Paste(text) => {
             model.input.push_str(&text);
             false
@@ -872,12 +998,15 @@ fn handle_event(model: &mut TuiModel, event: Event) -> bool {
     }
 }
 
-fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
+fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if copy_selection(model) {
+            return false;
+        }
+        if focused_process_is_sync(model) && sync.cancel_current(model) {
             return false;
         }
         model.sync_status = ProcessStatus::Cancelled;
@@ -1146,6 +1275,13 @@ fn focused_session_selector(model: &TuiModel) -> Option<String> {
         .get(model.focused)
         .and_then(|process| process.session_id)
         .map(|id| id.to_string())
+}
+
+fn focused_process_is_sync(model: &TuiModel) -> bool {
+    model
+        .processes
+        .get(model.focused)
+        .is_some_and(|process| process.session_id.is_none())
 }
 
 fn lock_sessions(

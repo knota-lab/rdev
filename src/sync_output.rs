@@ -13,17 +13,6 @@ impl SyncOutput for ConsoleSyncOutput {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SilentSyncOutput;
-
-impl SyncOutput for SilentSyncOutput {
-    fn line(&self, _line: String) {}
-}
-
 pub(crate) fn console_output() -> Arc<dyn SyncOutput> {
     Arc::new(ConsoleSyncOutput)
-}
-
-pub(crate) fn silent_output() -> Arc<dyn SyncOutput> {
-    Arc::new(SilentSyncOutput)
 }
