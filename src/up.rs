@@ -400,6 +400,11 @@ fn handle_console_command(
             let spec = RemoteSessionSpec::from_config(watch.config, name, command)?;
             println!("{}", SessionManager::start_remote(sessions, spec)?);
         }
+        ConsoleCommand::SavedSessions
+        | ConsoleCommand::RestoreSession { .. }
+        | ConsoleCommand::DeleteSavedSession { .. } => {
+            println!("[console] saved sessions are available in TUI mode");
+        }
         ConsoleCommand::Logs { selector } => {
             let mut manager = lock_sessions_for_console(sessions)?;
             println!("{}", manager.logs(selector.as_deref())?);

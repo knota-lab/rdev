@@ -42,11 +42,13 @@ use crate::up::{
 
 mod input;
 mod logs;
+mod state;
 
 use self::input::{
     next_char_boundary, next_word_boundary, previous_char_boundary, previous_word_boundary,
 };
 use self::logs::{parse_log_line, selected_line, wrapped_log_rows, UiLogLine};
+use self::state::{SavedSession, SavedSessionKind, TuiStateStore};
 
 const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
@@ -63,6 +65,7 @@ pub struct TuiRequest {
 #[derive(Debug)]
 struct TuiModel {
     config: AppConfig,
+    state: TuiStateStore,
     sessions: SharedSessions,
     project: String,
     remote: String,
@@ -218,8 +221,19 @@ impl TuiModel {
             .unwrap_or("project")
             .to_owned();
         let remote = format!("{}:{}", config.remote.host, config.remote.path);
+        let (state, state_event) = TuiStateStore::load(&request.project_root);
+        let mut events = vec![
+            "sync watcher started".to_owned(),
+            "real sessions enabled".to_owned(),
+            "type new session <name> -- <command>".to_owned(),
+        ];
+        if let Some(event) = state_event {
+            events.push(event);
+        }
         Self {
             config: config.clone(),
+            command_history: state.command_history().to_vec(),
+            state,
             sessions: SessionManager::shared(request.project_root),
             project,
             remote,
@@ -234,14 +248,9 @@ impl TuiModel {
                 UiLogLine::rdev("sync watcher started"),
                 UiLogLine::rdev("initial full sync is not run in TUI yet"),
             ],
-            events: vec![
-                "sync watcher started".to_owned(),
-                "real sessions enabled".to_owned(),
-                "type new session <name> -- <command>".to_owned(),
-            ],
+            events,
             input: String::new(),
             input_cursor: 0,
-            command_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
             follow_logs: true,
@@ -470,17 +479,14 @@ impl TuiModel {
         if command.is_empty() {
             return;
         }
-        if self
-            .command_history
-            .last()
-            .is_some_and(|previous| previous == command)
+        match self
+            .state
+            .push_command_history(command, COMMAND_HISTORY_LIMIT)
         {
-            return;
-        }
-        self.command_history.push(command.to_owned());
-        if self.command_history.len() > COMMAND_HISTORY_LIMIT {
-            let overflow = self.command_history.len() - COMMAND_HISTORY_LIMIT;
-            self.command_history.drain(0..overflow);
+            Ok(()) => {
+                self.command_history = self.state.command_history().to_vec();
+            }
+            Err(error) => self.push_event(error.to_string()),
         }
     }
 
@@ -1274,12 +1280,14 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
         ConsoleCommand::Help => Ok(help_text().to_owned()),
         ConsoleCommand::Sessions => lock_sessions(model).map(|mut manager| manager.list()),
         ConsoleCommand::NewSession { name, command } => {
-            SessionManager::start(&model.sessions, name, command)
+            start_and_remember_local(model, name, command)
         }
         ConsoleCommand::NewRemoteSession { name, command } => {
-            RemoteSessionSpec::from_config(&model.config, name, command)
-                .and_then(|spec| SessionManager::start_remote(&model.sessions, spec))
+            start_and_remember_remote(model, name, command)
         }
+        ConsoleCommand::SavedSessions => Ok(model.state.saved_sessions_text()),
+        ConsoleCommand::RestoreSession { selector } => restore_saved_session(model, &selector),
+        ConsoleCommand::DeleteSavedSession { selector } => model.state.delete_session(&selector),
         ConsoleCommand::Logs { selector } => {
             lock_sessions(model).and_then(|mut manager| manager.logs(selector.as_deref()))
         }
@@ -1328,6 +1336,47 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
     }
     model.refresh_sessions();
     false
+}
+
+fn restore_saved_session(model: &mut TuiModel, selector: &str) -> Result<String> {
+    let Some(saved) = model.state.find_session(selector) else {
+        return Err(err(error_info::WATCH_EVENT_FAILED)
+            .with_hint(format!("saved session not found: {selector}")));
+    };
+    match saved.kind {
+        SavedSessionKind::Local => {
+            SessionManager::start(&model.sessions, saved.name, saved.command)
+        }
+        SavedSessionKind::Remote => {
+            let spec = RemoteSessionSpec::from_config(&model.config, saved.name, saved.command)?;
+            SessionManager::start_remote(&model.sessions, spec)
+        }
+    }
+}
+
+fn start_and_remember_local(model: &mut TuiModel, name: String, command: String) -> Result<String> {
+    let message = SessionManager::start(&model.sessions, name.clone(), command.clone())?;
+    model.state.remember_session(SavedSession {
+        name,
+        kind: SavedSessionKind::Local,
+        command,
+    })?;
+    Ok(message)
+}
+
+fn start_and_remember_remote(
+    model: &mut TuiModel,
+    name: String,
+    command: String,
+) -> Result<String> {
+    let spec = RemoteSessionSpec::from_config(&model.config, name.clone(), command.clone())?;
+    let message = SessionManager::start_remote(&model.sessions, spec)?;
+    model.state.remember_session(SavedSession {
+        name,
+        kind: SavedSessionKind::Remote,
+        command,
+    })?;
+    Ok(message)
 }
 
 fn stop_focused(model: &mut TuiModel) {

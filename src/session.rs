@@ -32,6 +32,13 @@ pub enum ConsoleCommand {
         name: String,
         command: String,
     },
+    SavedSessions,
+    RestoreSession {
+        selector: String,
+    },
+    DeleteSavedSession {
+        selector: String,
+    },
     Logs {
         selector: Option<String>,
     },
@@ -598,6 +605,19 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if trimmed == "sync" {
         return ConsoleCommand::Sync;
     }
+    if matches!(trimmed, "saved-sessions" | "saved sessions") {
+        return ConsoleCommand::SavedSessions;
+    }
+    if let Some(rest) = trimmed.strip_prefix("restore ") {
+        return ConsoleCommand::RestoreSession {
+            selector: rest.trim().to_owned(),
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("delete session ") {
+        return ConsoleCommand::DeleteSavedSession {
+            selector: rest.trim().to_owned(),
+        };
+    }
     if let Some(rest) = trimmed.strip_prefix("logs") {
         let selector = optional_arg(rest);
         return ConsoleCommand::Logs { selector };
@@ -634,7 +654,7 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
 }
 
 pub fn help_text() -> &'static str {
-    "commands: help, sessions|ps, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit, quit!"
+    "commands: help, sessions|ps, saved-sessions, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, restore <name|index>, delete session <name|index>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit, quit!"
 }
 
 fn parse_new_session(rest: &str) -> ConsoleCommand {
@@ -948,6 +968,26 @@ mod tests {
             ConsoleCommand::NewRemoteSession {
                 name: "web".to_owned(),
                 command: "pnpm preview --host".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_saved_session_commands() {
+        assert_eq!(
+            parse_console_command("saved-sessions"),
+            ConsoleCommand::SavedSessions
+        );
+        assert_eq!(
+            parse_console_command("restore web"),
+            ConsoleCommand::RestoreSession {
+                selector: "web".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_console_command("delete session web"),
+            ConsoleCommand::DeleteSavedSession {
+                selector: "web".to_owned()
             }
         );
     }
