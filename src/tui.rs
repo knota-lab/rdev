@@ -159,6 +159,12 @@ enum UiEventLevel {
     Sync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventPanelMode {
+    Inline,
+    Boxed,
+}
+
 impl UiEventLevel {
     fn parts(self) -> (&'static str, Style) {
         match self {
@@ -819,16 +825,14 @@ fn draw(frame: &mut Frame<'_>, model: &mut TuiModel) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(6),
-            Constraint::Length(events_height(area)),
             Constraint::Length(3),
         ])
         .split(area);
 
     draw_status(frame, vertical[0], model);
     draw_body(frame, vertical[1], model);
-    draw_events(frame, vertical[2], model);
-    draw_input(frame, vertical[3], model);
-    set_input_cursor(frame, vertical[3], model);
+    draw_input(frame, vertical[2], model);
+    set_input_cursor(frame, vertical[2], model);
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -855,10 +859,15 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     if area.width < 80 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(4)])
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(4),
+                Constraint::Length(compact_events_height(area)),
+            ])
             .split(area);
         draw_logs(frame, chunks[0], model);
         draw_compact_processes(frame, chunks[1], model);
+        draw_events(frame, chunks[2], (model, EventPanelMode::Inline));
         return;
     }
 
@@ -923,12 +932,26 @@ fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    if area.height < 16 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(8)])
+            .split(area);
+        draw_process_list(frame, chunks[0], model);
+        draw_process_details(frame, chunks[1], model);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(8)])
+        .constraints([
+            Constraint::Percentage(38),
+            Constraint::Length(8),
+            Constraint::Min(5),
+        ])
         .split(area);
     draw_process_list(frame, chunks[0], model);
     draw_process_details(frame, chunks[1], model);
+    draw_events(frame, chunks[2], (model, EventPanelMode::Boxed));
 }
 
 fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -1000,35 +1023,53 @@ fn draw_compact_processes(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     );
 }
 
-fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+fn draw_events(frame: &mut Frame<'_>, area: Rect, options: (&TuiModel, EventPanelMode)) {
+    let (model, mode) = options;
     if area.height == 0 {
         return;
     }
+    if mode == EventPanelMode::Boxed {
+        frame.render_widget(
+            Block::default().title(" Events ").borders(Borders::ALL),
+            area,
+        );
+    }
+    let content = if mode == EventPanelMode::Boxed {
+        Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        }
+    } else {
+        area
+    };
+    if content.height == 0 || content.width == 0 {
+        return;
+    }
     let Some(latest) = model.events.last() else {
-        frame.render_widget(Paragraph::new(Line::from("status: idle")), area);
+        frame.render_widget(Paragraph::new(Line::from("status: idle")), content);
         return;
     };
-    let mut lines = vec![event_line("status", latest)];
-    if area.height > 1 {
+    let mut lines = vec![event_line("latest", latest)];
+    if content.height > 2 {
         let history = model
             .events
             .iter()
             .rev()
             .skip(1)
-            .take(3)
-            .map(|event| compact_event_text(event, area.width.saturating_div(3).max(16)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
+            .take(content.height.saturating_sub(1) as usize)
+            .map(event_history_line)
             .collect::<Vec<_>>();
         if !history.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("recent ", Style::default().fg(Color::DarkGray)),
-                Span::styled(history.join("  /  "), Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.push(Line::from(Span::styled(
+                "recent",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.extend(history);
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
 }
 
 fn event_line(title: &str, event: &UiEvent) -> Line<'static> {
@@ -1040,28 +1081,12 @@ fn event_line(title: &str, event: &UiEvent) -> Line<'static> {
     ])
 }
 
-fn compact_event_text(event: &UiEvent, max_width: u16) -> String {
-    let (label, _) = event.level.parts();
-    let prefix = format!("{label} ");
-    let width = max_width.saturating_sub(1) as usize;
-    let mut text = format!("{prefix}{}", event.message);
-    if UnicodeWidthStr::width(text.as_str()) <= width {
-        return text;
-    }
-    let mut truncated = String::new();
-    let mut used = 0usize;
-    let limit = width.saturating_sub(3);
-    for ch in text.chars() {
-        let char_width = ch.width().unwrap_or(0);
-        if used.saturating_add(char_width) > limit {
-            break;
-        }
-        truncated.push(ch);
-        used = used.saturating_add(char_width);
-    }
-    text = truncated;
-    text.push_str("...");
-    text
+fn event_history_line(event: &UiEvent) -> Line<'static> {
+    let (label, style) = event.level.parts();
+    Line::from(vec![
+        Span::styled(format!("{label} "), style),
+        Span::styled(event.message.clone(), Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -1421,7 +1446,10 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
             return true;
         }
         ConsoleCommand::Empty => Ok(String::new()),
-        ConsoleCommand::Unknown(message) => Ok(format!("unknown command: {message}")),
+        ConsoleCommand::Unknown(message) => {
+            model.push_warning(format!("unknown command: {message}"));
+            Ok(String::new())
+        }
     };
     match result {
         Ok(message) => {
@@ -1564,12 +1592,10 @@ fn write_clipboard(_text: &str) -> Result<()> {
     Err(err(error_info::WATCH_EVENT_FAILED).with_hint("clipboard copy is only wired on Windows"))
 }
 
-fn events_height(area: Rect) -> u16 {
-    if area.height < 20 {
+fn compact_events_height(area: Rect) -> u16 {
+    if area.height < 22 {
         0
-    } else if area.height < 28 {
-        1
     } else {
-        2
+        3
     }
 }
