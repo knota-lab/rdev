@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -17,12 +18,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use notify::{RecursiveMode, Watcher};
+
 use crate::config::AppConfig;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
+use crate::process::SystemProcessRunner;
 use crate::session::{
     help_text, parse_console_command, ConsoleCommand, RemoteSessionSpec, SessionManager,
     SharedSessions,
+};
+use crate::sftp::SftpDeltaBackend;
+use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest};
+use crate::up::{
+    build_watcher, collect_event_changes, reconcile_existing_paths, resolve_local_root,
+    sync_backend, EventFilter, PendingChanges, SyncedFiles,
 };
 
 const INPUT_PROMPT: &str = "rdev> ";
@@ -32,6 +42,7 @@ const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
     pub project_root: PathBuf,
+    pub poll: bool,
 }
 
 #[derive(Debug)]
@@ -44,11 +55,27 @@ struct TuiModel {
     processes: Vec<UiProcess>,
     focused: usize,
     logs: Vec<UiLogLine>,
+    sync_logs: Vec<UiLogLine>,
     events: Vec<String>,
     input: String,
     follow_logs: bool,
     log_scroll: u16,
     started_at: Instant,
+}
+
+struct TuiSyncRuntime {
+    _watcher: notify::RecommendedWatcher,
+    receiver: mpsc::Receiver<notify::Event>,
+    pending: PendingChanges,
+    synced_files: SyncedFiles,
+    last_event_at: Instant,
+    local_root: PathBuf,
+    debounce: Duration,
+}
+
+struct TuiSyncContext<'a> {
+    config: &'a AppConfig,
+    backend: &'a dyn SyncBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,13 +98,13 @@ struct UiProcess {
     command: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct UiLogLine {
     stream: LogStream,
     text: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum LogStream {
     Stdout,
     Stderr,
@@ -101,9 +128,15 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
+    let runner = SystemProcessRunner::default();
+    let rsync_backend = RsyncSyncBackend::new(config, &runner);
+    let ssh_backend = SftpDeltaBackend::new(config);
+    let backend = sync_backend(config, &rsync_backend, &ssh_backend);
+    let mut sync = TuiSyncRuntime::new(config, &request)?;
     let mut guard = init_terminal()?;
     let mut model = TuiModel::new(config, request);
     loop {
+        sync.process_events(TuiSyncContext { config, backend }, &mut model);
         model.refresh_sessions();
         guard
             .terminal
@@ -116,6 +149,9 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
             let event = event::read()
                 .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
             if handle_event(&mut model, event) {
+                if let Ok(mut manager) = model.sessions.lock() {
+                    manager.stop_all();
+                }
                 return Ok(());
             }
         }
@@ -141,10 +177,14 @@ impl TuiModel {
             focused: 0,
             logs: vec![
                 UiLogLine::rdev("TUI session mode started. Type help for commands."),
-                UiLogLine::rdev("Sync watcher is not wired into TUI yet."),
+                UiLogLine::rdev("Focus a session to view its logs."),
+            ],
+            sync_logs: vec![
+                UiLogLine::rdev("sync watcher started"),
+                UiLogLine::rdev("initial full sync is not run in TUI yet"),
             ],
             events: vec![
-                "sync idle".to_owned(),
+                "sync watcher started".to_owned(),
                 "real sessions enabled".to_owned(),
                 "type new session <name> -- <command>".to_owned(),
             ],
@@ -208,7 +248,7 @@ impl TuiModel {
                 })
                 .unwrap_or_else(|| vec![UiLogLine::rdev("logs: <empty>")])
         } else {
-            vec![UiLogLine::rdev("sync watcher is not wired into TUI yet")]
+            self.sync_logs.clone()
         };
         if self.logs.is_empty() {
             self.logs.push(UiLogLine::rdev("logs: <empty>"));
@@ -256,6 +296,16 @@ impl TuiModel {
         }
     }
 
+    fn push_sync_log(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        self.sync_logs.push(UiLogLine::rdev(line.clone()));
+        self.push_event(line);
+        if self.sync_logs.len() > 500 {
+            let overflow = self.sync_logs.len() - 500;
+            self.sync_logs.drain(0..overflow);
+        }
+    }
+
     fn focus_manager_to_current(&mut self) {
         let Some(session_id) = self
             .processes
@@ -266,6 +316,84 @@ impl TuiModel {
         };
         if let Ok(mut manager) = self.sessions.lock() {
             let _ignored = manager.focus(&session_id.to_string());
+        }
+    }
+}
+
+impl TuiSyncRuntime {
+    fn new(config: &AppConfig, request: &TuiRequest) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = build_watcher(request.poll, sender)?;
+        let local_root = resolve_local_root(&request.project_root, &config.sync.local_path);
+        for watch_dir in &config.sync.watch_dirs {
+            let watch_path = local_root.join(watch_dir);
+            watcher
+                .watch(&watch_path, RecursiveMode::Recursive)
+                .map_err(|source| {
+                    err_with_source(error_info::WATCH_EVENT_FAILED, source)
+                        .with_path(watch_path.display())
+                })?;
+        }
+        Ok(Self {
+            _watcher: watcher,
+            receiver,
+            pending: PendingChanges::default(),
+            synced_files: SyncedFiles::default(),
+            last_event_at: Instant::now(),
+            local_root,
+            debounce: Duration::from_millis(config.sync.debounce_ms.max(50)),
+        })
+    }
+
+    fn process_events(&mut self, context: TuiSyncContext<'_>, model: &mut TuiModel) {
+        while let Ok(event) = self.receiver.try_recv() {
+            let filter = EventFilter {
+                local_root: &self.local_root,
+                watch_dirs: &context.config.sync.watch_dirs,
+                excludes: &context.config.sync.exclude,
+            };
+            if let Some(changes) = collect_event_changes(&event, &filter) {
+                self.pending.merge(changes);
+                self.last_event_at = Instant::now();
+                model.sync_status = ProcessStatus::Running;
+                model.push_sync_log("file change detected");
+            }
+        }
+        if !self.pending.has_changes() || self.last_event_at.elapsed() < self.debounce {
+            if model.sync_status == ProcessStatus::Running {
+                model.sync_status = ProcessStatus::Idle;
+            }
+            return;
+        }
+        let changes = self.pending.take();
+        let changes = reconcile_existing_paths(changes, &self.local_root);
+        let changes = self.synced_files.filter_changed(changes, &self.local_root);
+        if !changes.has_changes() {
+            model.sync_status = ProcessStatus::Idle;
+            return;
+        }
+        model.sync_status = ProcessStatus::Running;
+        let upload_count = changes.uploads.len();
+        let delete_count = changes.deletes.len();
+        model.push_sync_log(format!(
+            "delta start uploads={upload_count} deletes={delete_count}"
+        ));
+        let result = context.backend.sync_delta(SyncDeltaRequest {
+            project_root: self.local_root.clone(),
+            uploads: changes.uploads.iter().cloned().collect(),
+            deletes: changes.deletes.iter().cloned().collect(),
+            cancelled: None,
+        });
+        match result {
+            Ok(report) => {
+                self.synced_files.record(&changes, &self.local_root);
+                model.sync_status = ProcessStatus::Idle;
+                model.push_sync_log(report.format_text());
+            }
+            Err(error) => {
+                model.sync_status = ProcessStatus::Failed;
+                model.push_sync_log(error.to_string());
+            }
         }
     }
 }

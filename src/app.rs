@@ -110,6 +110,7 @@ fn up(args: crate::cli::UpArgs, cwd: &Path) -> Result<String> {
             &config,
             TuiRequest {
                 project_root: cwd.to_path_buf(),
+                poll: args.poll,
             },
         )?;
         return Ok(String::new());

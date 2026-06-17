@@ -243,7 +243,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn sync_backend<'a>(
+pub(crate) fn sync_backend<'a>(
     config: &AppConfig,
     rsync: &'a dyn SyncBackend,
     ssh: &'a dyn SyncBackend,
@@ -479,12 +479,16 @@ struct FileFingerprint {
 }
 
 #[derive(Debug, Default)]
-struct SyncedFiles {
+pub(crate) struct SyncedFiles {
     files: BTreeMap<PathBuf, FileFingerprint>,
 }
 
 impl SyncedFiles {
-    fn filter_changed(&self, changes: PendingChanges, local_root: &Path) -> PendingChanges {
+    pub(crate) fn filter_changed(
+        &self,
+        changes: PendingChanges,
+        local_root: &Path,
+    ) -> PendingChanges {
         let mut filtered = PendingChanges {
             uploads: BTreeSet::new(),
             deletes: changes.deletes,
@@ -498,7 +502,7 @@ impl SyncedFiles {
         filtered
     }
 
-    fn record(&mut self, changes: &PendingChanges, local_root: &Path) {
+    pub(crate) fn record(&mut self, changes: &PendingChanges, local_root: &Path) {
         for upload in &changes.uploads {
             if let Some(fingerprint) = file_fingerprint(&local_root.join(upload)) {
                 self.files.insert(upload.clone(), fingerprint);
@@ -716,7 +720,7 @@ fn install_console_input(shutdown: Arc<AtomicBool>) -> mpsc::Receiver<String> {
     receiver
 }
 
-fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {
+pub(crate) fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {
     let callback = move |result: notify::Result<Event>| {
         if let Ok(event) = result {
             let _send_result = sender.send(event);
@@ -734,7 +738,7 @@ fn build_watcher(poll: bool, sender: mpsc::Sender<Event>) -> Result<RecommendedW
     .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))
 }
 
-fn resolve_local_root(project_root: &Path, local_path: &Path) -> PathBuf {
+pub(crate) fn resolve_local_root(project_root: &Path, local_path: &Path) -> PathBuf {
     if local_path.is_absolute() {
         local_path.to_path_buf()
     } else {
@@ -743,17 +747,17 @@ fn resolve_local_root(project_root: &Path, local_path: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Default)]
-struct PendingChanges {
-    uploads: BTreeSet<PathBuf>,
-    deletes: BTreeSet<PathBuf>,
+pub(crate) struct PendingChanges {
+    pub(crate) uploads: BTreeSet<PathBuf>,
+    pub(crate) deletes: BTreeSet<PathBuf>,
 }
 
 impl PendingChanges {
-    fn has_changes(&self) -> bool {
+    pub(crate) fn has_changes(&self) -> bool {
         !self.uploads.is_empty() || !self.deletes.is_empty()
     }
 
-    fn merge(&mut self, other: Self) {
+    pub(crate) fn merge(&mut self, other: Self) {
         for upload in other.uploads {
             self.deletes.remove(&upload);
             self.uploads.insert(upload);
@@ -764,7 +768,7 @@ impl PendingChanges {
         }
     }
 
-    fn take(&mut self) -> Self {
+    pub(crate) fn take(&mut self) -> Self {
         Self {
             uploads: std::mem::take(&mut self.uploads),
             deletes: std::mem::take(&mut self.deletes),
@@ -772,13 +776,16 @@ impl PendingChanges {
     }
 }
 
-struct EventFilter<'a> {
-    local_root: &'a Path,
-    watch_dirs: &'a [PathBuf],
-    excludes: &'a [String],
+pub(crate) struct EventFilter<'a> {
+    pub(crate) local_root: &'a Path,
+    pub(crate) watch_dirs: &'a [PathBuf],
+    pub(crate) excludes: &'a [String],
 }
 
-fn collect_event_changes(event: &Event, filter: &EventFilter<'_>) -> Option<PendingChanges> {
+pub(crate) fn collect_event_changes(
+    event: &Event,
+    filter: &EventFilter<'_>,
+) -> Option<PendingChanges> {
     let mut changes = PendingChanges::default();
     for path in &event.paths {
         if filter.is_excluded(path) {
@@ -806,7 +813,10 @@ fn collect_event_changes(event: &Event, filter: &EventFilter<'_>) -> Option<Pend
     }
 }
 
-fn reconcile_existing_paths(mut changes: PendingChanges, local_root: &Path) -> PendingChanges {
+pub(crate) fn reconcile_existing_paths(
+    mut changes: PendingChanges,
+    local_root: &Path,
+) -> PendingChanges {
     let uploads = std::mem::take(&mut changes.uploads);
     for upload in uploads {
         if local_root.join(&upload).exists() {
