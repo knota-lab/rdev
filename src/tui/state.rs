@@ -100,7 +100,7 @@ impl TuiStateStore {
 
     pub(super) fn delete_session(&mut self, selector: &str) -> Result<String> {
         let Some(index) = self.session_index(selector) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED)
+            return Err(err(error_info::SESSION_FAILED)
                 .with_hint(format!("saved session not found: {selector}")));
         };
         let removed = self.state.sessions.remove(index);

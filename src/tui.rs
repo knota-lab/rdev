@@ -25,7 +25,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use notify::{RecursiveMode, Watcher};
 
 use crate::config::AppConfig;
-use crate::error::{err, err_with_source, Result};
+use crate::error::{err, err_with_source, RdevError, Result};
 use crate::error_info;
 use crate::process::SystemProcessRunner;
 use crate::session::{
@@ -1079,16 +1079,18 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         if focused_process_is_sync(model) && sync.cancel_current(model) {
             return false;
         }
-        model.sync_status = ProcessStatus::Cancelled;
-        model.push_event("interrupt requested");
+        if focused_process_is_sync(model) {
+            model.sync_status = ProcessStatus::Cancelled;
+            model.push_event("sync cancel requested");
+        } else {
+            model.push_event("ctrl+c copies selection; focus sync to cancel sync");
+        }
         return false;
     }
     match key.code {
         KeyCode::Char('?') => model.push_event(
             "help: drag logs to select, ctrl+c copies selection, ctrl+arrows focus, quit",
         ),
-        KeyCode::Char('s') if model.input.is_empty() => stop_focused(model),
-        KeyCode::Char('r') if model.input.is_empty() => restart_focused(model),
         KeyCode::Char('f') if model.input.is_empty() => {
             model.follow_logs = true;
             model.log_scroll = 0;
@@ -1191,7 +1193,7 @@ fn copy_selection(model: &mut TuiModel) -> bool {
             model.push_event(format!("copied {} lines", text.lines().count()));
             model.selection = None;
         }
-        Err(error) => model.push_event(error.to_string()),
+        Err(error) => model.push_event(tui_error_message(&error)),
     }
     true
 }
@@ -1302,7 +1304,15 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
         ConsoleCommand::Stop { selector } => {
             lock_sessions(model).and_then(|mut manager| manager.stop(&selector))
         }
+        ConsoleCommand::StopFocused => {
+            stop_focused(model);
+            Ok(String::new())
+        }
         ConsoleCommand::Restart { selector } => SessionManager::restart(&model.sessions, &selector),
+        ConsoleCommand::RestartFocused => {
+            restart_focused(model);
+            Ok(String::new())
+        }
         ConsoleCommand::Sync => {
             model.sync_status = ProcessStatus::Cancelled;
             Ok("sync is not wired into TUI yet".to_owned())
@@ -1332,7 +1342,7 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
                 model.push_event(line.to_owned());
             }
         }
-        Err(error) => model.push_event(error.to_string()),
+        Err(error) => model.push_event(tui_error_message(&error)),
     }
     model.refresh_sessions();
     false
@@ -1340,7 +1350,7 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
 
 fn restore_saved_session(model: &mut TuiModel, selector: &str) -> Result<String> {
     let Some(saved) = model.state.find_session(selector) else {
-        return Err(err(error_info::WATCH_EVENT_FAILED)
+        return Err(err(error_info::SESSION_FAILED)
             .with_hint(format!("saved session not found: {selector}")));
     };
     match saved.kind {
@@ -1420,13 +1430,20 @@ fn lock_sessions(
     model
         .sessions
         .lock()
-        .map_err(|_| err(error_info::WATCH_EVENT_FAILED).with_hint("session manager poisoned"))
+        .map_err(|_| err(error_info::SESSION_FAILED).with_hint("session manager poisoned"))
 }
 
 fn push_result_event(model: &mut TuiModel, result: Result<String>) {
     match result {
         Ok(message) => model.push_event(message),
-        Err(error) => model.push_event(error.to_string()),
+        Err(error) => model.push_event(tui_error_message(&error)),
+    }
+}
+
+fn tui_error_message(error: &RdevError) -> String {
+    match &error.hint {
+        Some(hint) if !hint.is_empty() => format!("{error}; {hint}"),
+        _ => error.to_string(),
     }
 }
 

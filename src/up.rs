@@ -425,8 +425,14 @@ fn handle_console_command(
             let mut manager = lock_sessions_for_console(sessions)?;
             println!("{}", manager.stop(&selector)?);
         }
+        ConsoleCommand::StopFocused => {
+            println!("[console] shorthand s is available in TUI mode");
+        }
         ConsoleCommand::Restart { selector } => {
             println!("{}", SessionManager::restart(sessions, &selector)?);
+        }
+        ConsoleCommand::RestartFocused => {
+            println!("[console] shorthand r is available in TUI mode");
         }
         ConsoleCommand::Sync => {
             watch.interrupt.store(false, Ordering::SeqCst);

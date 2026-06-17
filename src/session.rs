@@ -55,9 +55,11 @@ pub enum ConsoleCommand {
     Stop {
         selector: String,
     },
+    StopFocused,
     Restart {
         selector: String,
     },
+    RestartFocused,
     Sync,
     Quit,
     QuitForce,
@@ -196,8 +198,9 @@ impl SessionManager {
         let cwd = {
             let manager = lock_sessions(shared)?;
             if manager.names.contains_key(&name) {
-                return Err(err(error_info::WATCH_EVENT_FAILED)
-                    .with_hint(format!("session already exists: {name}")));
+                return Err(
+                    err(error_info::SESSION_FAILED).with_hint(format!("已存在同名会话: {name}"))
+                );
             }
             manager.cwd.clone()
         };
@@ -251,7 +254,7 @@ impl SessionManager {
         let mut manager = lock_sessions(shared)?;
         manager.refresh();
         let Some(session) = manager.sessions.get(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         if session.status != SessionStatus::Running {
             return Ok(format!(
@@ -320,7 +323,7 @@ impl SessionManager {
         self.refresh();
         let id = self.resolve_or_focused(selector)?;
         let Some(session) = self.sessions.get(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         if session.logs.is_empty() {
             return Ok(format!("logs {}: <empty>", session.name));
@@ -332,7 +335,7 @@ impl SessionManager {
         self.refresh();
         let id = self.resolve_or_focused(selector)?;
         let Some(session) = self.sessions.get(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         if session.logs.is_empty() {
             return Ok(format!("logs {}: <empty>", session.name));
@@ -352,7 +355,7 @@ impl SessionManager {
         self.refresh();
         let id = self.resolve_or_focused(selector)?;
         let Some(session) = self.sessions.get_mut(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         session.logs.clear();
         Ok(format!("logs cleared: {}", session.name))
@@ -363,7 +366,7 @@ impl SessionManager {
         let id = self.resolve(selector)?;
         self.focused = Some(id);
         let Some(session) = self.sessions.get(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         Ok(format!("focused {} ({})", session.name, session.id))
     }
@@ -380,7 +383,7 @@ impl SessionManager {
             manager.refresh();
             let id = manager.resolve(selector)?;
             let Some(session) = manager.sessions.get(&id) else {
-                return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+                return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
             };
             (
                 session.name.clone(),
@@ -434,7 +437,7 @@ impl SessionManager {
 
     fn stop_id(&mut self, id: u32) -> Result<String> {
         let Some(session) = self.sessions.get_mut(&id) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         if session.status != SessionStatus::Running {
             return Ok(format!(
@@ -459,7 +462,7 @@ impl SessionManager {
 
     fn remove_session(&mut self, name: &str) -> Result<()> {
         let Some(id) = self.names.remove(name) else {
-            return Err(err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"));
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         self.sessions.remove(&id);
         if self.focused == Some(id) {
@@ -473,7 +476,7 @@ impl SessionManager {
             Some(selector) => self.resolve(selector),
             None => self
                 .focused
-                .ok_or_else(|| err(error_info::WATCH_EVENT_FAILED).with_hint("no focused session")),
+                .ok_or_else(|| err(error_info::SESSION_FAILED).with_hint("no focused session")),
         }
     }
 
@@ -486,7 +489,7 @@ impl SessionManager {
         self.names
             .get(selector)
             .copied()
-            .ok_or_else(|| err(error_info::WATCH_EVENT_FAILED).with_hint("session not found"))
+            .ok_or_else(|| err(error_info::SESSION_FAILED).with_hint("session not found"))
     }
 
     fn refresh(&mut self) {
@@ -602,6 +605,12 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if matches!(trimmed, "quit" | "exit") {
         return ConsoleCommand::Quit;
     }
+    if trimmed == "s" {
+        return ConsoleCommand::StopFocused;
+    }
+    if trimmed == "r" {
+        return ConsoleCommand::RestartFocused;
+    }
     if trimmed == "sync" {
         return ConsoleCommand::Sync;
     }
@@ -654,7 +663,7 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
 }
 
 pub fn help_text() -> &'static str {
-    "commands: help, sessions|ps, saved-sessions, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, restore <name|index>, delete session <name|index>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>, restart <name|id>, sync, quit, quit!"
+    "commands: help, sessions|ps, saved-sessions, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, restore <name|index>, delete session <name|index>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>|s, restart <name|id>|r, sync, quit, quit!"
 }
 
 fn parse_new_session(rest: &str) -> ConsoleCommand {
@@ -813,7 +822,7 @@ fn terminate_remote_session(control: &RemoteSessionControl) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(err(error_info::WATCH_EVENT_FAILED)
+        Err(err(error_info::SESSION_FAILED)
             .with_hint(String::from_utf8_lossy(&output.stderr).trim()))
     }
 }
@@ -872,7 +881,7 @@ where
 fn lock_sessions(shared: &SharedSessions) -> Result<std::sync::MutexGuard<'_, SessionManager>> {
     shared
         .lock()
-        .map_err(|_| err(error_info::WATCH_EVENT_FAILED).with_hint("session manager poisoned"))
+        .map_err(|_| err(error_info::SESSION_FAILED).with_hint("session manager poisoned"))
 }
 
 fn validate_session_name(name: &str) -> Result<()> {
@@ -883,7 +892,7 @@ fn validate_session_name(name: &str) -> Result<()> {
     if valid {
         Ok(())
     } else {
-        Err(err(error_info::WATCH_EVENT_FAILED)
+        Err(err(error_info::SESSION_FAILED)
             .with_hint("session name may only contain ascii letters, numbers, _, -, ."))
     }
 }
@@ -944,7 +953,10 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_console_command, remote_stop_command, ConsoleCommand, RemoteSession};
+    use super::{
+        parse_console_command, remote_stop_command, ConsoleCommand, RemoteSession, SessionManager,
+    };
+    use crate::error_info;
 
     #[test]
     fn parses_new_session_command() {
@@ -990,6 +1002,29 @@ mod tests {
                 selector: "web".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn parses_focused_session_shorthands() {
+        assert_eq!(parse_console_command("s"), ConsoleCommand::StopFocused);
+        assert_eq!(parse_console_command("r"), ConsoleCommand::RestartFocused);
+    }
+
+    #[test]
+    fn duplicate_session_name_uses_session_error() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        {
+            let mut manager = shared.lock().unwrap_or_else(|error| error.into_inner());
+            manager.names.insert("web".to_owned(), 1);
+        }
+
+        let error = match SessionManager::start(&shared, "web".to_owned(), "echo ok".to_owned()) {
+            Ok(message) => panic!("duplicate session should fail, got: {message}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.info.code, error_info::SESSION_FAILED.code);
+        assert_eq!(error.hint.as_deref(), Some("已存在同名会话: web"));
     }
 
     #[test]

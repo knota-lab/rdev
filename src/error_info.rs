@@ -120,6 +120,14 @@ pub const SYNC_DELETE_REJECTED: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Sync,
 };
 
+pub const SESSION_FAILED: ErrorInfo = ErrorInfo {
+    code: "session.failed",
+    message_zh: "会话操作失败",
+    message_en: "Session operation failed",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Watch,
+};
+
 pub const WATCH_EVENT_FAILED: ErrorInfo = ErrorInfo {
     code: "watch.event_failed",
     message_zh: "文件监听事件处理失败",
