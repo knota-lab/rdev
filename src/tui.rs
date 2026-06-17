@@ -17,6 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use unicode_width::UnicodeWidthStr;
 
 use notify::{RecursiveMode, Watcher};
 
@@ -473,7 +474,7 @@ fn draw(frame: &mut Frame<'_>, model: &TuiModel) {
             Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(events_height(area)),
-            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -656,6 +657,11 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    let input_area = input_text_area(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+        area,
+    );
     let line = Line::from(vec![
         Span::styled(
             INPUT_PROMPT,
@@ -665,21 +671,32 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
         ),
         Span::styled(model.input.as_str(), Style::default().fg(Color::White)),
     ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line), input_area);
 }
 
 fn set_input_cursor(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    if area.height == 0 || area.width == 0 {
+    let input_area = input_text_area(area);
+    if input_area.height == 0 || input_area.width == 0 {
         return;
     }
-    let prompt_width = INPUT_PROMPT.chars().count() as u16;
-    let input_width = model.input.chars().count() as u16;
-    let max_x = area.width.saturating_sub(1);
+    let prompt_width = UnicodeWidthStr::width(INPUT_PROMPT) as u16;
+    let input_width = UnicodeWidthStr::width(model.input.as_str()) as u16;
+    let max_x = input_area.width.saturating_sub(1);
     let cursor_x = prompt_width.saturating_add(input_width).min(max_x);
-    frame.set_cursor(area.x.saturating_add(cursor_x), area.y);
+    frame.set_cursor(input_area.x.saturating_add(cursor_x), input_area.y);
+}
+
+fn input_text_area(area: Rect) -> Rect {
+    if area.height >= 3 {
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(1),
+            width: area.width,
+            height: 1,
+        }
+    } else {
+        area
+    }
 }
 
 fn handle_event(model: &mut TuiModel, event: Event) -> bool {
