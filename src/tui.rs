@@ -511,14 +511,21 @@ fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
             model.log_scroll = 0;
             model.push_event("log follow enabled");
         }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_digit() =>
+        {
+            focus_by_digit(model, ch);
+        }
         KeyCode::Char(ch) => model.input.push(ch),
         KeyCode::Backspace => {
             model.input.pop();
         }
         KeyCode::Enter => return submit_input(model),
         KeyCode::Esc => model.input.clear(),
-        KeyCode::Up => model.focus_prev(),
-        KeyCode::Down | KeyCode::Tab => model.focus_next(),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_prev(),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => model.focus_next(),
+        KeyCode::Up | KeyCode::Down => {}
+        KeyCode::Tab => model.focus_next(),
         KeyCode::PageUp => {
             model.follow_logs = false;
             model.log_scroll = model.log_scroll.saturating_sub(5);
@@ -560,6 +567,25 @@ fn mark_focused(model: &mut TuiModel, status: ProcessStatus) {
     if let Some(name) = focused_name {
         model.push_event(format!("{name} marked {}", status.label()));
     }
+}
+
+fn focus_by_digit(model: &mut TuiModel, digit: char) {
+    let Some(index) = digit.to_digit(10) else {
+        return;
+    };
+    if index == 0 {
+        return;
+    }
+    let index = index as usize - 1;
+    if index >= model.processes.len() {
+        return;
+    }
+    model.focused = index;
+    model.follow_logs = true;
+    model.log_scroll = 0;
+    model
+        .events
+        .push(format!("focused {}", model.processes[model.focused].name));
 }
 
 fn events_height(area: Rect) -> u16 {
