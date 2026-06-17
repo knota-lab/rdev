@@ -15,7 +15,7 @@ use crate::ssh::shell_quote;
 const MAX_LOG_LINES: usize = 500;
 const CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_SESSION_SHELL: &str = "bash";
-const REMOTE_SESSION_ENV: &str = "for f in /etc/profile ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc; do [ -r \"$f\" ] && . \"$f\" >/dev/null 2>&1 || true; done; export PNPM_HOME=\"${PNPM_HOME:-$HOME/.local/share/pnpm}\"; case \":$PATH:\" in *\":$PNPM_HOME:\"*) ;; *) export PATH=\"$PNPM_HOME:$PATH\" ;; esac";
+const REMOTE_SESSION_ENV: &str = "for f in /etc/profile ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc; do [ -r \"$f\" ] && . \"$f\" >/dev/null 2>&1 || true; done; export NVM_DIR=\"${NVM_DIR:-$HOME/.nvm}\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\" >/dev/null 2>&1 || true; export VOLTA_HOME=\"${VOLTA_HOME:-$HOME/.volta}\"; [ -d \"$VOLTA_HOME/bin\" ] && case \":$PATH:\" in *\":$VOLTA_HOME/bin:\"*) ;; *) export PATH=\"$VOLTA_HOME/bin:$PATH\" ;; esac; if command -v fnm >/dev/null 2>&1; then eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 || true; fi; export PNPM_HOME=\"${PNPM_HOME:-$HOME/.local/share/pnpm}\"; case \":$PATH:\" in *\":$PNPM_HOME:\"*) ;; *) export PATH=\"$PNPM_HOME:$PATH\" ;; esac";
 const REMOTE_SESSION_RUNNER: &str = "echo \"$$\" > \"$RDEV_SESSION_PID_FILE\"; trap 'rm -f \"$RDEV_SESSION_PID_FILE\"' EXIT; eval \"$RDEV_SESSION_COMMAND\"";
 
 pub type SharedSessions = Arc<Mutex<SessionManager>>;
