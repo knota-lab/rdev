@@ -231,6 +231,10 @@ impl TuiModel {
             .processes
             .get(self.focused)
             .and_then(|process| process.session_id);
+        let previous_was_sync = self
+            .processes
+            .get(self.focused)
+            .is_some_and(|process| process.session_id.is_none());
         let snapshot = if let Ok(mut manager) = self.sessions.lock() {
             Some(manager.snapshot())
         } else {
@@ -256,14 +260,18 @@ impl TuiModel {
             status: ProcessStatus::from_session(session.status.as_str(), session.exit_code),
             command: session.command.clone(),
         }));
-        let focused_session = previous_session.or(snapshot.focused);
-        let focused = focused_session
-            .and_then(|id| {
-                processes
-                    .iter()
-                    .position(|process| process.session_id == Some(id))
-            })
-            .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)));
+        let focused = if previous_was_sync {
+            0
+        } else {
+            let focused_session = previous_session.or(snapshot.focused);
+            focused_session
+                .and_then(|id| {
+                    processes
+                        .iter()
+                        .position(|process| process.session_id == Some(id))
+                })
+                .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)))
+        };
         let mut logs = if let Some(session_id) = processes.get(focused).and_then(|p| p.session_id) {
             snapshot
                 .sessions
@@ -400,11 +408,14 @@ impl TuiSyncRuntime {
                 dirty = true;
             }
         }
-        if !self.pending.has_changes() || self.last_event_at.elapsed() < self.debounce {
+        if !self.pending.has_changes() {
             if model.sync_status == ProcessStatus::Running {
                 model.sync_status = ProcessStatus::Idle;
                 dirty = true;
             }
+            return dirty;
+        }
+        if self.last_event_at.elapsed() < self.debounce {
             return dirty;
         }
         let changes = self.pending.take();
