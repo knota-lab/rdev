@@ -51,8 +51,8 @@ use self::logs::{parse_log_line, selected_line, wrapped_log_rows, UiLogLine};
 use self::state::{SavedSession, SavedSessionKind, TuiStateStore};
 
 const INPUT_PROMPT: &str = "rdev> ";
-const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
-const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
+const PROCESS_PANEL_MIN_WIDTH: u16 = 30;
+const PROCESS_PANEL_MAX_WIDTH: u16 = 48;
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const COMMAND_HISTORY_LIMIT: usize = 100;
 
@@ -161,8 +161,8 @@ enum UiEventLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventPanelMode {
-    Inline,
-    Boxed,
+    Compact,
+    Rail,
 }
 
 impl UiEventLevel {
@@ -867,7 +867,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
             .split(area);
         draw_logs(frame, chunks[0], model);
         draw_compact_processes(frame, chunks[1], model);
-        draw_events(frame, chunks[2], (model, EventPanelMode::Inline));
+        draw_events(frame, chunks[2], (model, EventPanelMode::Compact));
         return;
     }
 
@@ -932,71 +932,134 @@ fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    if area.height < 16 {
+    frame.render_widget(
+        Block::default().title(" Control ").borders(Borders::LEFT),
+        area,
+    );
+    let content = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y,
+        width: area.width.saturating_sub(3),
+        height: area.height,
+    };
+    if content.height < 16 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(8)])
-            .split(area);
-        draw_process_list(frame, chunks[0], model);
-        draw_process_details(frame, chunks[1], model);
+            .constraints([Constraint::Length(5), Constraint::Min(5)])
+            .split(content);
+        draw_side_context(frame, chunks[0], model);
+        draw_process_list(frame, chunks[1], model);
         return;
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(38),
-            Constraint::Length(8),
-            Constraint::Min(5),
+            Constraint::Length(6),
+            Constraint::Percentage(34),
+            Constraint::Min(7),
+            Constraint::Length(7),
         ])
-        .split(area);
-    draw_process_list(frame, chunks[0], model);
-    draw_process_details(frame, chunks[1], model);
-    draw_events(frame, chunks[2], (model, EventPanelMode::Boxed));
+        .split(content);
+    draw_side_context(frame, chunks[0], model);
+    draw_process_list(frame, chunks[1], model);
+    draw_events(frame, chunks[2], (model, EventPanelMode::Rail));
+    draw_process_details(frame, chunks[3], model);
+}
+
+fn draw_side_context(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    let focused = model
+        .focused_process()
+        .map_or("<none>", |process| process.name.as_str());
+    let lines = vec![
+        Line::from(Span::styled(
+            model.project.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Context",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::styled("remote ", Style::default().fg(Color::DarkGray)),
+            Span::raw(model.remote.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("sync   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(model.sync_status.label(), model.sync_status.style()),
+        ]),
+        Line::from(vec![
+            Span::styled("focus  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(focused.to_owned()),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_process_list(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    let items = model
-        .processes
-        .iter()
-        .enumerate()
-        .map(|(index, process)| {
-            let marker = if index == model.focused { "> " } else { "  " };
-            let style = if index == model.focused {
-                process
-                    .status
-                    .style()
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
-                process.status.style()
-            };
-            ListItem::new(Line::from(vec![
-                Span::raw(marker),
-                Span::styled(format!("{:<10}", process.name), style),
-                Span::styled(process.status.label(), process.status.style()),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let list = List::new(items).block(Block::default().title(" Processes ").borders(Borders::ALL));
+    let mut items = vec![ListItem::new(Line::from(Span::styled(
+        "Processes",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )))];
+    items.extend(model.processes.iter().enumerate().map(|(index, process)| {
+        let marker = if index == model.focused { ">" } else { " " };
+        let style = if index == model.focused {
+            process.status.style().add_modifier(Modifier::BOLD)
+        } else {
+            process.status.style()
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<12}", process.name), style),
+            Span::styled(process.status.label(), process.status.style()),
+        ]))
+    }));
+    let list = List::new(items);
     frame.render_widget(list, area);
 }
 
 fn draw_process_details(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     let lines = model.focused_process().map_or_else(
-        || vec![Line::from("no process")],
+        || {
+            vec![
+                Line::from(Span::styled(
+                    "Details",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("no process"),
+            ]
+        },
         |process| {
             vec![
-                Line::from(format!("id: {}", process.id)),
-                Line::from(format!("name: {}", process.name)),
-                Line::from(format!("kind: {}", process.kind)),
-                Line::from(format!("status: {}", process.status.label())),
-                Line::from("cmd:"),
+                Line::from(Span::styled(
+                    "Details",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(vec![
+                    Span::styled("id     ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(process.id.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("kind   ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(process.kind.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled("status ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(process.status.label(), process.status.style()),
+                ]),
+                Line::from(Span::styled("cmd", Style::default().fg(Color::DarkGray))),
                 Line::from(process.command.as_str()),
             ]
         },
     );
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(" Details ").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -1028,22 +1091,7 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, options: (&TuiModel, EventPane
     if area.height == 0 {
         return;
     }
-    if mode == EventPanelMode::Boxed {
-        frame.render_widget(
-            Block::default().title(" Events ").borders(Borders::ALL),
-            area,
-        );
-    }
-    let content = if mode == EventPanelMode::Boxed {
-        Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        }
-    } else {
-        area
-    };
+    let content = area;
     if content.height == 0 || content.width == 0 {
         return;
     }
@@ -1051,7 +1099,19 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, options: (&TuiModel, EventPane
         frame.render_widget(Paragraph::new(Line::from("status: idle")), content);
         return;
     };
-    let mut lines = vec![event_line("latest", latest)];
+    let mut lines = if mode == EventPanelMode::Rail {
+        vec![
+            Line::from(Span::styled(
+                "Events",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            event_line("latest", latest),
+        ]
+    } else {
+        vec![event_line("latest", latest)]
+    };
     if content.height > 2 {
         let history = model
             .events
