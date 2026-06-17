@@ -12,6 +12,7 @@ use ssh2::{Session, Sftp};
 use crate::config::AppConfig;
 use crate::error::{err, err_with_source, ErrorInfo, Result};
 use crate::error_info;
+use crate::sync_output::{console_output, SyncOutput};
 
 pub(crate) const SSH_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -21,6 +22,7 @@ pub(crate) struct SshClient {
     session: Session,
     sftp: Option<Sftp>,
     ensured_dirs: BTreeSet<PathBuf>,
+    output: Arc<dyn SyncOutput>,
 }
 
 pub(crate) struct UploadRequest<'a> {
@@ -58,7 +60,12 @@ impl SshClient {
             session,
             sftp: None,
             ensured_dirs: BTreeSet::new(),
+            output: console_output(),
         })
+    }
+
+    pub(crate) fn set_output(&mut self, output: Arc<dyn SyncOutput>) {
+        self.output = output;
     }
 
     pub(crate) fn session_mut(&mut self) -> &mut Session {
@@ -80,10 +87,10 @@ impl SshClient {
         let mut local = match FsFile::open(request.local_path) {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                println!(
+                self.output.line(format!(
                     "[sync] upload skipped vanished local={}",
                     request.local_path.display()
-                );
+                ));
                 return Ok(());
             }
             Err(source) => {
@@ -105,14 +112,14 @@ impl SshClient {
             cancelled: request.cancelled,
         })?;
         let copy_elapsed = copy_started.elapsed().as_millis();
-        println!(
+        self.output.line(format!(
             "[sync] upload detail remote={} ensure_ms={} open_ms={} create_ms={} copy_ms={}",
             request.remote_path.display(),
             ensure_elapsed,
             open_elapsed,
             create_elapsed,
             copy_elapsed
-        );
+        ));
         Ok(())
     }
 

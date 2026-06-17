@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::AppConfig;
@@ -9,10 +10,12 @@ use crate::path::RemotePath;
 use crate::ssh::{sh_c, RemoteCheck, SshClient, UploadRequest};
 use crate::ssh_tar::{upload_tar, TarUpload};
 use crate::sync::{SyncBackend, SyncDeltaRequest, SyncReport, SyncRequest};
+use crate::sync_output::{console_output, SyncOutput};
 
 pub struct SftpDeltaBackend<'a> {
     config: &'a AppConfig,
     client: RefCell<Option<SshClient>>,
+    output: Arc<dyn SyncOutput>,
 }
 
 impl<'a> SftpDeltaBackend<'a> {
@@ -20,7 +23,13 @@ impl<'a> SftpDeltaBackend<'a> {
         Self {
             config,
             client: RefCell::new(None),
+            output: console_output(),
         }
+    }
+
+    pub(crate) fn with_output(mut self, output: Arc<dyn SyncOutput>) -> Self {
+        self.output = output;
+        self
     }
 
     pub fn check_exec(&self) -> Result<()> {
@@ -34,11 +43,11 @@ impl<'a> SftpDeltaBackend<'a> {
 
     fn sync_delta_impl(&self, request: SyncDeltaRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
-        println!(
+        self.output.line(format!(
             "[sync] delta start transport=internal-sftp uploads={} deletes={}",
             request.uploads.len(),
             request.deletes.len()
-        );
+        ));
         let started = Instant::now();
         self.with_client(|client| {
             for path in &request.uploads {
@@ -48,7 +57,10 @@ impl<'a> SftpDeltaBackend<'a> {
                 let item_started = Instant::now();
                 let local_path = request.project_root.join(path);
                 if !local_path.exists() {
-                    println!("[sync] upload skipped vanished path={}", path.display());
+                    self.output.line(format!(
+                        "[sync] upload skipped vanished path={}",
+                        path.display()
+                    ));
                     continue;
                 }
                 let remote_path = remote_path(&remote_root, path);
@@ -57,11 +69,11 @@ impl<'a> SftpDeltaBackend<'a> {
                     remote_path: Path::new(&remote_path),
                     cancelled: request.cancelled.as_ref(),
                 })?;
-                println!(
+                self.output.line(format!(
                     "[sync] upload ok path={} elapsed_ms={}",
                     path.display(),
                     item_started.elapsed().as_millis()
-                );
+                ));
             }
             for path in &request.deletes {
                 if request.is_cancelled() {
@@ -70,32 +82,34 @@ impl<'a> SftpDeltaBackend<'a> {
                 let item_started = Instant::now();
                 let remote_path = remote_path(&remote_root, path);
                 client.remove(Path::new(&remote_path))?;
-                println!(
+                self.output.line(format!(
                     "[sync] delete ok path={} elapsed_ms={}",
                     path.display(),
                     item_started.elapsed().as_millis()
-                );
+                ));
             }
             Ok(())
         })?;
-        println!(
+        self.output.line(format!(
             "[sync] delta done elapsed_ms={}",
             started.elapsed().as_millis()
-        );
+        ));
         Ok(SyncReport::completed_sftp(request.uploads, request.deletes))
     }
 
     fn sync_full_impl(&self, request: SyncRequest) -> Result<SyncReport> {
         let remote_root = RemotePath::parse(self.config.remote.path.as_str())?;
         if request.dry_run {
-            println!("[sync] full dry-run transport=ssh-tar");
+            self.output
+                .line("[sync] full dry-run transport=ssh-tar".to_owned());
             return Ok(SyncReport::completed_ssh_tar(
                 self.config.sync.watch_dirs.clone(),
                 true,
             ));
         }
         let started = Instant::now();
-        println!("[sync] full start transport=ssh-tar");
+        self.output
+            .line("[sync] full start transport=ssh-tar".to_owned());
         self.with_client(|client| {
             upload_tar(
                 client,
@@ -103,13 +117,14 @@ impl<'a> SftpDeltaBackend<'a> {
                     config: self.config,
                     request: &request,
                     remote_root: &remote_root,
+                    output: Arc::clone(&self.output),
                 },
             )
         })?;
-        println!(
+        self.output.line(format!(
             "[sync] full done transport=ssh-tar elapsed_ms={}",
             started.elapsed().as_millis()
-        );
+        ));
         Ok(SyncReport::completed_ssh_tar(
             self.config.sync.watch_dirs.clone(),
             request.dry_run,
@@ -119,16 +134,18 @@ impl<'a> SftpDeltaBackend<'a> {
     fn warm_up_impl(&self) -> Result<()> {
         let started = Instant::now();
         self.with_client(|_| Ok(()))?;
-        println!(
+        self.output.line(format!(
             "[sync] internal-sftp connected elapsed_ms={}",
             started.elapsed().as_millis()
-        );
+        ));
         Ok(())
     }
 
     fn with_client<T>(&self, action: impl FnOnce(&mut SshClient) -> Result<T>) -> Result<T> {
         if self.client.borrow().is_none() {
-            self.client.replace(Some(SshClient::connect(self.config)?));
+            let mut client = SshClient::connect(self.config)?;
+            client.set_output(Arc::clone(&self.output));
+            self.client.replace(Some(client));
         }
         let mut client = self.client.borrow_mut();
         let Some(client) = client.as_mut() else {

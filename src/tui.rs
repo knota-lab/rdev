@@ -30,6 +30,7 @@ use crate::session::{
 };
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncDeltaRequest};
+use crate::sync_output::silent_output;
 use crate::up::{
     build_watcher, collect_event_changes, reconcile_existing_paths, resolve_local_root,
     sync_backend, EventFilter, PendingChanges, SyncedFiles,
@@ -130,7 +131,7 @@ impl Drop for TerminalGuard {
 pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
     let runner = SystemProcessRunner::default();
     let rsync_backend = RsyncSyncBackend::new(config, &runner);
-    let ssh_backend = SftpDeltaBackend::new(config);
+    let ssh_backend = SftpDeltaBackend::new(config).with_output(silent_output());
     let backend = sync_backend(config, &rsync_backend, &ssh_backend);
     let mut sync = TuiSyncRuntime::new(config, &request)?;
     let mut guard = init_terminal()?;

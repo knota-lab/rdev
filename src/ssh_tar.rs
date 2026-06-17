@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use walkdir::WalkDir;
@@ -10,11 +11,13 @@ use crate::error_info;
 use crate::path::{is_sync_excluded, RemotePath};
 use crate::ssh::{read_channel_stderr, sh_c, shell_quote, RemoteCheck, SshClient};
 use crate::sync::SyncRequest;
+use crate::sync_output::SyncOutput;
 
 pub(crate) struct TarUpload<'a> {
     pub(crate) config: &'a AppConfig,
     pub(crate) request: &'a SyncRequest,
     pub(crate) remote_root: &'a RemotePath,
+    pub(crate) output: Arc<dyn SyncOutput>,
 }
 
 pub(crate) fn upload_tar(client: &mut SshClient, upload: TarUpload<'_>) -> Result<()> {
@@ -80,17 +83,17 @@ pub(crate) fn upload_tar(client: &mut SshClient, upload: TarUpload<'_>) -> Resul
     }
 }
 
-#[derive(Debug)]
 struct TarProgress {
     started: Instant,
     last_printed: Instant,
     files: u64,
     dirs: u64,
     bytes: u64,
+    output: Arc<dyn SyncOutput>,
 }
 
 impl TarProgress {
-    fn new() -> Self {
+    fn new(output: Arc<dyn SyncOutput>) -> Self {
         let now = Instant::now();
         Self {
             started: now,
@@ -98,6 +101,7 @@ impl TarProgress {
             files: 0,
             dirs: 0,
             bytes: 0,
+            output,
         }
     }
 
@@ -120,13 +124,13 @@ impl TarProgress {
     }
 
     fn print(&self, label: &str) {
-        println!(
+        self.output.line(format!(
             "[sync] tar {label} files={} dirs={} bytes={} elapsed_ms={}",
             self.files,
             self.dirs,
             self.bytes,
             self.started.elapsed().as_millis()
-        );
+        ));
     }
 }
 
@@ -134,7 +138,7 @@ fn append_project_tar<W: Write>(
     archive: &mut tar::Builder<W>,
     upload: TarUpload<'_>,
 ) -> Result<()> {
-    let mut progress = TarProgress::new();
+    let mut progress = TarProgress::new(Arc::clone(&upload.output));
     for watch_dir in &upload.config.sync.watch_dirs {
         let source = local_source(&upload.request.project_root, watch_dir);
         for entry in WalkDir::new(&source)
