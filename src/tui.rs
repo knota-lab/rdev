@@ -18,8 +18,12 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::config::AppConfig;
-use crate::error::{err_with_source, Result};
+use crate::error::{err, err_with_source, Result};
 use crate::error_info;
+use crate::session::{
+    help_text, parse_console_command, ConsoleCommand, RemoteSessionSpec, SessionManager,
+    SharedSessions,
+};
 
 const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
@@ -32,6 +36,8 @@ pub struct TuiRequest {
 
 #[derive(Debug)]
 struct TuiModel {
+    config: AppConfig,
+    sessions: SharedSessions,
     project: String,
     remote: String,
     sync_status: ProcessStatus,
@@ -48,7 +54,6 @@ struct TuiModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessStatus {
     Idle,
-    Syncing,
     Running,
     Exited(i32),
     Stopped,
@@ -59,6 +64,7 @@ enum ProcessStatus {
 #[derive(Debug)]
 struct UiProcess {
     id: u32,
+    session_id: Option<u32>,
     name: String,
     kind: String,
     status: ProcessStatus,
@@ -96,8 +102,9 @@ impl Drop for TerminalGuard {
 
 pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
     let mut guard = init_terminal()?;
-    let mut model = TuiModel::prototype(config, request);
+    let mut model = TuiModel::new(config, request);
     loop {
+        model.refresh_sessions();
         guard
             .terminal
             .draw(|frame| draw(frame, &model))
@@ -116,7 +123,7 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
 }
 
 impl TuiModel {
-    fn prototype(config: &AppConfig, request: TuiRequest) -> Self {
+    fn new(config: &AppConfig, request: TuiRequest) -> Self {
         let project = request
             .project_root
             .file_name()
@@ -125,57 +132,88 @@ impl TuiModel {
             .to_owned();
         let remote = format!("{}:{}", config.remote.host, config.remote.path);
         Self {
+            config: config.clone(),
+            sessions: SessionManager::shared(request.project_root),
             project,
             remote,
             sync_status: ProcessStatus::Idle,
-            processes: vec![
-                UiProcess {
-                    id: 0,
-                    name: "sync".to_owned(),
-                    kind: "watcher".to_owned(),
-                    status: ProcessStatus::Syncing,
-                    command: "file watcher".to_owned(),
-                },
-                UiProcess {
-                    id: 1,
-                    name: "web".to_owned(),
-                    kind: "remote".to_owned(),
-                    status: ProcessStatus::Running,
-                    command: "cd knota-fold && cargo loco start --all".to_owned(),
-                },
-                UiProcess {
-                    id: 2,
-                    name: "api".to_owned(),
-                    kind: "local".to_owned(),
-                    status: ProcessStatus::Failed,
-                    command: "cargo run".to_owned(),
-                },
-                UiProcess {
-                    id: 3,
-                    name: "build".to_owned(),
-                    kind: "local".to_owned(),
-                    status: ProcessStatus::Exited(0),
-                    command: "npm run build".to_owned(),
-                },
-            ],
-            focused: 1,
+            processes: Vec::new(),
+            focused: 0,
             logs: vec![
-                UiLogLine::rdev("TUI prototype started. Type quit to leave."),
-                UiLogLine::stdout("listening on http://0.0.0.0:5150"),
-                UiLogLine::stdout("worker is online"),
-                UiLogLine::stdout("scheduler is running"),
-                UiLogLine::stderr("example stderr line from focused process"),
+                UiLogLine::rdev("TUI session mode started. Type help for commands."),
+                UiLogLine::rdev("Sync watcher is not wired into TUI yet."),
             ],
             events: vec![
                 "sync idle".to_owned(),
-                "remote web running".to_owned(),
-                "press ? for help".to_owned(),
+                "real sessions enabled".to_owned(),
+                "type new session <name> -- <command>".to_owned(),
             ],
             input: String::new(),
             follow_logs: true,
             log_scroll: 0,
             started_at: Instant::now(),
         }
+    }
+
+    fn refresh_sessions(&mut self) {
+        let previous_session = self
+            .processes
+            .get(self.focused)
+            .and_then(|process| process.session_id);
+        let snapshot = if let Ok(mut manager) = self.sessions.lock() {
+            Some(manager.snapshot())
+        } else {
+            None
+        };
+        let Some(snapshot) = snapshot else {
+            self.push_event("session manager unavailable");
+            return;
+        };
+        let mut processes = vec![UiProcess {
+            id: 0,
+            session_id: None,
+            name: "sync".to_owned(),
+            kind: "watcher".to_owned(),
+            status: self.sync_status,
+            command: "file watcher".to_owned(),
+        }];
+        processes.extend(snapshot.sessions.iter().map(|session| UiProcess {
+            id: session.id,
+            session_id: Some(session.id),
+            name: session.name.clone(),
+            kind: session.kind.clone(),
+            status: ProcessStatus::from_session(session.status.as_str(), session.exit_code),
+            command: session.command.clone(),
+        }));
+        let focused_session = previous_session.or(snapshot.focused);
+        self.focused = focused_session
+            .and_then(|id| {
+                processes
+                    .iter()
+                    .position(|process| process.session_id == Some(id))
+            })
+            .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)));
+        self.logs = if let Some(session_id) = processes.get(self.focused).and_then(|p| p.session_id)
+        {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| {
+                    session
+                        .logs
+                        .iter()
+                        .map(|line| parse_log_line(line))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![UiLogLine::rdev("logs: <empty>")])
+        } else {
+            vec![UiLogLine::rdev("sync watcher is not wired into TUI yet")]
+        };
+        if self.logs.is_empty() {
+            self.logs.push(UiLogLine::rdev("logs: <empty>"));
+        }
+        self.processes = processes;
     }
 
     fn focused_process(&self) -> Option<&UiProcess> {
@@ -191,6 +229,7 @@ impl TuiModel {
         self.log_scroll = 0;
         self.events
             .push(format!("focused {}", self.processes[self.focused].name));
+        self.focus_manager_to_current();
     }
 
     fn focus_prev(&mut self) {
@@ -206,6 +245,7 @@ impl TuiModel {
         self.log_scroll = 0;
         self.events
             .push(format!("focused {}", self.processes[self.focused].name));
+        self.focus_manager_to_current();
     }
 
     fn push_event(&mut self, event: impl Into<String>) {
@@ -213,6 +253,19 @@ impl TuiModel {
         if self.events.len() > 8 {
             let overflow = self.events.len() - 8;
             self.events.drain(0..overflow);
+        }
+    }
+
+    fn focus_manager_to_current(&mut self) {
+        let Some(session_id) = self
+            .processes
+            .get(self.focused)
+            .and_then(|process| process.session_id)
+        else {
+            return;
+        };
+        if let Ok(mut manager) = self.sessions.lock() {
+            let _ignored = manager.focus(&session_id.to_string());
         }
     }
 }
@@ -241,10 +294,18 @@ impl UiLogLine {
 }
 
 impl ProcessStatus {
+    fn from_session(status: &str, exit_code: Option<i32>) -> Self {
+        match status {
+            "running" => Self::Running,
+            "stopped" => Self::Stopped,
+            "exited" => exit_code.map_or(Self::Exited(0), Self::Exited),
+            _ => Self::Failed,
+        }
+    }
+
     fn label(self) -> String {
         match self {
             Self::Idle => "idle".to_owned(),
-            Self::Syncing => "syncing".to_owned(),
             Self::Running => "running".to_owned(),
             Self::Exited(code) => format!("exit {code}"),
             Self::Stopped => "stopped".to_owned(),
@@ -256,7 +317,7 @@ impl ProcessStatus {
     fn style(self) -> Style {
         match self {
             Self::Idle | Self::Stopped => Style::default().fg(Color::DarkGray),
-            Self::Syncing | Self::Running => Style::default().fg(Color::Green),
+            Self::Running => Style::default().fg(Color::Green),
             Self::Exited(0) => Style::default().fg(Color::Blue),
             Self::Exited(_) | Self::Failed => Style::default().fg(Color::Red),
             Self::Cancelled => Style::default().fg(Color::Yellow),
@@ -504,8 +565,8 @@ fn handle_key(model: &mut TuiModel, key: KeyEvent) -> bool {
         KeyCode::Char('?') => {
             model.push_event("help: arrows focus, s stop, r restart, type quit to exit");
         }
-        KeyCode::Char('s') if model.input.is_empty() => mark_focused(model, ProcessStatus::Stopped),
-        KeyCode::Char('r') if model.input.is_empty() => mark_focused(model, ProcessStatus::Running),
+        KeyCode::Char('s') if model.input.is_empty() => stop_focused(model),
+        KeyCode::Char('r') if model.input.is_empty() => restart_focused(model),
         KeyCode::Char('f') if model.input.is_empty() => {
             model.follow_logs = true;
             model.log_scroll = 0;
@@ -550,23 +611,7 @@ fn submit_input(model: &mut TuiModel) -> bool {
     if command.is_empty() {
         return false;
     }
-    if command == "quit" || command == "quit!" {
-        return true;
-    }
-    model.push_event(format!("prototype command ignored: {command}"));
-    false
-}
-
-fn mark_focused(model: &mut TuiModel, status: ProcessStatus) {
-    let focused_name = if let Some(process) = model.processes.get_mut(model.focused) {
-        process.status = status;
-        Some(process.name.clone())
-    } else {
-        None
-    };
-    if let Some(name) = focused_name {
-        model.push_event(format!("{name} marked {}", status.label()));
-    }
+    execute_console_command(model, parse_console_command(&command))
 }
 
 fn focus_by_digit(model: &mut TuiModel, digit: char) {
@@ -586,6 +631,122 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
     model
         .events
         .push(format!("focused {}", model.processes[model.focused].name));
+    model.focus_manager_to_current();
+}
+
+fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> bool {
+    let result = match command {
+        ConsoleCommand::Help => Ok(help_text().to_owned()),
+        ConsoleCommand::Sessions => lock_sessions(model).map(|mut manager| manager.list()),
+        ConsoleCommand::NewSession { name, command } => {
+            SessionManager::start(&model.sessions, name, command)
+        }
+        ConsoleCommand::NewRemoteSession { name, command } => {
+            RemoteSessionSpec::from_config(&model.config, name, command)
+                .and_then(|spec| SessionManager::start_remote(&model.sessions, spec))
+        }
+        ConsoleCommand::Logs { selector } => {
+            lock_sessions(model).and_then(|mut manager| manager.logs(selector.as_deref()))
+        }
+        ConsoleCommand::Tail { selector, lines } => lock_sessions(model)
+            .and_then(|mut manager| manager.tail_logs(selector.as_deref(), lines)),
+        ConsoleCommand::ClearLogs { selector } => {
+            lock_sessions(model).and_then(|mut manager| manager.clear_logs(selector.as_deref()))
+        }
+        ConsoleCommand::Focus { selector } => {
+            lock_sessions(model).and_then(|mut manager| manager.focus(&selector))
+        }
+        ConsoleCommand::Stop { selector } => {
+            lock_sessions(model).and_then(|mut manager| manager.stop(&selector))
+        }
+        ConsoleCommand::Restart { selector } => SessionManager::restart(&model.sessions, &selector),
+        ConsoleCommand::Sync => {
+            model.sync_status = ProcessStatus::Cancelled;
+            Ok("sync is not wired into TUI yet".to_owned())
+        }
+        ConsoleCommand::Quit => {
+            let running = lock_sessions(model)
+                .map(|mut manager| manager.has_running())
+                .unwrap_or(false);
+            if running {
+                Ok("running sessions exist; use quit! to stop sessions and exit".to_owned())
+            } else {
+                return true;
+            }
+        }
+        ConsoleCommand::QuitForce => {
+            if let Ok(mut manager) = lock_sessions(model) {
+                manager.stop_all();
+            }
+            return true;
+        }
+        ConsoleCommand::Empty => Ok(String::new()),
+        ConsoleCommand::Unknown(message) => Ok(format!("unknown command: {message}")),
+    };
+    match result {
+        Ok(message) => {
+            for line in message.lines().filter(|line| !line.is_empty()) {
+                model.push_event(line.to_owned());
+            }
+        }
+        Err(error) => model.push_event(error.to_string()),
+    }
+    model.refresh_sessions();
+    false
+}
+
+fn stop_focused(model: &mut TuiModel) {
+    let Some(selector) = focused_session_selector(model) else {
+        model.push_event("sync watcher cannot be stopped in TUI yet");
+        return;
+    };
+    let result = lock_sessions(model).and_then(|mut manager| manager.stop(&selector));
+    push_result_event(model, result);
+    model.refresh_sessions();
+}
+
+fn restart_focused(model: &mut TuiModel) {
+    let Some(selector) = focused_session_selector(model) else {
+        model.push_event("sync watcher cannot be restarted in TUI yet");
+        return;
+    };
+    let result = SessionManager::restart(&model.sessions, &selector);
+    push_result_event(model, result);
+    model.refresh_sessions();
+}
+
+fn focused_session_selector(model: &TuiModel) -> Option<String> {
+    model
+        .processes
+        .get(model.focused)
+        .and_then(|process| process.session_id)
+        .map(|id| id.to_string())
+}
+
+fn lock_sessions(
+    model: &TuiModel,
+) -> Result<std::sync::MutexGuard<'_, crate::session::SessionManager>> {
+    model
+        .sessions
+        .lock()
+        .map_err(|_| err(error_info::WATCH_EVENT_FAILED).with_hint("session manager poisoned"))
+}
+
+fn push_result_event(model: &mut TuiModel, result: Result<String>) {
+    match result {
+        Ok(message) => model.push_event(message),
+        Err(error) => model.push_event(error.to_string()),
+    }
+}
+
+fn parse_log_line(line: &str) -> UiLogLine {
+    if let Some(text) = line.strip_prefix("[stdout] ") {
+        UiLogLine::stdout(text)
+    } else if let Some(text) = line.strip_prefix("[stderr] ") {
+        UiLogLine::stderr(text)
+    } else {
+        UiLogLine::rdev(line)
+    }
 }
 
 fn events_height(area: Rect) -> u16 {

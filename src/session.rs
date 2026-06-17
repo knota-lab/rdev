@@ -65,6 +65,23 @@ pub struct SessionManager {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub focused: Option<u32>,
+    pub sessions: Vec<SessionProcessSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProcessSnapshot {
+    pub id: u32,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSessionSpec {
     name: String,
     command: String,
@@ -265,6 +282,26 @@ impl SessionManager {
             ));
         }
         lines.join("\n")
+    }
+
+    pub fn snapshot(&mut self) -> SessionSnapshot {
+        self.refresh();
+        SessionSnapshot {
+            focused: self.focused,
+            sessions: self
+                .sessions
+                .values()
+                .map(|session| SessionProcessSnapshot {
+                    id: session.id,
+                    name: session.name.clone(),
+                    kind: session.kind.label().to_owned(),
+                    status: session.status.label().to_owned(),
+                    command: session.command.clone(),
+                    exit_code: session.exit_code,
+                    logs: session.logs.iter().cloned().collect(),
+                })
+                .collect(),
+        }
     }
 
     pub fn logs(&mut self, selector: Option<&str>) -> Result<String> {
