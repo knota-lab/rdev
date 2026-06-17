@@ -481,6 +481,7 @@ fn draw(frame: &mut Frame<'_>, model: &TuiModel) {
     draw_body(frame, vertical[1], model);
     draw_events(frame, vertical[2], model);
     draw_input(frame, vertical[3], model);
+    set_input_cursor(frame, vertical[3], model);
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -655,8 +656,30 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
-    let input = format!("{INPUT_PROMPT}{}", model.input);
-    frame.render_widget(Paragraph::new(input), area);
+    let line = Line::from(vec![
+        Span::styled(
+            INPUT_PROMPT,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(model.input.as_str(), Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
+}
+
+fn set_input_cursor(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let prompt_width = INPUT_PROMPT.chars().count() as u16;
+    let input_width = model.input.chars().count() as u16;
+    let max_x = area.width.saturating_sub(1);
+    let cursor_x = prompt_width.saturating_add(input_width).min(max_x);
+    frame.set_cursor(area.x.saturating_add(cursor_x), area.y);
 }
 
 fn handle_event(model: &mut TuiModel, event: Event) -> bool {
