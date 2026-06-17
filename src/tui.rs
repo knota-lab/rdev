@@ -40,6 +40,14 @@ use crate::up::{
     sync_backend, EventFilter, PendingChanges, SyncedFiles,
 };
 
+mod input;
+mod logs;
+
+use self::input::{
+    next_char_boundary, next_word_boundary, previous_char_boundary, previous_word_boundary,
+};
+use self::logs::{parse_log_line, selected_line, wrapped_log_rows, UiLogLine};
+
 const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 24;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 36;
@@ -131,19 +139,6 @@ struct UiProcess {
     kind: String,
     status: ProcessStatus,
     command: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UiLogLine {
-    stream: LogStream,
-    text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LogStream {
-    Stdout,
-    Stderr,
-    Rdev,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -716,37 +711,6 @@ impl SyncOutput for ChannelSyncOutput {
     }
 }
 
-impl UiLogLine {
-    fn stdout(text: impl Into<String>) -> Self {
-        Self {
-            stream: LogStream::Stdout,
-            text: text.into(),
-        }
-    }
-
-    fn stderr(text: impl Into<String>) -> Self {
-        Self {
-            stream: LogStream::Stderr,
-            text: text.into(),
-        }
-    }
-
-    fn rdev(text: impl Into<String>) -> Self {
-        Self {
-            stream: LogStream::Rdev,
-            text: text.into(),
-        }
-    }
-
-    fn copy_text(&self) -> String {
-        match self.stream {
-            LogStream::Stdout => format!("[stdout] {}", self.text),
-            LogStream::Stderr => format!("[stderr] {}", self.text),
-            LogStream::Rdev => self.text.clone(),
-        }
-    }
-}
-
 impl ProcessStatus {
     fn from_session(status: &str, exit_code: Option<i32>) -> Self {
         match status {
@@ -875,7 +839,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     model.log_region = Some(LogRegion {
         content,
         first_row: scroll as usize,
-        rows: rows.clone(),
+        rows: rows.iter().map(|row| row.plain.clone()).collect(),
     });
     let lines = rows
         .iter()
@@ -895,69 +859,6 @@ fn log_content_area(area: Rect) -> Rect {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     }
-}
-
-fn selected_line(text: &str, row: usize, selection: Option<TextSelection>) -> Line<'_> {
-    let Some(selection) = selection else {
-        return Line::from(Span::raw(text.to_owned()));
-    };
-    let (start, end) = ordered_selection(selection);
-    if row < start.row || row > end.row {
-        return Line::from(Span::raw(text.to_owned()));
-    }
-
-    let width = UnicodeWidthStr::width(text) as u16;
-    let start_col = if row == start.row {
-        start.col.min(width)
-    } else {
-        0
-    };
-    let end_col = if row == end.row {
-        end.col.min(width)
-    } else {
-        width
-    };
-    if start_col == end_col {
-        return Line::from(Span::raw(text.to_owned()));
-    }
-    let start_index = byte_index_for_display_col(text, start_col);
-    let end_index = byte_index_for_display_col(text, end_col);
-    Line::from(vec![
-        Span::raw(text[..start_index].to_owned()),
-        Span::styled(
-            text[start_index..end_index].to_owned(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ),
-        Span::raw(text[end_index..].to_owned()),
-    ])
-}
-
-fn wrapped_log_rows(logs: &[UiLogLine], width: u16) -> Vec<String> {
-    let width = width.max(1);
-    logs.iter()
-        .flat_map(|line| wrap_display_line(&line.copy_text(), width))
-        .collect()
-}
-
-fn wrap_display_line(text: &str, width: u16) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0u16;
-    for ch in text.chars() {
-        let char_width = ch.width().unwrap_or(0) as u16;
-        if current_width > 0 && current_width.saturating_add(char_width) > width {
-            rows.push(current);
-            current = String::new();
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width = current_width.saturating_add(char_width);
-    }
-    rows.push(current);
-    rows
 }
 
 fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -> u16 {
@@ -1464,87 +1365,6 @@ fn focused_process_is_sync(model: &TuiModel) -> bool {
         .is_some_and(|process| process.session_id.is_none())
 }
 
-fn previous_char_boundary(text: &str, cursor: usize) -> usize {
-    text[..cursor]
-        .char_indices()
-        .last()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_char_boundary(text: &str, cursor: usize) -> usize {
-    if cursor >= text.len() {
-        return text.len();
-    }
-    text[cursor..]
-        .char_indices()
-        .nth(1)
-        .map_or(text.len(), |(index, _)| cursor + index)
-}
-
-fn previous_word_boundary(text: &str, cursor: usize) -> usize {
-    if cursor == 0 {
-        return 0;
-    }
-    let mut chars = text[..cursor].char_indices().collect::<Vec<_>>();
-    while let Some((index, ch)) = chars.pop() {
-        if !ch.is_whitespace() {
-            chars.push((index, ch));
-            break;
-        }
-    }
-    let Some((_, last)) = chars.last().copied() else {
-        return 0;
-    };
-    let target = word_class(last);
-    while let Some((index, ch)) = chars.pop() {
-        if word_class(ch) != target {
-            return index + ch.len_utf8();
-        }
-    }
-    0
-}
-
-fn next_word_boundary(text: &str, cursor: usize) -> usize {
-    if cursor >= text.len() {
-        return text.len();
-    }
-    let mut iter = text[cursor..].char_indices().peekable();
-    while let Some((_, ch)) = iter.peek().copied() {
-        if ch.is_whitespace() {
-            iter.next();
-        } else {
-            break;
-        }
-    }
-    let Some((_, first)) = iter.peek().copied() else {
-        return text.len();
-    };
-    let target = word_class(first);
-    for (index, ch) in iter {
-        if word_class(ch) != target {
-            return cursor + index;
-        }
-    }
-    text.len()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WordClass {
-    Word,
-    Symbol,
-    Whitespace,
-}
-
-fn word_class(ch: char) -> WordClass {
-    if ch.is_whitespace() {
-        WordClass::Whitespace
-    } else if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' | '~') {
-        WordClass::Word
-    } else {
-        WordClass::Symbol
-    }
-}
-
 fn lock_sessions(
     model: &TuiModel,
 ) -> Result<std::sync::MutexGuard<'_, crate::session::SessionManager>> {
@@ -1591,103 +1411,10 @@ fn write_clipboard(_text: &str) -> Result<()> {
     Err(err(error_info::WATCH_EVENT_FAILED).with_hint("clipboard copy is only wired on Windows"))
 }
 
-fn parse_log_line(line: &str) -> UiLogLine {
-    if let Some(text) = line.strip_prefix("[stdout] ") {
-        UiLogLine::stdout(strip_ansi_escapes(text))
-    } else if let Some(text) = line.strip_prefix("[stderr] ") {
-        UiLogLine::stderr(strip_ansi_escapes(text))
-    } else {
-        UiLogLine::rdev(strip_ansi_escapes(line))
-    }
-}
-
-fn strip_ansi_escapes(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' {
-            output.push(ch);
-            continue;
-        }
-        match chars.peek().copied() {
-            Some('[') => {
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                let mut previous = '\0';
-                for next in chars.by_ref() {
-                    if next == '\u{7}' || (previous == '\u{1b}' && next == '\\') {
-                        break;
-                    }
-                    previous = next;
-                }
-            }
-            _ => {}
-        }
-    }
-    output
-}
-
 fn events_height(area: Rect) -> u16 {
     if area.height < 20 {
         0
     } else {
         1
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        next_word_boundary, previous_word_boundary, strip_ansi_escapes, wrap_display_line,
-    };
-
-    #[test]
-    fn word_navigation_skips_shell_words() {
-        let input = "cd knota-studio && pnpm dev --host";
-
-        assert_eq!(previous_word_boundary(input, input.len()), 28);
-        assert_eq!(previous_word_boundary(input, 28), 24);
-        assert_eq!(previous_word_boundary(input, 18), 16);
-        assert_eq!(next_word_boundary(input, 0), 2);
-        assert_eq!(next_word_boundary(input, 3), 15);
-        assert_eq!(next_word_boundary(input, 16), 18);
-    }
-
-    #[test]
-    fn word_navigation_keeps_utf8_boundaries() {
-        let input = "echo 中文 路径/test";
-        let end = input.len();
-        let previous = previous_word_boundary(input, end);
-
-        assert!(input.is_char_boundary(previous));
-        assert_eq!(&input[previous..], "路径/test");
-        assert!(input.is_char_boundary(next_word_boundary(input, 5)));
-    }
-
-    #[test]
-    fn log_wrapping_respects_display_width() {
-        assert_eq!(
-            wrap_display_line("abcdef", 3),
-            vec!["abc".to_owned(), "def".to_owned()]
-        );
-        assert_eq!(
-            wrap_display_line("中文ab", 4),
-            vec!["中文".to_owned(), "ab".to_owned()]
-        );
-    }
-
-    #[test]
-    fn strips_ansi_escape_sequences() {
-        assert_eq!(
-            strip_ansi_escapes("\u{1b}[32mgreen\u{1b}[0m text"),
-            "green text"
-        );
     }
 }
