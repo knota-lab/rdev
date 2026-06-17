@@ -74,7 +74,7 @@ struct TuiModel {
     focused: usize,
     logs: Vec<UiLogLine>,
     sync_logs: Vec<UiLogLine>,
-    events: Vec<String>,
+    events: Vec<UiEvent>,
     input: String,
     input_cursor: usize,
     command_history: Vec<String>,
@@ -142,6 +142,33 @@ struct UiProcess {
     kind: String,
     status: ProcessStatus,
     command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UiEvent {
+    level: UiEventLevel,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiEventLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+    Sync,
+}
+
+impl UiEventLevel {
+    fn parts(self) -> (&'static str, Style) {
+        match self {
+            Self::Info => ("info", Style::default().fg(Color::White)),
+            Self::Success => ("ok", Style::default().fg(Color::Green)),
+            Self::Warning => ("warn", Style::default().fg(Color::Yellow)),
+            Self::Error => ("error", Style::default().fg(Color::Red)),
+            Self::Sync => ("sync", Style::default().fg(Color::Cyan)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,15 +249,7 @@ impl TuiModel {
             .to_owned();
         let remote = format!("{}:{}", config.remote.host, config.remote.path);
         let (state, state_event) = TuiStateStore::load(&request.project_root);
-        let mut events = vec![
-            "sync watcher started".to_owned(),
-            "real sessions enabled".to_owned(),
-            "type new session <name> -- <command>".to_owned(),
-        ];
-        if let Some(event) = state_event {
-            events.push(event);
-        }
-        Self {
+        let mut model = Self {
             config: config.clone(),
             command_history: state.command_history().to_vec(),
             state,
@@ -248,7 +267,7 @@ impl TuiModel {
                 UiLogLine::rdev("sync watcher started"),
                 UiLogLine::rdev("initial full sync is not run in TUI yet"),
             ],
-            events,
+            events: Vec::new(),
             input: String::new(),
             input_cursor: 0,
             history_index: None,
@@ -257,7 +276,14 @@ impl TuiModel {
             log_scroll: 0,
             log_region: None,
             selection: None,
+        };
+        model.push_sync_event("sync watcher started");
+        model.push_event("real sessions enabled");
+        model.push_event("type new session <name> -- <command>");
+        if let Some(event) = state_event {
+            model.push_warning(event);
         }
+        model
     }
 
     fn refresh_sessions(&mut self) -> bool {
@@ -275,7 +301,7 @@ impl TuiModel {
             None
         };
         let Some(snapshot) = snapshot else {
-            self.push_event("session manager unavailable");
+            self.push_error("session manager unavailable");
             return true;
         };
         let mut processes = vec![UiProcess {
@@ -347,8 +373,7 @@ impl TuiModel {
         self.follow_logs = true;
         self.log_scroll = 0;
         self.selection = None;
-        self.events
-            .push(format!("focused {}", self.processes[self.focused].name));
+        self.push_event(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
     }
 
@@ -364,13 +389,35 @@ impl TuiModel {
         self.follow_logs = true;
         self.log_scroll = 0;
         self.selection = None;
-        self.events
-            .push(format!("focused {}", self.processes[self.focused].name));
+        self.push_event(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
     }
 
     fn push_event(&mut self, event: impl Into<String>) {
-        self.events.push(event.into());
+        self.push_tui_event(UiEventLevel::Info, event);
+    }
+
+    fn push_success(&mut self, event: impl Into<String>) {
+        self.push_tui_event(UiEventLevel::Success, event);
+    }
+
+    fn push_warning(&mut self, event: impl Into<String>) {
+        self.push_tui_event(UiEventLevel::Warning, event);
+    }
+
+    fn push_error(&mut self, event: impl Into<String>) {
+        self.push_tui_event(UiEventLevel::Error, event);
+    }
+
+    fn push_sync_event(&mut self, event: impl Into<String>) {
+        self.push_tui_event(UiEventLevel::Sync, event);
+    }
+
+    fn push_tui_event(&mut self, level: UiEventLevel, event: impl Into<String>) {
+        self.events.push(UiEvent {
+            level,
+            message: event.into(),
+        });
         if self.events.len() > 8 {
             let overflow = self.events.len() - 8;
             self.events.drain(0..overflow);
@@ -380,7 +427,7 @@ impl TuiModel {
     fn push_sync_log(&mut self, line: impl Into<String>) {
         let line = line.into();
         self.sync_logs.push(UiLogLine::rdev(line.clone()));
-        self.push_event(line);
+        self.push_sync_event(line);
         if self.sync_logs.len() > 500 {
             let overflow = self.sync_logs.len() - 500;
             self.sync_logs.drain(0..overflow);
@@ -486,7 +533,7 @@ impl TuiModel {
             Ok(()) => {
                 self.command_history = self.state.command_history().to_vec();
             }
-            Err(error) => self.push_event(error.to_string()),
+            Err(error) => self.push_error(error.to_string()),
         }
     }
 
@@ -957,22 +1004,64 @@ fn draw_events(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     if area.height == 0 {
         return;
     }
-    let recent = model
-        .events
-        .iter()
-        .rev()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-    let text = if recent.is_empty() {
-        "Events: <none>".to_owned()
-    } else {
-        format!("Events: {}", recent.join(" | "))
+    let Some(latest) = model.events.last() else {
+        frame.render_widget(Paragraph::new(Line::from("status: idle")), area);
+        return;
     };
-    frame.render_widget(Paragraph::new(text), area);
+    let mut lines = vec![event_line("status", latest)];
+    if area.height > 1 {
+        let history = model
+            .events
+            .iter()
+            .rev()
+            .skip(1)
+            .take(3)
+            .map(|event| compact_event_text(event, area.width.saturating_div(3).max(16)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        if !history.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("recent ", Style::default().fg(Color::DarkGray)),
+                Span::styled(history.join("  /  "), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn event_line(title: &str, event: &UiEvent) -> Line<'static> {
+    let (label, style) = event.level.parts();
+    Line::from(vec![
+        Span::styled(format!("{title} "), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{label} "), style.add_modifier(Modifier::BOLD)),
+        Span::styled(event.message.clone(), style),
+    ])
+}
+
+fn compact_event_text(event: &UiEvent, max_width: u16) -> String {
+    let (label, _) = event.level.parts();
+    let prefix = format!("{label} ");
+    let width = max_width.saturating_sub(1) as usize;
+    let mut text = format!("{prefix}{}", event.message);
+    if UnicodeWidthStr::width(text.as_str()) <= width {
+        return text;
+    }
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    let limit = width.saturating_sub(3);
+    for ch in text.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if used.saturating_add(char_width) > limit {
+            break;
+        }
+        truncated.push(ch);
+        used = used.saturating_add(char_width);
+    }
+    text = truncated;
+    text.push_str("...");
+    text
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -1081,9 +1170,9 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         }
         if focused_process_is_sync(model) {
             model.sync_status = ProcessStatus::Cancelled;
-            model.push_event("sync cancel requested");
+            model.push_warning("sync cancel requested");
         } else {
-            model.push_event("ctrl+c copies selection; focus sync to cancel sync");
+            model.push_warning("ctrl+c copies selection; focus sync to cancel sync");
         }
         return false;
     }
@@ -1190,10 +1279,10 @@ fn copy_selection(model: &mut TuiModel) -> bool {
     }
     match write_clipboard(&text) {
         Ok(()) => {
-            model.push_event(format!("copied {} lines", text.lines().count()));
+            model.push_success(format!("copied {} lines", text.lines().count()));
             model.selection = None;
         }
-        Err(error) => model.push_event(tui_error_message(&error)),
+        Err(error) => model.push_error(tui_error_message(&error)),
     }
     true
 }
@@ -1271,9 +1360,7 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
     model.focused = index;
     model.follow_logs = true;
     model.log_scroll = 0;
-    model
-        .events
-        .push(format!("focused {}", model.processes[model.focused].name));
+    model.push_event(format!("focused {}", model.processes[model.focused].name));
     model.focus_manager_to_current();
 }
 
@@ -1339,10 +1426,10 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
     match result {
         Ok(message) => {
             for line in message.lines().filter(|line| !line.is_empty()) {
-                model.push_event(line.to_owned());
+                model.push_success(line.to_owned());
             }
         }
-        Err(error) => model.push_event(tui_error_message(&error)),
+        Err(error) => model.push_error(tui_error_message(&error)),
     }
     model.refresh_sessions();
     false
@@ -1391,7 +1478,7 @@ fn start_and_remember_remote(
 
 fn stop_focused(model: &mut TuiModel) {
     let Some(selector) = focused_session_selector(model) else {
-        model.push_event("sync watcher cannot be stopped in TUI yet");
+        model.push_warning("sync watcher cannot be stopped in TUI yet");
         return;
     };
     let result = lock_sessions(model).and_then(|mut manager| manager.stop(&selector));
@@ -1401,7 +1488,7 @@ fn stop_focused(model: &mut TuiModel) {
 
 fn restart_focused(model: &mut TuiModel) {
     let Some(selector) = focused_session_selector(model) else {
-        model.push_event("sync watcher cannot be restarted in TUI yet");
+        model.push_warning("sync watcher cannot be restarted in TUI yet");
         return;
     };
     let result = SessionManager::restart(&model.sessions, &selector);
@@ -1435,8 +1522,8 @@ fn lock_sessions(
 
 fn push_result_event(model: &mut TuiModel, result: Result<String>) {
     match result {
-        Ok(message) => model.push_event(message),
-        Err(error) => model.push_event(tui_error_message(&error)),
+        Ok(message) => model.push_success(message),
+        Err(error) => model.push_error(tui_error_message(&error)),
     }
 }
 
@@ -1480,7 +1567,9 @@ fn write_clipboard(_text: &str) -> Result<()> {
 fn events_height(area: Rect) -> u16 {
     if area.height < 20 {
         0
-    } else {
+    } else if area.height < 28 {
         1
+    } else {
+        2
     }
 }
