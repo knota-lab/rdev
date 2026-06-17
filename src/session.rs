@@ -167,7 +167,19 @@ impl SessionManager {
     }
 
     pub fn start(shared: &SharedSessions, name: String, command: String) -> Result<String> {
-        Self::start_with_command(shared, StartSpec::local(name, command), shell_command)
+        Self::start_with_command(
+            shared,
+            StartSpec::local(name, command).replace_inactive(),
+            shell_command,
+        )
+    }
+
+    pub fn restore(shared: &SharedSessions, name: String, command: String) -> Result<String> {
+        Self::start_with_command(
+            shared,
+            StartSpec::local(name, command).replace_inactive(),
+            shell_command,
+        )
     }
 
     pub fn start_remote(shared: &SharedSessions, spec: RemoteSessionSpec) -> Result<String> {
@@ -177,9 +189,25 @@ impl SessionManager {
             remote_root: spec.remote_root.clone(),
         };
         let session_name = spec.name.clone();
-        Self::start_with_command(shared, StartSpec::remote(spec), |command| {
-            remote.shell_command(&session_name, command)
-        })
+        Self::start_with_command(
+            shared,
+            StartSpec::remote(spec).replace_inactive(),
+            |command| remote.shell_command(&session_name, command),
+        )
+    }
+
+    pub fn restore_remote(shared: &SharedSessions, spec: RemoteSessionSpec) -> Result<String> {
+        let remote = RemoteSession {
+            host: spec.host.clone(),
+            port: spec.port,
+            remote_root: spec.remote_root.clone(),
+        };
+        let session_name = spec.name.clone();
+        Self::start_with_command(
+            shared,
+            StartSpec::remote(spec).replace_inactive(),
+            |command| remote.shell_command(&session_name, command),
+        )
     }
 
     fn start_with_command(
@@ -193,14 +221,31 @@ impl SessionManager {
             kind,
             launch,
             remote_control,
+            conflict,
         } = spec;
         validate_session_name(&name)?;
         let cwd = {
-            let manager = lock_sessions(shared)?;
-            if manager.names.contains_key(&name) {
-                return Err(
-                    err(error_info::SESSION_FAILED).with_hint(format!("已存在同名会话: {name}"))
-                );
+            let mut manager = lock_sessions(shared)?;
+            manager.refresh();
+            if let Some(existing_id) = manager.names.get(&name).copied() {
+                match conflict {
+                    StartConflict::RejectExisting => {
+                        return Err(err(error_info::SESSION_FAILED)
+                            .with_hint(format!("已存在同名会话: {name}")));
+                    }
+                    StartConflict::ReplaceInactive => {
+                        let Some(existing) = manager.sessions.get(&existing_id) else {
+                            return Err(
+                                err(error_info::SESSION_FAILED).with_hint("session not found")
+                            );
+                        };
+                        if existing.status == SessionStatus::Running {
+                            return Err(err(error_info::SESSION_FAILED)
+                                .with_hint(format!("已存在正在运行的同名会话: {name}")));
+                        }
+                        manager.remove_session(&name)?;
+                    }
+                }
             }
             manager.cwd.clone()
         };
@@ -377,6 +422,21 @@ impl SessionManager {
         self.stop_id(id)
     }
 
+    pub fn delete_inactive(&mut self, selector: &str) -> Result<String> {
+        self.refresh();
+        let id = self.resolve(selector)?;
+        let Some(session) = self.sessions.get(&id) else {
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
+        };
+        if session.status == SessionStatus::Running {
+            return Err(err(error_info::SESSION_FAILED)
+                .with_hint(format!("会话正在运行，不能删除: {}", session.name)));
+        }
+        let name = session.name.clone();
+        self.remove_session(&name)?;
+        Ok(format!("session deleted: {name}"))
+    }
+
     pub fn restart(shared: &SharedSessions, selector: &str) -> Result<String> {
         let (name, command, launch) = {
             let mut manager = lock_sessions(shared)?;
@@ -540,6 +600,13 @@ struct StartSpec {
     kind: SessionKind,
     launch: SessionLaunch,
     remote_control: Option<RemoteSessionControl>,
+    conflict: StartConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartConflict {
+    RejectExisting,
+    ReplaceInactive,
 }
 
 impl StartSpec {
@@ -550,6 +617,7 @@ impl StartSpec {
             kind: SessionKind::Local,
             launch: SessionLaunch::Local,
             remote_control: None,
+            conflict: StartConflict::RejectExisting,
         }
     }
 
@@ -565,7 +633,13 @@ impl StartSpec {
             kind: SessionKind::Remote,
             remote_control: Some(remote.control(&spec.name)),
             launch: SessionLaunch::Remote(spec),
+            conflict: StartConflict::RejectExisting,
         }
+    }
+
+    fn replace_inactive(mut self) -> Self {
+        self.conflict = StartConflict::ReplaceInactive;
+        self
     }
 }
 
@@ -663,7 +737,28 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
 }
 
 pub fn help_text() -> &'static str {
-    "commands: help, sessions|ps, saved-sessions, new session <name> -- <local-command>, new remote-session <name> -- <remote-command>, restore <name|index>, delete session <name|index>, logs [name|id], tail [name|id] [lines], clear-logs [name|id], focus <name|id>, stop <name|id>|s, restart <name|id>|r, sync, quit, quit!"
+    "Commands\n\
+     sessions|ps                 list runtime sessions\n\
+     saved-sessions              list saved session templates\n\
+     new session <name> -- <cmd> create or replace an inactive local session\n\
+     new remote-session <name> -- <cmd>\n\
+                                 create or replace an inactive remote session\n\
+     restore <name|index>        start a saved session template\n\
+     delete session <name|index> delete saved template and inactive runtime session\n\
+     logs [name|id]              show logs for a session\n\
+     tail [name|id] [lines]      show recent session logs\n\
+     clear-logs [name|id]        clear buffered logs\n\
+     focus <name|id>             focus a session\n\
+     stop <name|id> | s          stop a session, or focused session with s\n\
+     restart <name|id> | r       restart a session, or focused session with r\n\
+     sync                        run full sync\n\
+     quit / quit!                exit, or force stop sessions and exit\n\
+     Keys\n\
+     Ctrl+1..9                   focus process by number\n\
+     Ctrl+C                      copy selection; cancel sync only when sync focused\n\
+     Ctrl+Up/Down                focus previous/next process\n\
+     PageUp/PageDown             scroll current logs\n\
+     Esc                         clear input and selection"
 }
 
 fn parse_new_session(rest: &str) -> ConsoleCommand {
@@ -953,8 +1048,11 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::{
-        parse_console_command, remote_stop_command, ConsoleCommand, RemoteSession, SessionManager,
+        parse_console_command, remote_stop_command, ConsoleCommand, ManagedSession, RemoteSession,
+        SessionKind, SessionLaunch, SessionManager, SessionStatus,
     };
     use crate::error_info;
 
@@ -1013,10 +1111,7 @@ mod tests {
     #[test]
     fn duplicate_session_name_uses_session_error() {
         let shared = SessionManager::shared(std::env::temp_dir());
-        {
-            let mut manager = shared.lock().unwrap_or_else(|error| error.into_inner());
-            manager.names.insert("web".to_owned(), 1);
-        }
+        insert_local_session(&shared, "web", SessionStatus::Running);
 
         let error = match SessionManager::start(&shared, "web".to_owned(), "echo ok".to_owned()) {
             Ok(message) => panic!("duplicate session should fail, got: {message}"),
@@ -1024,7 +1119,82 @@ mod tests {
         };
 
         assert_eq!(error.info.code, error_info::SESSION_FAILED.code);
-        assert_eq!(error.hint.as_deref(), Some("已存在同名会话: web"));
+        assert_eq!(error.hint.as_deref(), Some("已存在正在运行的同名会话: web"));
+    }
+
+    #[test]
+    fn new_session_replaces_exited_session_with_same_name() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        insert_local_session(&shared, "web", SessionStatus::Exited);
+
+        let result = SessionManager::start(&shared, "web".to_owned(), "echo new".to_owned());
+
+        assert!(
+            result.is_ok(),
+            "exited session should be replaceable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn restore_replaces_stopped_session_with_same_name() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        insert_local_session(&shared, "web", SessionStatus::Stopped);
+
+        let result = SessionManager::restore(&shared, "web".to_owned(), "echo restored".to_owned());
+
+        assert!(
+            result.is_ok(),
+            "stopped session should be replaceable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_replace_running_session_with_same_name() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        insert_local_session(&shared, "web", SessionStatus::Running);
+
+        let error =
+            match SessionManager::restore(&shared, "web".to_owned(), "echo restored".to_owned()) {
+                Ok(message) => panic!("running session should not be replaced, got: {message}"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.info.code, error_info::SESSION_FAILED.code);
+        assert_eq!(error.hint.as_deref(), Some("已存在正在运行的同名会话: web"));
+    }
+
+    #[test]
+    fn delete_inactive_session_releases_name() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        insert_local_session(&shared, "web", SessionStatus::Exited);
+
+        let message = {
+            let mut manager = shared.lock().unwrap_or_else(|error| error.into_inner());
+            manager
+                .delete_inactive("web")
+                .unwrap_or_else(|error| panic!("{error}"))
+        };
+
+        assert_eq!(message, "session deleted: web");
+        let manager = shared.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(!manager.names.contains_key("web"));
+    }
+
+    #[test]
+    fn delete_inactive_session_rejects_running() {
+        let shared = SessionManager::shared(std::env::temp_dir());
+        insert_local_session(&shared, "web", SessionStatus::Running);
+
+        let error = {
+            let mut manager = shared.lock().unwrap_or_else(|error| error.into_inner());
+            match manager.delete_inactive("web") {
+                Ok(message) => panic!("running session should not be deleted, got: {message}"),
+                Err(error) => error,
+            }
+        };
+
+        assert_eq!(error.info.code, error_info::SESSION_FAILED.code);
+        assert_eq!(error.hint.as_deref(), Some("会话正在运行，不能删除: web"));
     }
 
     #[test]
@@ -1108,6 +1278,28 @@ mod tests {
             ConsoleCommand::Unknown(
                 "new session requires: new session <name> -- <command>".to_owned()
             )
+        );
+    }
+
+    fn insert_local_session(shared: &super::SharedSessions, name: &str, status: SessionStatus) {
+        let mut manager = shared.lock().unwrap_or_else(|error| error.into_inner());
+        let id = manager.next_id;
+        manager.next_id += 1;
+        manager.names.insert(name.to_owned(), id);
+        manager.sessions.insert(
+            id,
+            ManagedSession {
+                id,
+                name: name.to_owned(),
+                kind: SessionKind::Local,
+                launch: SessionLaunch::Local,
+                remote_control: None,
+                command: "echo old".to_owned(),
+                status,
+                child: None,
+                logs: VecDeque::new(),
+                exit_code: None,
+            },
         );
     }
 }

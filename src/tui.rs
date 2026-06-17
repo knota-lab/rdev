@@ -1298,11 +1298,6 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         KeyCode::Char('?') => model.push_event(
             "help: drag logs to select, ctrl+c copies selection, ctrl+arrows focus, quit",
         ),
-        KeyCode::Char('f') if model.input.is_empty() => {
-            model.follow_logs = true;
-            model.log_scroll = 0;
-            model.push_event("log follow enabled");
-        }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_digit() =>
         {
@@ -1484,7 +1479,12 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
 
 fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> bool {
     let result = match command {
-        ConsoleCommand::Help => Ok(help_text().to_owned()),
+        ConsoleCommand::Help => {
+            for line in help_text().lines().filter(|line| !line.trim().is_empty()) {
+                model.push_event(line.trim_end().to_owned());
+            }
+            Ok(String::new())
+        }
         ConsoleCommand::Sessions => lock_sessions(model).map(|mut manager| manager.list()),
         ConsoleCommand::NewSession { name, command } => {
             start_and_remember_local(model, name, command)
@@ -1494,7 +1494,7 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
         }
         ConsoleCommand::SavedSessions => Ok(model.state.saved_sessions_text()),
         ConsoleCommand::RestoreSession { selector } => restore_saved_session(model, &selector),
-        ConsoleCommand::DeleteSavedSession { selector } => model.state.delete_session(&selector),
+        ConsoleCommand::DeleteSavedSession { selector } => delete_saved_session(model, &selector),
         ConsoleCommand::Logs { selector } => {
             lock_sessions(model).and_then(|mut manager| manager.logs(selector.as_deref()))
         }
@@ -1563,12 +1563,31 @@ fn restore_saved_session(model: &mut TuiModel, selector: &str) -> Result<String>
     };
     match saved.kind {
         SavedSessionKind::Local => {
-            SessionManager::start(&model.sessions, saved.name, saved.command)
+            SessionManager::restore(&model.sessions, saved.name, saved.command)
         }
         SavedSessionKind::Remote => {
             let spec = RemoteSessionSpec::from_config(&model.config, saved.name, saved.command)?;
-            SessionManager::start_remote(&model.sessions, spec)
+            SessionManager::restore_remote(&model.sessions, spec)
         }
+    }
+}
+
+fn delete_saved_session(model: &mut TuiModel, selector: &str) -> Result<String> {
+    if let Some(saved) = model.state.find_session(selector) {
+        let name = saved.name;
+        let mut messages = vec![model.state.delete_session(selector)?];
+        match lock_sessions(model).and_then(|mut manager| manager.delete_inactive(&name)) {
+            Ok(message) => messages.push(message),
+            Err(error) if is_session_not_found(&error) => {}
+            Err(error) => messages.push(tui_error_message(&error)),
+        }
+        return Ok(messages.join("\n"));
+    }
+
+    match lock_sessions(model).and_then(|mut manager| manager.delete_inactive(selector)) {
+        Ok(message) => Ok(message),
+        Err(error) if is_session_not_found(&error) => model.state.delete_session(selector),
+        Err(error) => Err(error),
     }
 }
 
@@ -1653,6 +1672,10 @@ fn tui_error_message(error: &RdevError) -> String {
         Some(hint) if !hint.is_empty() => format!("{error}; {hint}"),
         _ => error.to_string(),
     }
+}
+
+fn is_session_not_found(error: &RdevError) -> bool {
+    error.hint.as_deref() == Some("session not found")
 }
 
 #[cfg(windows)]
