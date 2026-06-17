@@ -47,7 +47,8 @@ mod state;
 use self::input::{
     next_char_boundary, next_word_boundary, previous_char_boundary, previous_word_boundary,
 };
-use self::logs::{parse_log_line, selected_line, wrapped_log_rows, UiLogLine};
+use self::logs::LOG_PREFIX_WIDTH;
+use self::logs::{parse_log_line, selected_line, wrapped_log_rows, RenderLogRow, UiLogLine};
 use self::state::{SavedSession, SavedSessionKind, TuiStateStore};
 
 const INPUT_PROMPT: &str = "rdev> ";
@@ -86,7 +87,9 @@ struct TuiModel {
     follow_logs: bool,
     log_scroll: u16,
     log_region: Option<LogRegion>,
+    log_rows_cache: Option<LogRowsCache>,
     selection: Option<TextSelection>,
+    help_visible: bool,
 }
 
 struct TuiSyncRuntime {
@@ -187,6 +190,12 @@ struct LogRegion {
     rows: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogRowsCache {
+    width: u16,
+    rows: Vec<RenderLogRow>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextSelection {
     anchor: CellPos,
@@ -201,6 +210,29 @@ struct CellPos {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventOutcome {
+    quit: bool,
+    dirty: bool,
+}
+
+impl EventOutcome {
+    const CLEAN: Self = Self {
+        quit: false,
+        dirty: false,
+    };
+
+    const DIRTY: Self = Self {
+        quit: false,
+        dirty: true,
+    };
+
+    const QUIT: Self = Self {
+        quit: true,
+        dirty: false,
+    };
 }
 
 impl Drop for TerminalGuard {
@@ -237,13 +269,14 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
         {
             let event = event::read()
                 .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
-            if handle_event(&mut model, &mut sync, event) {
+            let outcome = handle_event(&mut model, &mut sync, event);
+            if outcome.quit {
                 if let Ok(mut manager) = model.sessions.lock() {
                     manager.stop_all();
                 }
                 return Ok(());
             }
-            dirty = true;
+            dirty |= outcome.dirty;
         }
     }
 }
@@ -284,7 +317,9 @@ impl TuiModel {
             follow_logs: true,
             log_scroll: 0,
             log_region: None,
+            log_rows_cache: None,
             selection: None,
+            help_visible: false,
         };
         model.push_sync_event("sync watcher started");
         model.push_event("real sessions enabled");
@@ -360,12 +395,25 @@ impl TuiModel {
         if logs.is_empty() {
             logs.push(UiLogLine::rdev("logs: <empty>"));
         }
-        let dirty = self.focused != focused || self.processes != processes || self.logs != logs;
+        let focused_session = processes
+            .get(focused)
+            .and_then(|process| process.session_id);
+        let focused_was_sync = processes
+            .get(focused)
+            .is_some_and(|process| process.session_id.is_none());
+        let focused_process_changed = self.focused != focused
+            || previous_was_sync != focused_was_sync
+            || previous_session != focused_session;
+        let logs_changed = self.logs != logs;
+        let dirty = focused_process_changed || self.processes != processes || logs_changed;
         self.focused = focused;
         self.processes = processes;
         self.logs = logs;
-        if dirty {
+        if focused_process_changed {
             self.selection = None;
+            self.log_rows_cache = None;
+        } else if logs_changed {
+            self.log_rows_cache = None;
         }
         dirty
     }
@@ -382,6 +430,7 @@ impl TuiModel {
         self.follow_logs = true;
         self.log_scroll = 0;
         self.selection = None;
+        self.log_rows_cache = None;
         self.push_event(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
     }
@@ -398,6 +447,7 @@ impl TuiModel {
         self.follow_logs = true;
         self.log_scroll = 0;
         self.selection = None;
+        self.log_rows_cache = None;
         self.push_event(format!("focused {}", self.processes[self.focused].name));
         self.focus_manager_to_current();
     }
@@ -914,10 +964,29 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
     }
 
     let content = log_content_area(area);
-    let all_rows = wrapped_log_rows(&model.logs, content.width);
+    if model.help_visible {
+        model.log_region = None;
+        draw_help_panel(frame, content);
+        return;
+    }
+    if model
+        .log_rows_cache
+        .as_ref()
+        .map_or(true, |cache| cache.width != content.width)
+    {
+        model.log_rows_cache = Some(LogRowsCache {
+            width: content.width,
+            rows: wrapped_log_rows(&model.logs, content.width),
+        });
+    }
+    let all_rows = model
+        .log_rows_cache
+        .as_ref()
+        .map(|cache| cache.rows.as_slice())
+        .unwrap_or(&[]);
     let scroll = clamped_visual_log_scroll(all_rows.len(), content.height, model.log_scroll);
     let rows = all_rows
-        .into_iter()
+        .iter()
         .skip(scroll as usize)
         .take(content.height as usize)
         .collect::<Vec<_>>();
@@ -935,6 +1004,29 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), content);
+}
+
+fn draw_help_panel(frame: &mut Frame<'_>, area: Rect) {
+    let lines = help_text()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            if line.trim_end() == "Commands" || line.trim_end() == "Keys" {
+                Line::from(Span::styled(
+                    line.trim_end().to_owned(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    line.trim_end().to_owned(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn log_content_area(area: Rect) -> Rect {
@@ -1225,66 +1317,82 @@ fn input_text_area(area: Rect) -> Rect {
     }
 }
 
-fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -> bool {
+fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -> EventOutcome {
     match event {
         Event::Key(key) => handle_key(model, sync, key),
         Event::Paste(text) => {
             model.insert_text(&text);
-            false
+            EventOutcome::DIRTY
         }
         Event::Mouse(mouse) => {
-            match mouse.kind {
+            let dirty = match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    model.selection =
-                        selection_pos(model, mouse.column, mouse.row).map(|pos| TextSelection {
+                    let Some(pos) = selection_pos(model, mouse.column, mouse.row) else {
+                        return EventOutcome::CLEAN;
+                    };
+                    let next = if extends_selection(mouse.modifiers) {
+                        TextSelection {
+                            anchor: model.selection.map_or(pos, |selection| selection.anchor),
+                            cursor: pos,
+                        }
+                    } else {
+                        TextSelection {
                             anchor: pos,
                             cursor: pos,
-                        });
+                        }
+                    };
+                    set_selection_if_changed(model, Some(next))
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(pos) = selection_pos(model, mouse.column, mouse.row) {
                         if let Some(selection) = model.selection.as_mut() {
-                            selection.cursor = pos;
+                            if selection.cursor != pos {
+                                selection.cursor = pos;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
+                    } else {
+                        false
                     }
                 }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(pos) = selection_pos(model, mouse.column, mouse.row) {
-                        if let Some(selection) = model.selection.as_mut() {
-                            selection.cursor = pos;
-                        }
-                    }
-                }
+                MouseEventKind::Up(MouseButton::Left) => false,
+                MouseEventKind::Down(MouseButton::Right) => copy_selection(model),
                 MouseEventKind::ScrollUp => {
                     model.follow_logs = false;
                     model.log_scroll = model.log_scroll.saturating_add(1);
                     model.clamp_log_scroll();
                     model.selection = None;
+                    true
                 }
                 MouseEventKind::ScrollDown => {
                     model.log_scroll = model.log_scroll.saturating_sub(1);
                     model.clamp_log_scroll();
                     model.selection = None;
+                    true
                 }
-                _ => {}
-            }
-            false
+                _ => false,
+            };
+            EventOutcome { quit: false, dirty }
         }
-        Event::Resize(_, _) => false,
-        _ => false,
+        Event::Resize(_, _) => EventOutcome::DIRTY,
+        _ => EventOutcome::CLEAN,
     }
 }
 
-fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) -> bool {
+fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) -> EventOutcome {
     if key.kind != KeyEventKind::Press {
-        return false;
+        return EventOutcome::CLEAN;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if copy_selection(model) {
-            return false;
+            return EventOutcome::DIRTY;
         }
         if focused_process_is_sync(model) && sync.cancel_current(model) {
-            return false;
+            return EventOutcome::DIRTY;
         }
         if focused_process_is_sync(model) {
             model.sync_status = ProcessStatus::Cancelled;
@@ -1292,12 +1400,14 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         } else {
             model.push_warning("ctrl+c copies selection; focus sync to cancel sync");
         }
-        return false;
+        return EventOutcome::DIRTY;
     }
     match key.code {
-        KeyCode::Char('?') => model.push_event(
-            "help: drag logs to select, ctrl+c copies selection, ctrl+arrows focus, quit",
-        ),
+        KeyCode::Char('?') => {
+            model.help_visible = true;
+            model.selection = None;
+            model.push_event("help panel opened; press Esc to close");
+        }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_digit() =>
         {
@@ -1312,8 +1422,15 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
             model.delete_word_input();
         }
         KeyCode::Delete => model.delete_input(),
-        KeyCode::Enter => return submit_input(model),
+        KeyCode::Enter => {
+            return if submit_input(model) {
+                EventOutcome::QUIT
+            } else {
+                EventOutcome::DIRTY
+            }
+        }
         KeyCode::Esc => {
+            model.help_visible = false;
             model.clear_input();
             model.selection = None;
         }
@@ -1351,7 +1468,7 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         }
         _ => {}
     }
-    false
+    EventOutcome::DIRTY
 }
 
 impl TuiModel {
@@ -1371,8 +1488,23 @@ fn selection_pos(model: &TuiModel, x: u16, y: u16) -> Option<CellPos> {
     let row = region.first_row.saturating_add(visible_row);
     let row_text = region.rows.get(visible_row)?;
     let max_col = UnicodeWidthStr::width(row_text.as_str()) as u16;
-    let col = x.saturating_sub(region.content.x).min(max_col);
+    let col = x
+        .saturating_sub(region.content.x)
+        .saturating_sub(LOG_PREFIX_WIDTH)
+        .min(max_col);
     Some(CellPos { row, col })
+}
+
+fn extends_selection(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn set_selection_if_changed(model: &mut TuiModel, selection: Option<TextSelection>) -> bool {
+    if model.selection == selection {
+        return false;
+    }
+    model.selection = selection;
+    true
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -1480,9 +1612,9 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
 fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> bool {
     let result = match command {
         ConsoleCommand::Help => {
-            for line in help_text().lines().filter(|line| !line.trim().is_empty()) {
-                model.push_event(line.trim_end().to_owned());
-            }
+            model.help_visible = true;
+            model.selection = None;
+            model.push_event("help panel opened; press Esc to close");
             Ok(String::new())
         }
         ConsoleCommand::Sessions => lock_sessions(model).map(|mut manager| manager.list()),

@@ -4,6 +4,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{CellPos, TextSelection};
 
+pub(super) const LOG_PREFIX_WIDTH: u16 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct UiLogLine {
     stream: LogStream,
@@ -20,6 +22,7 @@ enum LogStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenderLogRow {
     pub(super) plain: String,
+    prefix: Option<StyledTextSegment>,
     segments: Vec<StyledTextSegment>,
 }
 
@@ -51,31 +54,30 @@ impl UiLogLine {
         }
     }
 
-    #[cfg(test)]
-    fn copy_text(&self) -> String {
-        let text = strip_ansi_escapes(&self.text);
+    fn prefix_segment(&self) -> Option<StyledTextSegment> {
         match self.stream {
-            LogStream::Stdout => format!("[stdout] {text}"),
-            LogStream::Stderr => format!("[stderr] {text}"),
-            LogStream::Rdev => text,
+            LogStream::Stdout => Some(StyledTextSegment {
+                text: "stdout".to_owned(),
+                style: Style::default().fg(Color::DarkGray),
+            }),
+            LogStream::Stderr => Some(StyledTextSegment {
+                text: "stderr".to_owned(),
+                style: Style::default().fg(Color::Red),
+            }),
+            LogStream::Rdev => Some(StyledTextSegment {
+                text: "rdev".to_owned(),
+                style: Style::default().fg(Color::DarkGray),
+            }),
         }
     }
 
     fn render_segments(&self) -> Vec<StyledTextSegment> {
-        let mut segments = Vec::new();
-        match self.stream {
-            LogStream::Stdout => push_styled_text(
-                &mut segments,
-                "[stdout] ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            LogStream::Stderr => {
-                push_styled_text(&mut segments, "[stderr] ", Style::default().fg(Color::Red))
-            }
-            LogStream::Rdev => {}
-        }
-        segments.extend(ansi_styled_segments(&self.text, Style::default()));
-        segments
+        ansi_styled_segments(&self.text, Style::default())
+    }
+
+    #[cfg(test)]
+    fn plain_text(&self) -> String {
+        strip_ansi_escapes(&self.text)
     }
 }
 
@@ -105,40 +107,67 @@ pub(super) fn selected_line(
         width
     };
     if start_col == end_col {
-        return Line::from(Span::raw(text.to_owned()));
+        return Line::from(prefixed_spans(log_row, vec![Span::raw(text.to_owned())]));
     }
     let start_index = byte_index_for_display_col(text, start_col);
     let end_index = byte_index_for_display_col(text, end_col);
-    Line::from(vec![
-        Span::raw(text[..start_index].to_owned()),
-        Span::styled(
-            text[start_index..end_index].to_owned(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ),
-        Span::raw(text[end_index..].to_owned()),
-    ])
+    Line::from(prefixed_spans(
+        log_row,
+        vec![
+            Span::raw(text[..start_index].to_owned()),
+            Span::styled(
+                text[start_index..end_index].to_owned(),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Span::raw(text[end_index..].to_owned()),
+        ],
+    ))
 }
 
 fn styled_line(log_row: &RenderLogRow) -> Line<'_> {
-    Line::from(
-        log_row
-            .segments
-            .iter()
-            .map(|segment| Span::styled(segment.text.clone(), segment.style))
-            .collect::<Vec<_>>(),
-    )
+    let message = log_row
+        .segments
+        .iter()
+        .map(|segment| Span::styled(segment.text.clone(), segment.style))
+        .collect::<Vec<_>>();
+    Line::from(prefixed_spans(log_row, message))
+}
+
+fn prefixed_spans(log_row: &RenderLogRow, mut message: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(prefix) = &log_row.prefix {
+        spans.push(Span::styled(
+            format!(
+                "{:>width$} ",
+                prefix.text,
+                width = LOG_PREFIX_WIDTH as usize - 1
+            ),
+            prefix.style,
+        ));
+    } else {
+        spans.push(Span::raw(" ".repeat(LOG_PREFIX_WIDTH as usize)));
+    }
+    spans.append(&mut message);
+    spans
 }
 
 pub(super) fn wrapped_log_rows(logs: &[UiLogLine], width: u16) -> Vec<RenderLogRow> {
     let width = width.max(1);
     logs.iter()
-        .flat_map(|line| wrap_styled_line(&line.render_segments(), width))
+        .flat_map(|line| {
+            wrap_styled_line(
+                line.prefix_segment(),
+                &line.render_segments(),
+                message_width(width),
+            )
+        })
         .collect()
 }
 
 #[cfg(test)]
 fn wrap_display_line(text: &str, width: u16) -> Vec<String> {
     wrap_styled_line(
+        None,
         &[StyledTextSegment {
             text: text.to_owned(),
             style: Style::default(),
@@ -150,11 +179,16 @@ fn wrap_display_line(text: &str, width: u16) -> Vec<String> {
     .collect()
 }
 
-fn wrap_styled_line(segments: &[StyledTextSegment], width: u16) -> Vec<RenderLogRow> {
+fn wrap_styled_line(
+    prefix: Option<StyledTextSegment>,
+    segments: &[StyledTextSegment],
+    width: u16,
+) -> Vec<RenderLogRow> {
     let width = width.max(1);
     if segments.iter().all(|segment| segment.text.is_empty()) {
         return vec![RenderLogRow {
             plain: String::new(),
+            prefix,
             segments: Vec::new(),
         }];
     }
@@ -162,6 +196,7 @@ fn wrap_styled_line(segments: &[StyledTextSegment], width: u16) -> Vec<RenderLog
     let mut rows = Vec::new();
     let mut current = RenderLogRow {
         plain: String::new(),
+        prefix,
         segments: Vec::new(),
     };
     let mut current_width = 0u16;
@@ -172,6 +207,7 @@ fn wrap_styled_line(segments: &[StyledTextSegment], width: u16) -> Vec<RenderLog
                 rows.push(current);
                 current = RenderLogRow {
                     plain: String::new(),
+                    prefix: None,
                     segments: Vec::new(),
                 };
                 current_width = 0;
@@ -183,6 +219,14 @@ fn wrap_styled_line(segments: &[StyledTextSegment], width: u16) -> Vec<RenderLog
     }
     rows.push(current);
     rows
+}
+
+fn message_width(width: u16) -> u16 {
+    if width > LOG_PREFIX_WIDTH.saturating_add(4) {
+        width.saturating_sub(LOG_PREFIX_WIDTH)
+    } else {
+        width
+    }
 }
 
 pub(super) fn parse_log_line(line: &str) -> UiLogLine {
@@ -256,22 +300,6 @@ fn apply_sgr(params: &str, base_style: Style, current_style: Style) -> Style {
     style
 }
 
-fn push_styled_text(segments: &mut Vec<StyledTextSegment>, text: &str, style: Style) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(last) = segments.last_mut() {
-        if last.style == style {
-            last.text.push_str(text);
-            return;
-        }
-    }
-    segments.push(StyledTextSegment {
-        text: text.to_owned(),
-        style,
-    });
-}
-
 fn push_styled_char(segments: &mut Vec<StyledTextSegment>, ch: char, style: Style) {
     if let Some(last) = segments.last_mut() {
         if last.style == style {
@@ -343,7 +371,7 @@ fn byte_index_for_display_col(text: &str, col: u16) -> usize {
 mod tests {
     use super::{
         ansi_styled_segments, parse_log_line, strip_ansi_escapes, wrap_display_line,
-        wrap_styled_line,
+        wrap_styled_line, wrapped_log_rows,
     };
     use ratatui::style::{Color, Style};
 
@@ -380,7 +408,7 @@ mod tests {
     #[test]
     fn wrapped_styled_logs_keep_plain_text_without_escape_codes() {
         let segments = ansi_styled_segments("\u{1b}[31mabcdef\u{1b}[0m", Style::default());
-        let rows = wrap_styled_line(&segments, 3);
+        let rows = wrap_styled_line(None, &segments, 3);
 
         assert_eq!(rows[0].plain, "abc");
         assert_eq!(rows[0].segments[0].style.fg, Some(Color::Red));
@@ -392,10 +420,14 @@ mod tests {
     fn parsed_log_copy_text_strips_ansi_but_render_keeps_style() {
         let line = parse_log_line("[stdout] \u{1b}[33mready\u{1b}[0m");
 
-        assert_eq!(line.copy_text(), "[stdout] ready");
-        let segments = line.render_segments();
-        assert_eq!(segments[0].text, "[stdout] ");
-        assert_eq!(segments[1].text, "ready");
-        assert_eq!(segments[1].style.fg, Some(Color::Yellow));
+        assert_eq!(line.plain_text(), "ready");
+        let rows = wrapped_log_rows(&[line], 80);
+        assert_eq!(rows[0].plain, "ready");
+        assert_eq!(
+            rows[0].prefix.as_ref().map(|prefix| prefix.text.as_str()),
+            Some("stdout")
+        );
+        assert_eq!(rows[0].segments[0].text, "ready");
+        assert_eq!(rows[0].segments[0].style.fg, Some(Color::Yellow));
     }
 }
