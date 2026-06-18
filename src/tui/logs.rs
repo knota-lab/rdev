@@ -207,14 +207,21 @@ fn wrap_styled_line(
         for ch in segment.text.chars() {
             let char_width = ch.width().unwrap_or(0) as u16;
             if current_width > 0 && current_width.saturating_add(char_width) > width {
-                rows.push(current);
-                current = RenderLogRow {
-                    plain: String::new(),
-                    starts_log_line: false,
-                    prefix: None,
-                    segments: Vec::new(),
-                };
-                current_width = 0;
+                if let Some(split_at) = last_wrap_break_char_count(&current.plain) {
+                    let (line, remainder) = split_log_row(current, split_at);
+                    rows.push(line);
+                    current = remainder;
+                    current_width = UnicodeWidthStr::width(current.plain.as_str()) as u16;
+                } else {
+                    rows.push(current);
+                    current = RenderLogRow {
+                        plain: String::new(),
+                        starts_log_line: false,
+                        prefix: None,
+                        segments: Vec::new(),
+                    };
+                    current_width = 0;
+                }
             }
             current.plain.push(ch);
             push_styled_char(&mut current.segments, ch, segment.style);
@@ -223,6 +230,87 @@ fn wrap_styled_line(
     }
     rows.push(current);
     rows
+}
+
+fn last_wrap_break_char_count(text: &str) -> Option<usize> {
+    text.chars()
+        .enumerate()
+        .filter_map(|(index, ch)| is_wrap_break(ch).then_some(index + 1))
+        .last()
+}
+
+fn is_wrap_break(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '/' | '\\' | '.' | ':' | ',' | ';' | ')' | ']' | '}')
+}
+
+fn split_log_row(row: RenderLogRow, char_count: usize) -> (RenderLogRow, RenderLogRow) {
+    let split_byte = byte_index_for_char_count(&row.plain, char_count);
+    let left_plain = row.plain[..split_byte].to_owned();
+    let right_plain = row.plain[split_byte..].to_owned();
+    let (left_segments, right_segments) = split_segments(row.segments, char_count);
+    (
+        RenderLogRow {
+            plain: left_plain,
+            starts_log_line: row.starts_log_line,
+            prefix: row.prefix,
+            segments: left_segments,
+        },
+        RenderLogRow {
+            plain: right_plain,
+            starts_log_line: false,
+            prefix: None,
+            segments: right_segments,
+        },
+    )
+}
+
+fn split_segments(
+    segments: Vec<StyledTextSegment>,
+    char_count: usize,
+) -> (Vec<StyledTextSegment>, Vec<StyledTextSegment>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut remaining = char_count;
+    for segment in segments {
+        let segment_chars = segment.text.chars().count();
+        if remaining >= segment_chars {
+            left.push(segment);
+            remaining -= segment_chars;
+            continue;
+        }
+        if remaining == 0 {
+            right.push(segment);
+            continue;
+        }
+        let split_byte = byte_index_for_char_count(&segment.text, remaining);
+        push_styled_text(&mut left, &segment.text[..split_byte], segment.style);
+        push_styled_text(&mut right, &segment.text[split_byte..], segment.style);
+        remaining = 0;
+    }
+    (left, right)
+}
+
+fn push_styled_text(segments: &mut Vec<StyledTextSegment>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = segments.last_mut() {
+        if last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    segments.push(StyledTextSegment {
+        text: text.to_owned(),
+        style,
+    });
+}
+
+fn byte_index_for_char_count(text: &str, char_count: usize) -> usize {
+    text.char_indices()
+        .map(|(index, _)| index)
+        .nth(char_count)
+        .unwrap_or(text.len())
 }
 
 fn message_width(width: u16) -> u16 {
@@ -388,6 +476,22 @@ mod tests {
         assert_eq!(
             wrap_display_line("中文ab", 4),
             vec!["中文".to_owned(), "ab".to_owned()]
+        );
+    }
+
+    #[test]
+    fn log_wrapping_prefers_word_boundaries() {
+        assert_eq!(
+            wrap_display_line("alpha beta gamma", 12),
+            vec!["alpha beta ".to_owned(), "gamma".to_owned()]
+        );
+        assert_eq!(
+            wrap_display_line("memora-frontend-h5/dist/assets/index.js", 18),
+            vec![
+                "memora-frontend-h5".to_owned(),
+                "/dist/assets/".to_owned(),
+                "index.js".to_owned()
+            ]
         );
     }
 
