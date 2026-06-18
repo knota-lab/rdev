@@ -90,7 +90,7 @@ pub struct SessionProcessSnapshot {
     pub status: String,
     pub command: String,
     pub exit_code: Option<i32>,
-    pub logs: Vec<String>,
+    pub log_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +126,7 @@ struct ManagedSession {
     status: SessionStatus,
     child: Option<Child>,
     logs: VecDeque<String>,
+    log_version: u64,
     exit_code: Option<i32>,
 }
 
@@ -278,6 +279,7 @@ impl SessionManager {
                     status: SessionStatus::Running,
                     child: Some(child),
                     logs: VecDeque::from([format!("[rdev] spawn {process_display}")]),
+                    log_version: 1,
                     exit_code: None,
                 },
             );
@@ -358,10 +360,21 @@ impl SessionManager {
                     status: session.status.label().to_owned(),
                     command: session.command.clone(),
                     exit_code: session.exit_code,
-                    logs: session.logs.iter().cloned().collect(),
+                    log_version: session.log_version,
                 })
                 .collect(),
         }
+    }
+
+    pub fn logs_snapshot(&mut self, id: u32) -> Result<(u64, Vec<String>)> {
+        self.refresh();
+        let Some(session) = self.sessions.get(&id) else {
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
+        };
+        Ok((
+            session.log_version,
+            session.logs.iter().cloned().collect::<Vec<_>>(),
+        ))
     }
 
     pub fn logs(&mut self, selector: Option<&str>) -> Result<String> {
@@ -403,6 +416,7 @@ impl SessionManager {
             return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
         };
         session.logs.clear();
+        session.log_version = session.log_version.saturating_add(1);
         Ok(format!("logs cleared: {}", session.name))
     }
 
@@ -997,6 +1011,7 @@ fn push_log(session: &mut ManagedSession, line: String) {
         session.logs.pop_front();
     }
     session.logs.push_back(line);
+    session.log_version = session.log_version.saturating_add(1);
 }
 
 fn command_display(command: &Command) -> String {
@@ -1298,6 +1313,7 @@ mod tests {
                 status,
                 child: None,
                 logs: VecDeque::new(),
+                log_version: 0,
                 exit_code: None,
             },
         );

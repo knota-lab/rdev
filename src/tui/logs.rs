@@ -22,6 +22,7 @@ enum LogStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenderLogRow {
     pub(super) plain: String,
+    pub(super) starts_log_line: bool,
     prefix: Option<StyledTextSegment>,
     segments: Vec<StyledTextSegment>,
 }
@@ -188,6 +189,7 @@ fn wrap_styled_line(
     if segments.iter().all(|segment| segment.text.is_empty()) {
         return vec![RenderLogRow {
             plain: String::new(),
+            starts_log_line: true,
             prefix,
             segments: Vec::new(),
         }];
@@ -196,6 +198,7 @@ fn wrap_styled_line(
     let mut rows = Vec::new();
     let mut current = RenderLogRow {
         plain: String::new(),
+        starts_log_line: true,
         prefix,
         segments: Vec::new(),
     };
@@ -207,6 +210,7 @@ fn wrap_styled_line(
                 rows.push(current);
                 current = RenderLogRow {
                     plain: String::new(),
+                    starts_log_line: false,
                     prefix: None,
                     segments: Vec::new(),
                 };

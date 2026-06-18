@@ -33,7 +33,7 @@ use crate::session::{
     SharedSessions,
 };
 use crate::sftp::SftpDeltaBackend;
-use crate::sync::{RsyncSyncBackend, SyncDeltaRequest};
+use crate::sync::{RsyncSyncBackend, SyncDeltaRequest, SyncRequest};
 use crate::sync_output::SyncOutput;
 use crate::up::{
     build_watcher, collect_event_changes, reconcile_existing_paths, resolve_local_root,
@@ -78,6 +78,9 @@ struct TuiModel {
     focused: usize,
     logs: Vec<UiLogLine>,
     sync_logs: Vec<UiLogLine>,
+    sync_log_version: u64,
+    focused_log_session: Option<u32>,
+    focused_log_version: u64,
     events: Vec<UiEvent>,
     input: String,
     input_cursor: usize,
@@ -86,6 +89,7 @@ struct TuiModel {
     history_draft: String,
     follow_logs: bool,
     log_scroll: u16,
+    log_max_scroll: u16,
     log_region: Option<LogRegion>,
     log_rows_cache: Option<LogRowsCache>,
     selection: Option<TextSelection>,
@@ -112,17 +116,27 @@ struct TuiSyncWorker {
 
 struct SyncJob {
     project_root: PathBuf,
-    changes: PendingChanges,
+    kind: SyncJobKind,
     cancel: Arc<AtomicBool>,
+}
+
+enum SyncJobKind {
+    Delta(PendingChanges),
+    Full { delete: bool },
 }
 
 enum SyncWorkerEvent {
     Output(String),
     Done {
-        changes: PendingChanges,
+        kind: SyncJobDoneKind,
         cancelled: bool,
         result: std::result::Result<String, String>,
     },
+}
+
+enum SyncJobDoneKind {
+    Delta(PendingChanges),
+    Full,
 }
 
 #[derive(Clone)]
@@ -187,7 +201,13 @@ impl UiEventLevel {
 struct LogRegion {
     content: Rect,
     first_row: usize,
-    rows: Vec<String>,
+    rows: Vec<LogRegionRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogRegionRow {
+    text: String,
+    starts_log_line: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,22 +236,32 @@ struct TerminalGuard {
 struct EventOutcome {
     quit: bool,
     dirty: bool,
+    skip_refresh_once: bool,
 }
 
 impl EventOutcome {
     const CLEAN: Self = Self {
         quit: false,
         dirty: false,
+        skip_refresh_once: false,
     };
 
     const DIRTY: Self = Self {
         quit: false,
         dirty: true,
+        skip_refresh_once: false,
     };
 
     const QUIT: Self = Self {
         quit: true,
         dirty: false,
+        skip_refresh_once: false,
+    };
+
+    const SCROLL: Self = Self {
+        quit: false,
+        dirty: true,
+        skip_refresh_once: true,
     };
 }
 
@@ -253,9 +283,14 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
     let mut guard = init_terminal()?;
     let mut model = TuiModel::new(config, request);
     let mut dirty = true;
+    let mut skip_refresh_once = false;
     loop {
         dirty |= sync.process_events(config, &mut model);
-        dirty |= model.refresh_sessions();
+        if skip_refresh_once {
+            skip_refresh_once = false;
+        } else {
+            dirty |= model.refresh_sessions();
+        }
         if dirty {
             guard
                 .terminal
@@ -277,6 +312,7 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
                 return Ok(());
             }
             dirty |= outcome.dirty;
+            skip_refresh_once |= outcome.skip_refresh_once;
         }
     }
 }
@@ -309,6 +345,9 @@ impl TuiModel {
                 UiLogLine::rdev("sync watcher started"),
                 UiLogLine::rdev("initial full sync is not run in TUI yet"),
             ],
+            sync_log_version: 1,
+            focused_log_session: None,
+            focused_log_version: 0,
             events: Vec::new(),
             input: String::new(),
             input_cursor: 0,
@@ -316,6 +355,7 @@ impl TuiModel {
             history_draft: String::new(),
             follow_logs: true,
             log_scroll: 0,
+            log_max_scroll: 0,
             log_region: None,
             log_rows_cache: None,
             selection: None,
@@ -376,39 +416,32 @@ impl TuiModel {
                 })
                 .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)))
         };
-        let mut logs = if let Some(session_id) = processes.get(focused).and_then(|p| p.session_id) {
-            snapshot
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .map(|session| {
-                    session
-                        .logs
-                        .iter()
-                        .map(|line| parse_log_line(line))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![UiLogLine::rdev("logs: <empty>")])
-        } else {
-            self.sync_logs.clone()
-        };
-        if logs.is_empty() {
-            logs.push(UiLogLine::rdev("logs: <empty>"));
-        }
         let focused_session = processes
             .get(focused)
             .and_then(|process| process.session_id);
+        let focused_log_version = focused_session
+            .and_then(|id| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+                    .map(|session| session.log_version)
+            })
+            .unwrap_or(0);
         let focused_was_sync = processes
             .get(focused)
             .is_some_and(|process| process.session_id.is_none());
         let focused_process_changed = self.focused != focused
             || previous_was_sync != focused_was_sync
             || previous_session != focused_session;
-        let logs_changed = self.logs != logs;
+        let next_logs = self.next_logs(focused_session, focused_log_version);
+        let logs_changed = next_logs.as_ref().is_some_and(|logs| self.logs != *logs);
         let dirty = focused_process_changed || self.processes != processes || logs_changed;
         self.focused = focused;
         self.processes = processes;
-        self.logs = logs;
+        if let Some(logs) = next_logs {
+            self.logs = logs;
+        }
         if focused_process_changed {
             self.selection = None;
             self.log_rows_cache = None;
@@ -416,6 +449,37 @@ impl TuiModel {
             self.log_rows_cache = None;
         }
         dirty
+    }
+
+    fn next_logs(
+        &mut self,
+        focused_session: Option<u32>,
+        focused_log_version: u64,
+    ) -> Option<Vec<UiLogLine>> {
+        let Some(session_id) = focused_session else {
+            if self.focused_log_session.is_none()
+                && self.focused_log_version == self.sync_log_version
+            {
+                return None;
+            }
+            self.focused_log_session = None;
+            self.focused_log_version = self.sync_log_version;
+            return Some(non_empty_logs(self.sync_logs.clone()));
+        };
+        if self.focused_log_session == Some(session_id)
+            && self.focused_log_version == focused_log_version
+        {
+            return None;
+        }
+        let logs = lock_sessions(self)
+            .and_then(|mut manager| manager.logs_snapshot(session_id))
+            .map(|(version, logs)| {
+                self.focused_log_session = Some(session_id);
+                self.focused_log_version = version;
+                non_empty_logs(logs.into_iter().map(|line| parse_log_line(&line)).collect())
+            })
+            .unwrap_or_else(|error| vec![UiLogLine::rdev(tui_error_message(&error))]);
+        Some(logs)
     }
 
     fn focused_process(&self) -> Option<&UiProcess> {
@@ -486,6 +550,7 @@ impl TuiModel {
     fn push_sync_log(&mut self, line: impl Into<String>) {
         let line = line.into();
         self.sync_logs.push(UiLogLine::rdev(line.clone()));
+        self.sync_log_version = self.sync_log_version.saturating_add(1);
         self.push_sync_event(line);
         if self.sync_logs.len() > 500 {
             let overflow = self.sync_logs.len() - 500;
@@ -666,7 +731,7 @@ impl TuiSyncRuntime {
             match event {
                 SyncWorkerEvent::Output(line) => model.push_sync_log(line),
                 SyncWorkerEvent::Done {
-                    changes,
+                    kind,
                     cancelled,
                     result,
                 } => {
@@ -674,7 +739,18 @@ impl TuiSyncRuntime {
                     self.worker.cancel = None;
                     match result {
                         Ok(message) => {
-                            self.synced_files.record(&changes, &self.local_root);
+                            match kind {
+                                SyncJobDoneKind::Delta(changes) => {
+                                    self.synced_files.record(&changes, &self.local_root);
+                                }
+                                SyncJobDoneKind::Full => {
+                                    self.synced_files.record_existing(&EventFilter {
+                                        local_root: &self.local_root,
+                                        watch_dirs: &config.sync.watch_dirs,
+                                        excludes: &config.sync.exclude,
+                                    });
+                                }
+                            }
                             model.push_sync_log(message);
                             model.sync_status = if self.pending.has_changes() {
                                 ProcessStatus::Running
@@ -743,7 +819,7 @@ impl TuiSyncRuntime {
         let cancel = Arc::new(AtomicBool::new(false));
         match self.worker.sender.send(SyncJob {
             project_root: self.local_root.clone(),
-            changes,
+            kind: SyncJobKind::Delta(changes),
             cancel: Arc::clone(&cancel),
         }) {
             Ok(()) => {
@@ -756,6 +832,32 @@ impl TuiSyncRuntime {
             }
         }
         true
+    }
+
+    fn start_full_sync(&mut self, config: &AppConfig, model: &mut TuiModel) {
+        if self.worker.in_flight {
+            model.push_warning("sync is already running");
+            return;
+        }
+        model.sync_status = ProcessStatus::Running;
+        model.push_sync_log("full sync requested");
+        let cancel = Arc::new(AtomicBool::new(false));
+        match self.worker.sender.send(SyncJob {
+            project_root: self.local_root.clone(),
+            kind: SyncJobKind::Full {
+                delete: config.sync.delete,
+            },
+            cancel: Arc::clone(&cancel),
+        }) {
+            Ok(()) => {
+                self.worker.in_flight = true;
+                self.worker.cancel = Some(cancel);
+            }
+            Err(error) => {
+                model.sync_status = ProcessStatus::Failed;
+                model.push_sync_log(format!("sync worker stopped: {error}"));
+            }
+        }
     }
 
     fn cancel_current(&mut self, model: &mut TuiModel) -> bool {
@@ -790,18 +892,40 @@ impl TuiSyncWorker {
                     }));
                 let backend = sync_backend(&config, &rsync_backend, &ssh_backend);
                 while let Ok(job) = job_receiver.recv() {
-                    let request = SyncDeltaRequest {
-                        project_root: job.project_root,
-                        uploads: job.changes.uploads.iter().cloned().collect(),
-                        deletes: job.changes.deletes.iter().cloned().collect(),
-                        cancelled: Some(Arc::clone(&job.cancel)),
+                    let (kind, result) = match job.kind {
+                        SyncJobKind::Delta(changes) => {
+                            let request = SyncDeltaRequest {
+                                project_root: job.project_root,
+                                uploads: changes.uploads.iter().cloned().collect(),
+                                deletes: changes.deletes.iter().cloned().collect(),
+                                cancelled: Some(Arc::clone(&job.cancel)),
+                            };
+                            (
+                                SyncJobDoneKind::Delta(changes),
+                                backend
+                                    .sync_delta(request)
+                                    .map(|report| report.format_text())
+                                    .map_err(|error| error.to_string()),
+                            )
+                        }
+                        SyncJobKind::Full { delete } => {
+                            let request = SyncRequest {
+                                dry_run: false,
+                                delete,
+                                project_root: job.project_root,
+                                cancelled: Some(Arc::clone(&job.cancel)),
+                            };
+                            (
+                                SyncJobDoneKind::Full,
+                                backend
+                                    .sync_full(request)
+                                    .map(|report| report.format_text())
+                                    .map_err(|error| error.to_string()),
+                            )
+                        }
                     };
-                    let result = backend
-                        .sync_delta(request)
-                        .map(|report| report.format_text())
-                        .map_err(|error| error.to_string());
                     let _send_result = event_sender.send(SyncWorkerEvent::Done {
-                        changes: job.changes,
+                        kind,
                         cancelled: job.cancel.load(Ordering::SeqCst),
                         result,
                     });
@@ -957,7 +1081,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
             Rect {
                 x: area.x.saturating_add(1),
                 y: area.y,
-                width: area.width.saturating_sub(1),
+                width: area.width.saturating_sub(2),
                 height: 1,
             },
         );
@@ -984,26 +1108,35 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, model: &mut TuiModel) {
         .as_ref()
         .map(|cache| cache.rows.as_slice())
         .unwrap_or(&[]);
-    let scroll = clamped_visual_log_scroll(all_rows.len(), content.height, model.log_scroll);
-    let rows = all_rows
-        .iter()
-        .skip(scroll as usize)
-        .take(content.height as usize)
-        .collect::<Vec<_>>();
+    model.log_max_scroll = max_visual_log_scroll(all_rows.len(), content.height);
+    if model.follow_logs {
+        model.log_scroll = model.log_max_scroll;
+    } else {
+        model.log_scroll = model.log_scroll.min(model.log_max_scroll);
+    }
+    let scroll = model.log_scroll as usize;
+    let visible_len = content.height as usize;
+    let visible_rows = all_rows.iter().skip(scroll).take(visible_len);
+    let mut region_rows = Vec::with_capacity(visible_len);
+    for (index, row) in visible_rows.enumerate() {
+        let absolute_row = scroll + index;
+        region_rows.push(LogRegionRow {
+            text: row.plain.clone(),
+            starts_log_line: row.starts_log_line,
+        });
+        let line = selected_line(row, absolute_row, model.selection);
+        frame.buffer_mut().set_line(
+            content.x,
+            content.y.saturating_add(index as u16),
+            &line,
+            content.width,
+        );
+    }
     model.log_region = Some(LogRegion {
         content,
-        first_row: scroll as usize,
-        rows: rows.iter().map(|row| row.plain.clone()).collect(),
+        first_row: scroll,
+        rows: region_rows,
     });
-    let lines = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let absolute_row = scroll as usize + index;
-            selected_line(row, absolute_row, model.selection)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), content);
 }
 
 fn draw_help_panel(frame: &mut Frame<'_>, area: Rect) {
@@ -1033,17 +1166,16 @@ fn log_content_area(area: Rect) -> Rect {
     Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(1),
-        height: area.height.saturating_sub(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     }
 }
 
-fn clamped_visual_log_scroll(row_count: usize, visible_rows: u16, scroll: u16) -> u16 {
+fn max_visual_log_scroll(row_count: usize, visible_rows: u16) -> u16 {
     if visible_rows == 0 {
         return 0;
     }
-    let max_scroll = (row_count as u16).saturating_sub(visible_rows);
-    scroll.min(max_scroll)
+    (row_count as u16).saturating_sub(visible_rows)
 }
 
 fn draw_process_panel(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
@@ -1362,21 +1494,22 @@ fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -
                 MouseEventKind::Up(MouseButton::Left) => false,
                 MouseEventKind::Down(MouseButton::Right) => copy_selection(model),
                 MouseEventKind::ScrollUp => {
-                    model.follow_logs = false;
-                    model.log_scroll = model.log_scroll.saturating_add(1);
-                    model.clamp_log_scroll();
+                    model.scroll_logs_up(3);
                     model.selection = None;
-                    true
+                    return EventOutcome::SCROLL;
                 }
                 MouseEventKind::ScrollDown => {
-                    model.log_scroll = model.log_scroll.saturating_sub(1);
-                    model.clamp_log_scroll();
+                    model.scroll_logs_down(3);
                     model.selection = None;
-                    true
+                    return EventOutcome::SCROLL;
                 }
                 _ => false,
             };
-            EventOutcome { quit: false, dirty }
+            EventOutcome {
+                quit: false,
+                dirty,
+                skip_refresh_once: false,
+            }
         }
         Event::Resize(_, _) => EventOutcome::DIRTY,
         _ => EventOutcome::CLEAN,
@@ -1423,7 +1556,7 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         }
         KeyCode::Delete => model.delete_input(),
         KeyCode::Enter => {
-            return if submit_input(model) {
+            return if submit_input(model, sync) {
                 EventOutcome::QUIT
             } else {
                 EventOutcome::DIRTY
@@ -1448,13 +1581,12 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         KeyCode::Right => model.move_input_right(),
         KeyCode::Tab => model.focus_next(),
         KeyCode::PageUp if model.input.is_empty() => {
-            model.follow_logs = false;
-            model.log_scroll = model.log_scroll.saturating_add(5);
-            model.clamp_log_scroll();
+            model.scroll_logs_up(10);
+            return EventOutcome::SCROLL;
         }
         KeyCode::PageDown if model.input.is_empty() => {
-            model.log_scroll = model.log_scroll.saturating_sub(5);
-            model.clamp_log_scroll();
+            model.scroll_logs_down(10);
+            return EventOutcome::SCROLL;
         }
         KeyCode::Home if !model.input.is_empty() => model.move_input_home(),
         KeyCode::End if !model.input.is_empty() => model.move_input_end(),
@@ -1472,10 +1604,20 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
 }
 
 impl TuiModel {
-    fn clamp_log_scroll(&mut self) {
+    fn scroll_logs_up(&mut self, amount: u16) {
+        if self.follow_logs {
+            self.log_scroll = self.log_max_scroll;
+        }
+        self.follow_logs = false;
+        self.log_scroll = self.log_scroll.saturating_sub(amount);
+    }
+
+    fn scroll_logs_down(&mut self, amount: u16) {
         self.log_scroll = self
             .log_scroll
-            .min(self.logs.len().saturating_sub(1) as u16);
+            .saturating_add(amount)
+            .min(self.log_max_scroll);
+        self.follow_logs = self.log_scroll >= self.log_max_scroll;
     }
 }
 
@@ -1486,13 +1628,21 @@ fn selection_pos(model: &TuiModel, x: u16, y: u16) -> Option<CellPos> {
     }
     let visible_row = y.saturating_sub(region.content.y) as usize;
     let row = region.first_row.saturating_add(visible_row);
-    let row_text = region.rows.get(visible_row)?;
-    let max_col = UnicodeWidthStr::width(row_text.as_str()) as u16;
-    let col = x
-        .saturating_sub(region.content.x)
-        .saturating_sub(LOG_PREFIX_WIDTH)
-        .min(max_col);
-    Some(CellPos { row, col })
+    let row = region.rows.get(visible_row).map(|line| CellPos {
+        row,
+        col: x
+            .saturating_sub(region.content.x)
+            .saturating_sub(LOG_PREFIX_WIDTH)
+            .min(UnicodeWidthStr::width(line.text.as_str()) as u16),
+    })?;
+    Some(row)
+}
+
+fn non_empty_logs(mut logs: Vec<UiLogLine>) -> Vec<UiLogLine> {
+    if logs.is_empty() {
+        logs.push(UiLogLine::rdev("logs: <empty>"));
+    }
+    logs
 }
 
 fn extends_selection(modifiers: KeyModifiers) -> bool {
@@ -1536,11 +1686,12 @@ fn selected_text(model: &TuiModel) -> Option<String> {
     let selection = model.selection?;
     let region = model.log_region.as_ref()?;
     let (start, end) = ordered_selection(selection);
-    let mut lines = Vec::new();
+    let mut selected = String::new();
     for row in start.row..=end.row {
         let visible_row = row.checked_sub(region.first_row)?;
-        let text = region.rows.get(visible_row)?;
-        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        let line = region.rows.get(visible_row)?;
+        let text = line.text.as_str();
+        let width = UnicodeWidthStr::width(text) as u16;
         let start_col = if row == start.row {
             start.col.min(width)
         } else {
@@ -1554,11 +1705,14 @@ fn selected_text(model: &TuiModel) -> Option<String> {
         if start_col > end_col {
             return None;
         }
+        if !selected.is_empty() && line.starts_log_line {
+            selected.push('\n');
+        }
         let start_index = byte_index_for_display_col(text, start_col);
         let end_index = byte_index_for_display_col(text, end_col);
-        lines.push(text[start_index..end_index].to_owned());
+        selected.push_str(&text[start_index..end_index]);
     }
-    Some(lines.join("\n"))
+    Some(selected)
 }
 
 fn ordered_selection(selection: TextSelection) -> (CellPos, CellPos) {
@@ -1581,14 +1735,14 @@ fn byte_index_for_display_col(text: &str, col: u16) -> usize {
     text.len()
 }
 
-fn submit_input(model: &mut TuiModel) -> bool {
+fn submit_input(model: &mut TuiModel, sync: &mut TuiSyncRuntime) -> bool {
     let command = model.input.trim().to_owned();
     model.clear_input();
     if command.is_empty() {
         return false;
     }
     model.push_command_history(&command);
-    execute_console_command(model, parse_console_command(&command))
+    execute_console_command(model, sync, parse_console_command(&command))
 }
 
 fn focus_by_digit(model: &mut TuiModel, digit: char) {
@@ -1609,7 +1763,11 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
     model.focus_manager_to_current();
 }
 
-fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> bool {
+fn execute_console_command(
+    model: &mut TuiModel,
+    sync: &mut TuiSyncRuntime,
+    command: ConsoleCommand,
+) -> bool {
     let result = match command {
         ConsoleCommand::Help => {
             model.help_visible = true;
@@ -1651,8 +1809,8 @@ fn execute_console_command(model: &mut TuiModel, command: ConsoleCommand) -> boo
             Ok(String::new())
         }
         ConsoleCommand::Sync => {
-            model.sync_status = ProcessStatus::Cancelled;
-            Ok("sync is not wired into TUI yet".to_owned())
+            sync.start_full_sync(&model.config.clone(), model);
+            Ok(String::new())
         }
         ConsoleCommand::Quit => {
             let running = lock_sessions(model)

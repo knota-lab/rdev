@@ -523,6 +523,29 @@ impl SyncedFiles {
             self.files.remove(delete);
         }
     }
+
+    pub(crate) fn record_existing(&mut self, filter: &EventFilter<'_>) {
+        self.files.clear();
+        for watch_dir in filter.watch_dirs {
+            let source = local_source(filter.local_root, watch_dir);
+            for entry in WalkDir::new(&source).into_iter().filter_entry(|entry| {
+                entry.path() == source || !is_sync_excluded(entry.path(), &source, filter.excludes)
+            }) {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let Ok(relative) = entry.path().strip_prefix(filter.local_root) else {
+                    continue;
+                };
+                if let Some(fingerprint) = file_fingerprint(entry.path()) {
+                    self.files.insert(relative.to_path_buf(), fingerprint);
+                }
+            }
+        }
+    }
 }
 
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
