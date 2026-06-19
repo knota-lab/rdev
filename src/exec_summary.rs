@@ -53,6 +53,14 @@ impl ExecSummaryRecorder {
         Ok(())
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+
     pub(crate) fn finish(mut self, exit_code: i32) -> Result<String> {
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);

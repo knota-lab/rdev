@@ -186,7 +186,7 @@ rdev exec --summary "cargo test"
 rdev exec --summary l2-session -- session_id=26
 ```
 
-摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。
+执行开始时会打印日志路径；长时间运行时会低频打印 captured bytes 心跳。摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。
 
 ## Backends
 

@@ -26,6 +26,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const FRAME_HEADER_LEN: usize = 4;
 const STREAM_BUFFER_LEN: usize = 16 * 1024;
+const SUMMARY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const PGID_MARKER: &str = "__RDEV_PGID=";
 const DAEMON_BIN_DIR: &str = "bin";
 
@@ -173,6 +174,14 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
     } else {
         None
     };
+    if let Some(recorder) = recorder.as_ref() {
+        eprintln!(
+            "[summary] capturing output to {}",
+            recorder.path().display()
+        );
+    }
+    let summary_started = Instant::now();
+    let mut last_summary_heartbeat = summary_started;
     let cancel_state = state.clone();
     let cancel_id = id.clone();
     ctrlc::set_handler(move || {
@@ -195,6 +204,11 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
             DaemonResponse::Stdout { data, .. } => {
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.record(&data)?;
+                    maybe_print_summary_heartbeat(
+                        recorder,
+                        summary_started,
+                        &mut last_summary_heartbeat,
+                    );
                 } else {
                     print!("{data}");
                     io::stdout().flush().map_err(|source| {
@@ -205,6 +219,11 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
             DaemonResponse::Stderr { data, .. } => {
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.record(&data)?;
+                    maybe_print_summary_heartbeat(
+                        recorder,
+                        summary_started,
+                        &mut last_summary_heartbeat,
+                    );
                 } else {
                     eprint!("{data}");
                     io::stderr().flush().map_err(|source| {
@@ -240,6 +259,23 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
             DaemonResponse::Status { .. } | DaemonResponse::Stopped => {}
         }
     }
+}
+
+fn maybe_print_summary_heartbeat(
+    recorder: &ExecSummaryRecorder,
+    started: Instant,
+    last_heartbeat: &mut Instant,
+) {
+    if last_heartbeat.elapsed() < SUMMARY_HEARTBEAT_INTERVAL {
+        return;
+    }
+    *last_heartbeat = Instant::now();
+    eprintln!(
+        "[summary] running elapsed={}s captured={} bytes log={}",
+        started.elapsed().as_secs(),
+        recorder.byte_count(),
+        recorder.path().display()
+    );
 }
 
 fn start_daemon(cwd: &Path) -> Result<String> {
