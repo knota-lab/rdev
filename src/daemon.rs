@@ -138,6 +138,7 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
     let cancel_state = state.clone();
     let cancel_id = id.clone();
     ctrlc::set_handler(move || {
+        eprintln!("[daemon] cancelling remote exec...");
         let _cancel_result = send_cancel(&cancel_state, &cancel_id);
     })
     .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
@@ -618,9 +619,9 @@ echo {PGID_MARKER}$child >&2
   while [ ! -e "$cancel_path" ]; do sleep 1; done
   if kill -0 "$child" 2>/dev/null || kill -0 -"$child" 2>/dev/null; then
     kill -INT -"$child" 2>/dev/null || kill -INT "$child" 2>/dev/null || true
-    sleep 2
+    sleep 1
     kill -TERM -"$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
-    sleep 2
+    sleep 1
     kill -KILL -"$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
   fi
 ) &
