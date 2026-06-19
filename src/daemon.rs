@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{DaemonArgs, DaemonCommand, ExecArgs};
 use crate::config::{AppConfig, CONFIG_DIR_NAME};
-use crate::error::{err, err_with_source, Result};
+use crate::error::{err, err_with_source, RdevError, Result};
 use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
 use crate::ssh::SshClient;
@@ -209,11 +209,12 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
 }
 
 fn start_daemon(cwd: &Path) -> Result<String> {
-    if let Ok(status) = daemon_status(cwd) {
-        return Ok(status);
+    if daemon_is_running(cwd) {
+        return daemon_status(cwd);
     }
     let exe = daemon_exe(cwd)?;
-    let mut command = ProcessCommand::new(exe);
+    let exe_display = exe.display().to_string();
+    let mut command = ProcessCommand::new(&exe);
     command
         .arg("daemon")
         .arg("serve")
@@ -223,9 +224,10 @@ fn start_daemon(cwd: &Path) -> Result<String> {
         .stderr(Stdio::null());
     #[cfg(windows)]
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
+    command.spawn().map_err(|source| {
+        err_with_source(error_info::DAEMON_FAILED, source)
+            .with_hint(format!("failed to start daemon executable: {exe_display}"))
+    })?;
 
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
@@ -235,6 +237,10 @@ fn start_daemon(cwd: &Path) -> Result<String> {
         thread::sleep(Duration::from_millis(100));
     }
     Err(err(error_info::DAEMON_FAILED).with_hint("daemon did not become ready in time"))
+}
+
+fn daemon_is_running(cwd: &Path) -> bool {
+    daemon_status_details(cwd).is_ok()
 }
 
 fn daemon_exe(cwd: &Path) -> Result<PathBuf> {
@@ -264,7 +270,7 @@ fn daemon_exe_name(current: &Path) -> &'static str {
     }) {
         "rdev-dev-daemon.exe"
     } else {
-        "rdev-installed-daemon.exe"
+        "rdev-daemon.exe"
     }
 }
 
@@ -292,7 +298,13 @@ fn ensure_daemon(cwd: &Path) -> Result<DaemonState> {
 }
 
 fn daemon_status(cwd: &Path) -> Result<String> {
-    let status = daemon_status_details(cwd)?;
+    let status = match daemon_status_details(cwd) {
+        Ok(status) => status,
+        Err(error) if is_daemon_not_running(&error) => {
+            return Ok("[daemon] not running".to_owned());
+        }
+        Err(error) => return Err(error),
+    };
     let pid = status.pid.unwrap_or(0);
     let remote = status.remote.unwrap_or_else(|| "<unknown>".to_owned());
     let addr = status.addr.unwrap_or_else(|| "<unknown>".to_owned());
@@ -301,6 +313,10 @@ fn daemon_status(cwd: &Path) -> Result<String> {
         "[daemon] pid={pid} remote={remote} addr={addr} busy={} active_job={job}",
         status.busy
     ))
+}
+
+fn is_daemon_not_running(error: &RdevError) -> bool {
+    error.info.code == error_info::DAEMON_NOT_RUNNING.code
 }
 
 fn daemon_status_details(cwd: &Path) -> Result<DaemonStatusSnapshot> {
@@ -966,7 +982,7 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::daemon_exe_name;
+    use super::{daemon_exe_name, daemon_is_running, daemon_status};
 
     #[test]
     fn daemon_exe_name_marks_target_build_as_dev_daemon() {
@@ -983,10 +999,45 @@ mod tests {
     }
 
     #[test]
-    fn daemon_exe_name_marks_non_target_binary_as_installed_daemon() {
+    fn daemon_exe_name_marks_non_target_binary_as_daemon() {
         assert_eq!(
             daemon_exe_name(Path::new(r"C:\Users\11989\.cargo\bin\rdev.exe")),
-            "rdev-installed-daemon.exe"
+            "rdev-daemon.exe"
         );
+    }
+
+    #[test]
+    fn daemon_status_reports_not_running_without_state_file() {
+        let root = std::env::temp_dir().join(format!(
+            "rdev-daemon-status-missing-state-{}",
+            std::process::id()
+        ));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            panic!("create dir: {error}");
+        }
+
+        let status = match daemon_status(&root) {
+            Ok(status) => status,
+            Err(error) => panic!("daemon status should be printable: {error}"),
+        };
+
+        assert_eq!(status, "[daemon] not running");
+        let _cleanup_after = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_state_is_not_running() {
+        let root = std::env::temp_dir().join(format!(
+            "rdev-daemon-running-missing-state-{}",
+            std::process::id()
+        ));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            panic!("create dir: {error}");
+        }
+
+        assert!(!daemon_is_running(&root));
+        let _cleanup_after = std::fs::remove_dir_all(&root);
     }
 }

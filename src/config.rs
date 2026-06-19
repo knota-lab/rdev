@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub remote: RemoteConfig,
     pub sync: SyncConfig,
     pub command: CommandConfig,
+    #[serde(default)]
+    pub commands: BTreeMap<String, CommandAliasConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +95,13 @@ pub struct CommandConfig {
     pub remote_env: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandAliasConfig {
+    pub command: String,
+    #[serde(default)]
+    pub dir: String,
+}
+
 impl AppConfig {
     pub fn path_in_dir(dir: &Path) -> PathBuf {
         dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME)
@@ -129,6 +138,7 @@ impl AppConfig {
             },
             sync: SyncConfig::default(),
             command: CommandConfig::default(),
+            commands: BTreeMap::new(),
         }
     }
 }
@@ -203,6 +213,10 @@ rsync_mode = "auto"
 [command]
 default_shell = "bash"
 remote_env = {}
+
+[commands.backend-lint]
+dir = "backend"
+command = "cargo clippy --all-features -- -D warnings"
 "#;
 
         let config = AppConfig::parse(raw);
@@ -217,6 +231,12 @@ remote_env = {}
         assert_eq!(config.sync.direction, SyncDirection::Push);
         assert_eq!(config.sync.delete_policy, DeletePolicy::Propagate);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
+        let alias = match config.commands.get("backend-lint") {
+            Some(alias) => alias,
+            None => panic!("alias should parse"),
+        };
+        assert_eq!(alias.dir, "backend");
+        assert_eq!(alias.command, "cargo clippy --all-features -- -D warnings");
     }
 
     #[test]
@@ -231,6 +251,7 @@ remote_env = {}
         assert_eq!(config.sync.full_sync_threshold, 32);
         assert_eq!(config.sync.backend, super::SyncBackendKind::Auto);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
+        assert!(config.commands.is_empty());
     }
 
     #[test]
