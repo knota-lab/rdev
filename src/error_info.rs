@@ -160,6 +160,14 @@ pub const DAEMON_PROTOCOL_ERROR: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Watch,
 };
 
+pub const DAEMON_EXEC_CANCELLED: ErrorInfo = ErrorInfo {
+    code: "daemon.exec_cancelled",
+    message_zh: "远程命令已取消",
+    message_en: "Remote command was cancelled",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Watch,
+};
+
 pub const WATCH_EVENT_FAILED: ErrorInfo = ErrorInfo {
     code: "watch.event_failed",
     message_zh: "文件监听事件处理失败",
