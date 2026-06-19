@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +22,7 @@ use std::os::windows::process::CommandExt;
 
 const DAEMON_FILE: &str = "daemon.json";
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const FRAME_HEADER_LEN: usize = 4;
 const STREAM_BUFFER_LEN: usize = 16 * 1024;
 const PGID_MARKER: &str = "__RDEV_PGID=";
@@ -122,6 +123,16 @@ struct RemoteCommand {
     cancel_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonStatusSnapshot {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub addr: Option<String>,
+    pub remote: Option<String>,
+    pub busy: bool,
+    pub active_job: Option<String>,
+}
+
 pub fn run_daemon_command(args: DaemonArgs, cwd: &Path) -> Result<String> {
     match args.command {
         DaemonCommand::Start => start_daemon(cwd),
@@ -129,6 +140,17 @@ pub fn run_daemon_command(args: DaemonArgs, cwd: &Path) -> Result<String> {
         DaemonCommand::Stop => stop_daemon(cwd),
         DaemonCommand::Serve => serve_daemon(cwd),
     }
+}
+
+pub fn daemon_status_snapshot(cwd: &Path) -> DaemonStatusSnapshot {
+    daemon_status_details(cwd).unwrap_or(DaemonStatusSnapshot {
+        running: false,
+        pid: None,
+        addr: None,
+        remote: None,
+        busy: false,
+        active_job: None,
+    })
 }
 
 pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
@@ -237,6 +259,18 @@ fn ensure_daemon(cwd: &Path) -> Result<DaemonState> {
 }
 
 fn daemon_status(cwd: &Path) -> Result<String> {
+    let status = daemon_status_details(cwd)?;
+    let pid = status.pid.unwrap_or(0);
+    let remote = status.remote.unwrap_or_else(|| "<unknown>".to_owned());
+    let addr = status.addr.unwrap_or_else(|| "<unknown>".to_owned());
+    let job = status.active_job.unwrap_or_else(|| "<none>".to_owned());
+    Ok(format!(
+        "[daemon] pid={pid} remote={remote} addr={addr} busy={} active_job={job}",
+        status.busy
+    ))
+}
+
+fn daemon_status_details(cwd: &Path) -> Result<DaemonStatusSnapshot> {
     let state = read_state(cwd)?;
     let mut stream = connect_state(&state)?;
     write_frame(
@@ -251,13 +285,14 @@ fn daemon_status(cwd: &Path) -> Result<String> {
             remote,
             busy,
             active_job,
-        } => {
-            let job = active_job.unwrap_or_else(|| "<none>".to_owned());
-            Ok(format!(
-                "[daemon] pid={pid} remote={remote} addr={} busy={busy} active_job={job}",
-                state.addr
-            ))
-        }
+        } => Ok(DaemonStatusSnapshot {
+            running: true,
+            pid: Some(pid),
+            addr: Some(state.addr),
+            remote: Some(remote),
+            busy,
+            active_job,
+        }),
         DaemonResponse::Error { code, message } => {
             Err(err(error_info::DAEMON_FAILED).with_hint(format!("{code}: {message}")))
         }
@@ -714,7 +749,15 @@ fn state_path(cwd: &Path) -> PathBuf {
 }
 
 fn connect_state(state: &DaemonState) -> Result<TcpStream> {
-    TcpStream::connect(&state.addr)
+    let addr = state
+        .addr
+        .to_socket_addrs()
+        .map_err(|source| err_with_source(error_info::DAEMON_NOT_RUNNING, source))?
+        .next()
+        .ok_or_else(|| {
+            err(error_info::DAEMON_NOT_RUNNING).with_hint("daemon address is invalid")
+        })?;
+    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|source| err_with_source(error_info::DAEMON_NOT_RUNNING, source))
 }
 

@@ -61,6 +61,9 @@ pub enum ConsoleCommand {
     },
     RestartFocused,
     Sync,
+    DaemonStart,
+    DaemonStatus,
+    DaemonStop,
     Quit,
     QuitForce,
     Empty,
@@ -702,6 +705,15 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
     if trimmed == "sync" {
         return ConsoleCommand::Sync;
     }
+    if trimmed == "daemon start" {
+        return ConsoleCommand::DaemonStart;
+    }
+    if trimmed == "daemon status" {
+        return ConsoleCommand::DaemonStatus;
+    }
+    if trimmed == "daemon stop" {
+        return ConsoleCommand::DaemonStop;
+    }
     if matches!(trimmed, "saved-sessions" | "saved sessions") {
         return ConsoleCommand::SavedSessions;
     }
@@ -766,6 +778,9 @@ pub fn help_text() -> &'static str {
      stop <name|id> | s          stop a session, or focused session with s\n\
      restart <name|id> | r       restart a session, or focused session with r\n\
      sync                        run full sync\n\
+     daemon start                start persistent SSH daemon for rdev exec\n\
+     daemon status               show daemon pid, remote, and active job\n\
+     daemon stop                 stop persistent SSH daemon\n\
      quit / quit!                exit, or force stop sessions and exit\n\
      Keys\n\
      Ctrl+1..9                   focus process by number\n\
@@ -1121,6 +1136,22 @@ mod tests {
     fn parses_focused_session_shorthands() {
         assert_eq!(parse_console_command("s"), ConsoleCommand::StopFocused);
         assert_eq!(parse_console_command("r"), ConsoleCommand::RestartFocused);
+    }
+
+    #[test]
+    fn parses_daemon_commands() {
+        assert_eq!(
+            parse_console_command("daemon start"),
+            ConsoleCommand::DaemonStart
+        );
+        assert_eq!(
+            parse_console_command("daemon status"),
+            ConsoleCommand::DaemonStatus
+        );
+        assert_eq!(
+            parse_console_command("daemon stop"),
+            ConsoleCommand::DaemonStop
+        );
     }
 
     #[test]

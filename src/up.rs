@@ -12,7 +12,9 @@ use std::thread;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::cli::{DaemonArgs, DaemonCommand};
 use crate::config::{AppConfig, SyncBackendKind};
+use crate::daemon::run_daemon_command;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
 use crate::path::is_sync_excluded;
@@ -450,6 +452,39 @@ fn handle_console_command(
                 }
                 Err(error) => return Err(error),
             }
+        }
+        ConsoleCommand::DaemonStart => {
+            println!(
+                "{}",
+                run_daemon_command(
+                    DaemonArgs {
+                        command: DaemonCommand::Start,
+                    },
+                    watch.local_root,
+                )?
+            );
+        }
+        ConsoleCommand::DaemonStatus => {
+            println!(
+                "{}",
+                run_daemon_command(
+                    DaemonArgs {
+                        command: DaemonCommand::Status,
+                    },
+                    watch.local_root,
+                )?
+            );
+        }
+        ConsoleCommand::DaemonStop => {
+            println!(
+                "{}",
+                run_daemon_command(
+                    DaemonArgs {
+                        command: DaemonCommand::Stop,
+                    },
+                    watch.local_root,
+                )?
+            );
         }
         ConsoleCommand::Quit => {
             let mut manager = lock_sessions_for_console(sessions)?;

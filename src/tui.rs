@@ -2,7 +2,7 @@ use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use notify::{RecursiveMode, Watcher};
 
+use crate::cli::{DaemonArgs, DaemonCommand};
 use crate::config::AppConfig;
+use crate::daemon::{daemon_status_snapshot, run_daemon_command, DaemonStatusSnapshot};
 use crate::error::{err, err_with_source, RdevError, Result};
 use crate::error_info;
 use crate::process::SystemProcessRunner;
@@ -55,10 +57,12 @@ const INPUT_PROMPT: &str = "rdev> ";
 const PROCESS_PANEL_MIN_WIDTH: u16 = 30;
 const PROCESS_PANEL_MAX_WIDTH: u16 = 48;
 const EVENT_POLL: Duration = Duration::from_millis(100);
+const DAEMON_STATUS_POLL: Duration = Duration::from_secs(1);
 const COMMAND_HISTORY_LIMIT: usize = 100;
 const BG_MAIN: Color = Color::Rgb(10, 10, 10);
 const BG_RAIL: Color = Color::Rgb(22, 22, 22);
 const BG_INPUT: Color = Color::Rgb(36, 36, 36);
+const ORANGE: Color = Color::Rgb(255, 165, 0);
 
 #[derive(Debug, Clone)]
 pub struct TuiRequest {
@@ -69,11 +73,14 @@ pub struct TuiRequest {
 #[derive(Debug)]
 struct TuiModel {
     config: AppConfig,
+    project_root: PathBuf,
     state: TuiStateStore,
     sessions: SharedSessions,
     project: String,
     remote: String,
     sync_status: ProcessStatus,
+    daemon_status: DaemonStatusSnapshot,
+    daemon_last_checked: Instant,
     processes: Vec<UiProcess>,
     focused: usize,
     logs: Vec<UiLogLine>,
@@ -87,6 +94,7 @@ struct TuiModel {
     command_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    command_status: Option<CommandStatus>,
     follow_logs: bool,
     log_scroll: u16,
     log_max_scroll: u16,
@@ -112,6 +120,45 @@ struct TuiSyncWorker {
     receiver: mpsc::Receiver<SyncWorkerEvent>,
     in_flight: bool,
     cancel: Option<Arc<AtomicBool>>,
+}
+
+struct TuiCommandRuntime {
+    sender: mpsc::Sender<CommandJob>,
+    receiver: mpsc::Receiver<CommandWorkerEvent>,
+    in_flight: bool,
+}
+
+struct TuiEventRuntime<'a> {
+    sync: &'a mut TuiSyncRuntime,
+    commands: &'a mut TuiCommandRuntime,
+}
+
+#[derive(Debug)]
+struct CommandStatus {
+    label: String,
+    started: Instant,
+}
+
+enum CommandJob {
+    StopSession { selector: String },
+    StopDaemon,
+    RestartDaemon,
+}
+
+impl CommandJob {
+    fn label(&self) -> String {
+        match self {
+            Self::StopSession { selector } => format!("stop {selector}"),
+            Self::StopDaemon => "daemon stop".to_owned(),
+            Self::RestartDaemon => "daemon restart".to_owned(),
+        }
+    }
+}
+
+struct CommandWorkerEvent {
+    label: String,
+    result: std::result::Result<String, String>,
+    refresh_daemon: bool,
 }
 
 struct SyncJob {
@@ -162,6 +209,13 @@ struct UiProcess {
     kind: String,
     status: ProcessStatus,
     command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedLogSource {
+    Sync,
+    Daemon,
+    Session { id: u32, version: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,14 +336,19 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
     let mut sync = TuiSyncRuntime::new(config, &request)?;
     let mut guard = init_terminal()?;
     let mut model = TuiModel::new(config, request);
+    let mut commands = TuiCommandRuntime::new(model.sessions.clone(), model.project_root.clone());
     let mut dirty = true;
     let mut skip_refresh_once = false;
     loop {
         dirty |= sync.process_events(config, &mut model);
+        dirty |= commands.process_events(&mut model);
         if skip_refresh_once {
             skip_refresh_once = false;
         } else {
             dirty |= model.refresh_sessions();
+        }
+        if model.command_status.is_some() {
+            dirty = true;
         }
         if dirty {
             guard
@@ -304,7 +363,11 @@ pub fn run_tui(config: &AppConfig, request: TuiRequest) -> Result<()> {
         {
             let event = event::read()
                 .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
-            let outcome = handle_event(&mut model, &mut sync, event);
+            let mut runtime = TuiEventRuntime {
+                sync: &mut sync,
+                commands: &mut commands,
+            };
+            let outcome = handle_event(&mut model, &mut runtime, event);
             if outcome.quit {
                 if let Ok(mut manager) = model.sessions.lock() {
                     manager.stop_all();
@@ -327,14 +390,18 @@ impl TuiModel {
             .to_owned();
         let remote = format!("{}:{}", config.remote.host, config.remote.path);
         let (state, state_event) = TuiStateStore::load(&request.project_root);
+        let sessions = SessionManager::shared(request.project_root.clone());
         let mut model = Self {
             config: config.clone(),
+            project_root: request.project_root.clone(),
             command_history: state.command_history().to_vec(),
             state,
-            sessions: SessionManager::shared(request.project_root),
+            sessions,
             project,
             remote,
             sync_status: ProcessStatus::Idle,
+            daemon_status: daemon_status_snapshot(&request.project_root),
+            daemon_last_checked: Instant::now(),
             processes: Vec::new(),
             focused: 0,
             logs: vec![
@@ -353,6 +420,7 @@ impl TuiModel {
             input_cursor: 0,
             history_index: None,
             history_draft: String::new(),
+            command_status: None,
             follow_logs: true,
             log_scroll: 0,
             log_max_scroll: 0,
@@ -371,31 +439,30 @@ impl TuiModel {
     }
 
     fn refresh_sessions(&mut self) -> bool {
+        if self.input.is_empty() && self.daemon_last_checked.elapsed() >= DAEMON_STATUS_POLL {
+            self.daemon_status = daemon_status_snapshot(&self.project_root);
+            self.daemon_last_checked = Instant::now();
+        }
         let previous_session = self
             .processes
             .get(self.focused)
             .and_then(|process| process.session_id);
-        let previous_was_sync = self
+        let previous_process_name = self
             .processes
             .get(self.focused)
-            .is_some_and(|process| process.session_id.is_none());
-        let snapshot = if let Ok(mut manager) = self.sessions.lock() {
-            Some(manager.snapshot())
-        } else {
-            None
+            .map(|process| process.name.clone());
+        let snapshot = {
+            match self.sessions.try_lock() {
+                Ok(mut manager) => Some(manager.snapshot()),
+                Err(TryLockError::WouldBlock) => return false,
+                Err(TryLockError::Poisoned(_)) => None,
+            }
         };
         let Some(snapshot) = snapshot else {
             self.push_error("session manager unavailable");
             return true;
         };
-        let mut processes = vec![UiProcess {
-            id: 0,
-            session_id: None,
-            name: "sync".to_owned(),
-            kind: "watcher".to_owned(),
-            status: self.sync_status,
-            command: "file watcher".to_owned(),
-        }];
+        let mut processes = vec![self.sync_process(), self.daemon_process()];
         processes.extend(snapshot.sessions.iter().map(|session| UiProcess {
             id: session.id,
             session_id: Some(session.id),
@@ -404,8 +471,15 @@ impl TuiModel {
             status: ProcessStatus::from_session(session.status.as_str(), session.exit_code),
             command: session.command.clone(),
         }));
-        let focused = if previous_was_sync {
-            0
+        let focused = if previous_session.is_none() {
+            previous_process_name
+                .as_ref()
+                .and_then(|name| {
+                    processes
+                        .iter()
+                        .position(|process| process.name.as_str() == name.as_str())
+                })
+                .unwrap_or_else(|| self.focused.min(processes.len().saturating_sub(1)))
         } else {
             let focused_session = previous_session.or(snapshot.focused);
             focused_session
@@ -428,13 +502,19 @@ impl TuiModel {
                     .map(|session| session.log_version)
             })
             .unwrap_or(0);
-        let focused_was_sync = processes
-            .get(focused)
-            .is_some_and(|process| process.session_id.is_none());
+        let focused_process_name = processes.get(focused).map(|process| process.name.clone());
         let focused_process_changed = self.focused != focused
-            || previous_was_sync != focused_was_sync
+            || previous_process_name.as_deref() != focused_process_name.as_deref()
             || previous_session != focused_session;
-        let next_logs = self.next_logs(focused_session, focused_log_version);
+        let log_source = match focused_session {
+            Some(id) => FocusedLogSource::Session {
+                id,
+                version: focused_log_version,
+            },
+            None if focused_process_name.as_deref() == Some("daemon") => FocusedLogSource::Daemon,
+            None => FocusedLogSource::Sync,
+        };
+        let next_logs = self.next_logs(log_source);
         let logs_changed = next_logs.as_ref().is_some_and(|logs| self.logs != *logs);
         let dirty = focused_process_changed || self.processes != processes || logs_changed;
         self.focused = focused;
@@ -451,35 +531,100 @@ impl TuiModel {
         dirty
     }
 
-    fn next_logs(
-        &mut self,
-        focused_session: Option<u32>,
-        focused_log_version: u64,
-    ) -> Option<Vec<UiLogLine>> {
-        let Some(session_id) = focused_session else {
-            if self.focused_log_session.is_none()
-                && self.focused_log_version == self.sync_log_version
-            {
-                return None;
-            }
-            self.focused_log_session = None;
-            self.focused_log_version = self.sync_log_version;
-            return Some(non_empty_logs(self.sync_logs.clone()));
-        };
-        if self.focused_log_session == Some(session_id)
-            && self.focused_log_version == focused_log_version
-        {
-            return None;
+    fn sync_process(&self) -> UiProcess {
+        UiProcess {
+            id: 0,
+            session_id: None,
+            name: "sync".to_owned(),
+            kind: "watcher".to_owned(),
+            status: self.sync_status,
+            command: "file watcher".to_owned(),
         }
-        let logs = lock_sessions(self)
-            .and_then(|mut manager| manager.logs_snapshot(session_id))
-            .map(|(version, logs)| {
-                self.focused_log_session = Some(session_id);
-                self.focused_log_version = version;
-                non_empty_logs(logs.into_iter().map(|line| parse_log_line(&line)).collect())
-            })
-            .unwrap_or_else(|error| vec![UiLogLine::rdev(tui_error_message(&error))]);
-        Some(logs)
+    }
+
+    fn daemon_process(&self) -> UiProcess {
+        let status = if self.daemon_status.running {
+            if self.daemon_status.busy {
+                ProcessStatus::Running
+            } else {
+                ProcessStatus::Idle
+            }
+        } else {
+            ProcessStatus::Stopped
+        };
+        let command = if let Some(active_job) = &self.daemon_status.active_job {
+            format!("persistent ssh daemon; active={active_job}")
+        } else if let Some(addr) = &self.daemon_status.addr {
+            format!("persistent ssh daemon; addr={addr}")
+        } else {
+            "persistent ssh daemon".to_owned()
+        };
+        UiProcess {
+            id: self.daemon_status.pid.unwrap_or(0),
+            session_id: None,
+            name: "daemon".to_owned(),
+            kind: "ssh".to_owned(),
+            status,
+            command,
+        }
+    }
+
+    fn next_logs(&mut self, source: FocusedLogSource) -> Option<Vec<UiLogLine>> {
+        match source {
+            FocusedLogSource::Daemon => {
+                self.focused_log_session = None;
+                self.focused_log_version = 0;
+                Some(self.daemon_logs())
+            }
+            FocusedLogSource::Sync => {
+                if self.focused_log_session.is_none()
+                    && self.focused_log_version == self.sync_log_version
+                {
+                    return None;
+                }
+                self.focused_log_session = None;
+                self.focused_log_version = self.sync_log_version;
+                Some(non_empty_logs(self.sync_logs.clone()))
+            }
+            FocusedLogSource::Session { id, version } => {
+                if self.focused_log_session == Some(id) && self.focused_log_version == version {
+                    return None;
+                }
+                let logs = lock_sessions(self)
+                    .and_then(|mut manager| manager.logs_snapshot(id))
+                    .map(|(version, logs)| {
+                        self.focused_log_session = Some(id);
+                        self.focused_log_version = version;
+                        non_empty_logs(logs.into_iter().map(|line| parse_log_line(&line)).collect())
+                    })
+                    .unwrap_or_else(|error| vec![UiLogLine::rdev(tui_error_message(&error))]);
+                Some(logs)
+            }
+        }
+    }
+
+    fn daemon_logs(&self) -> Vec<UiLogLine> {
+        if !self.daemon_status.running {
+            return vec![UiLogLine::rdev(
+                "daemon is stopped; run daemon start to enable persistent rdev exec",
+            )];
+        }
+        let mut lines = vec![UiLogLine::rdev("daemon is running")];
+        if let Some(pid) = self.daemon_status.pid {
+            lines.push(UiLogLine::rdev(format!("pid={pid}")));
+        }
+        if let Some(addr) = &self.daemon_status.addr {
+            lines.push(UiLogLine::rdev(format!("addr={addr}")));
+        }
+        if let Some(remote) = &self.daemon_status.remote {
+            lines.push(UiLogLine::rdev(format!("remote={remote}")));
+        }
+        lines.push(UiLogLine::rdev(format!("busy={}", self.daemon_status.busy)));
+        lines.push(UiLogLine::rdev(format!(
+            "active_job={}",
+            self.daemon_status.active_job.as_deref().unwrap_or("<none>")
+        )));
+        lines
     }
 
     fn focused_process(&self) -> Option<&UiProcess> {
@@ -937,6 +1082,106 @@ impl TuiSyncWorker {
             receiver: event_receiver,
             in_flight: false,
             cancel: None,
+        }
+    }
+}
+
+impl TuiCommandRuntime {
+    fn new(sessions: SharedSessions, project_root: PathBuf) -> Self {
+        let (job_sender, job_receiver) = mpsc::channel::<CommandJob>();
+        let (event_sender, event_receiver) = mpsc::channel::<CommandWorkerEvent>();
+        thread::spawn(move || {
+            while let Ok(job) = job_receiver.recv() {
+                let (label, refresh_daemon, result) = match job {
+                    CommandJob::StopSession { selector } => {
+                        let result = sessions
+                            .lock()
+                            .map_err(|_| "session manager poisoned".to_owned())
+                            .and_then(|mut manager| {
+                                manager.stop(&selector).map_err(|error| error.to_string())
+                            });
+                        (format!("stop {selector}"), false, result)
+                    }
+                    CommandJob::StopDaemon => {
+                        let result = run_daemon_command(
+                            DaemonArgs {
+                                command: DaemonCommand::Stop,
+                            },
+                            &project_root,
+                        )
+                        .map_err(|error| error.to_string());
+                        ("daemon stop".to_owned(), true, result)
+                    }
+                    CommandJob::RestartDaemon => {
+                        let _stop_result = run_daemon_command(
+                            DaemonArgs {
+                                command: DaemonCommand::Stop,
+                            },
+                            &project_root,
+                        );
+                        let result = run_daemon_command(
+                            DaemonArgs {
+                                command: DaemonCommand::Start,
+                            },
+                            &project_root,
+                        )
+                        .map_err(|error| error.to_string());
+                        ("daemon restart".to_owned(), true, result)
+                    }
+                };
+                let _send_result = event_sender.send(CommandWorkerEvent {
+                    label,
+                    result,
+                    refresh_daemon,
+                });
+            }
+        });
+        Self {
+            sender: job_sender,
+            receiver: event_receiver,
+            in_flight: false,
+        }
+    }
+
+    fn process_events(&mut self, model: &mut TuiModel) -> bool {
+        let mut dirty = false;
+        while let Ok(event) = self.receiver.try_recv() {
+            self.in_flight = false;
+            model.command_status = None;
+            if event.refresh_daemon {
+                model.daemon_status = daemon_status_snapshot(&model.project_root);
+                model.daemon_last_checked = Instant::now();
+            }
+            match event.result {
+                Ok(message) => {
+                    for line in message.lines().filter(|line| !line.is_empty()) {
+                        model.push_success(line.to_owned());
+                    }
+                }
+                Err(error) => model.push_error(format!("{} failed: {error}", event.label)),
+            }
+            model.refresh_sessions();
+            dirty = true;
+        }
+        dirty
+    }
+
+    fn start(&mut self, model: &mut TuiModel, job: CommandJob) {
+        let label = job.label();
+        if self.in_flight {
+            model.push_warning("another command is still running");
+            return;
+        }
+        match self.sender.send(job) {
+            Ok(()) => {
+                self.in_flight = true;
+                model.command_status = Some(CommandStatus {
+                    label: label.clone(),
+                    started: Instant::now(),
+                });
+                model.push_event(format!("{label} started"));
+            }
+            Err(error) => model.push_error(format!("command worker stopped: {error}")),
         }
     }
 }
@@ -1412,15 +1657,20 @@ fn event_history_line(event: &UiEvent) -> Line<'static> {
 fn draw_input(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     let input_area = input_text_area(area);
     frame.render_widget(Block::default().style(Style::default().bg(BG_INPUT)), area);
-    let line = Line::from(vec![
-        Span::styled(
-            INPUT_PROMPT,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+    let (prompt, prompt_style) = input_prompt(model);
+    let mut spans = vec![
+        Span::styled(prompt, prompt_style.add_modifier(Modifier::BOLD)),
         Span::styled(model.input.as_str(), Style::default().fg(Color::White)),
-    ]);
+    ];
+    if model.input.is_empty() {
+        if let Some(status) = &model.command_status {
+            spans.push(Span::styled(
+                format!("{}...", status.label),
+                Style::default().fg(ORANGE),
+            ));
+        }
+    }
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), input_area);
 }
 
@@ -1429,11 +1679,24 @@ fn set_input_cursor(frame: &mut Frame<'_>, area: Rect, model: &TuiModel) {
     if input_area.height == 0 || input_area.width == 0 {
         return;
     }
-    let prompt_width = UnicodeWidthStr::width(INPUT_PROMPT) as u16;
+    let (prompt, _) = input_prompt(model);
+    let prompt_width = UnicodeWidthStr::width(prompt.as_str()) as u16;
     let input_width = UnicodeWidthStr::width(&model.input[..model.input_cursor]) as u16;
     let max_x = input_area.width.saturating_sub(1);
     let cursor_x = prompt_width.saturating_add(input_width).min(max_x);
     frame.set_cursor(input_area.x.saturating_add(cursor_x), input_area.y);
+}
+
+fn input_prompt(model: &TuiModel) -> (String, Style) {
+    let Some(status) = &model.command_status else {
+        return (INPUT_PROMPT.to_owned(), Style::default().fg(Color::Cyan));
+    };
+    let frames = ['|', '/', '-', '\\'];
+    let index = (status.started.elapsed().as_millis() / 120) as usize % frames.len();
+    (
+        format!("rdev{} ", frames[index]),
+        Style::default().fg(ORANGE),
+    )
 }
 
 fn input_text_area(area: Rect) -> Rect {
@@ -1449,9 +1712,13 @@ fn input_text_area(area: Rect) -> Rect {
     }
 }
 
-fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -> EventOutcome {
+fn handle_event(
+    model: &mut TuiModel,
+    runtime: &mut TuiEventRuntime<'_>,
+    event: Event,
+) -> EventOutcome {
     match event {
-        Event::Key(key) => handle_key(model, sync, key),
+        Event::Key(key) => handle_key(model, runtime, key),
         Event::Paste(text) => {
             model.insert_text(&text);
             EventOutcome::DIRTY
@@ -1516,7 +1783,11 @@ fn handle_event(model: &mut TuiModel, sync: &mut TuiSyncRuntime, event: Event) -
     }
 }
 
-fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) -> EventOutcome {
+fn handle_key(
+    model: &mut TuiModel,
+    runtime: &mut TuiEventRuntime<'_>,
+    key: KeyEvent,
+) -> EventOutcome {
     if key.kind != KeyEventKind::Press {
         return EventOutcome::CLEAN;
     }
@@ -1524,7 +1795,7 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         if copy_selection(model) {
             return EventOutcome::DIRTY;
         }
-        if focused_process_is_sync(model) && sync.cancel_current(model) {
+        if focused_process_is_sync(model) && runtime.sync.cancel_current(model) {
             return EventOutcome::DIRTY;
         }
         if focused_process_is_sync(model) {
@@ -1556,7 +1827,7 @@ fn handle_key(model: &mut TuiModel, sync: &mut TuiSyncRuntime, key: KeyEvent) ->
         }
         KeyCode::Delete => model.delete_input(),
         KeyCode::Enter => {
-            return if submit_input(model, sync) {
+            return if submit_input(model, runtime) {
                 EventOutcome::QUIT
             } else {
                 EventOutcome::DIRTY
@@ -1735,14 +2006,14 @@ fn byte_index_for_display_col(text: &str, col: u16) -> usize {
     text.len()
 }
 
-fn submit_input(model: &mut TuiModel, sync: &mut TuiSyncRuntime) -> bool {
+fn submit_input(model: &mut TuiModel, runtime: &mut TuiEventRuntime<'_>) -> bool {
     let command = model.input.trim().to_owned();
     model.clear_input();
     if command.is_empty() {
         return false;
     }
     model.push_command_history(&command);
-    execute_console_command(model, sync, parse_console_command(&command))
+    execute_console_command(model, runtime, parse_console_command(&command))
 }
 
 fn focus_by_digit(model: &mut TuiModel, digit: char) {
@@ -1765,7 +2036,7 @@ fn focus_by_digit(model: &mut TuiModel, digit: char) {
 
 fn execute_console_command(
     model: &mut TuiModel,
-    sync: &mut TuiSyncRuntime,
+    runtime: &mut TuiEventRuntime<'_>,
     command: ConsoleCommand,
 ) -> bool {
     let result = match command {
@@ -1797,19 +2068,28 @@ fn execute_console_command(
             lock_sessions(model).and_then(|mut manager| manager.focus(&selector))
         }
         ConsoleCommand::Stop { selector } => {
-            lock_sessions(model).and_then(|mut manager| manager.stop(&selector))
+            runtime
+                .commands
+                .start(model, CommandJob::StopSession { selector });
+            Ok(String::new())
         }
         ConsoleCommand::StopFocused => {
-            stop_focused(model);
+            stop_focused(model, runtime.commands);
             Ok(String::new())
         }
         ConsoleCommand::Restart { selector } => SessionManager::restart(&model.sessions, &selector),
         ConsoleCommand::RestartFocused => {
-            restart_focused(model);
+            restart_focused(model, runtime.commands);
             Ok(String::new())
         }
         ConsoleCommand::Sync => {
-            sync.start_full_sync(&model.config.clone(), model);
+            runtime.sync.start_full_sync(&model.config.clone(), model);
+            Ok(String::new())
+        }
+        ConsoleCommand::DaemonStart => run_tui_daemon_command(model, DaemonCommand::Start),
+        ConsoleCommand::DaemonStatus => run_tui_daemon_command(model, DaemonCommand::Status),
+        ConsoleCommand::DaemonStop => {
+            runtime.commands.start(model, CommandJob::StopDaemon);
             Ok(String::new())
         }
         ConsoleCommand::Quit => {
@@ -1906,17 +2186,30 @@ fn start_and_remember_remote(
     Ok(message)
 }
 
-fn stop_focused(model: &mut TuiModel) {
+fn run_tui_daemon_command(model: &mut TuiModel, command: DaemonCommand) -> Result<String> {
+    let result = run_daemon_command(DaemonArgs { command }, &model.project_root);
+    model.daemon_status = daemon_status_snapshot(&model.project_root);
+    model.daemon_last_checked = Instant::now();
+    result
+}
+
+fn stop_focused(model: &mut TuiModel, commands: &mut TuiCommandRuntime) {
+    if focused_process_is_daemon(model) {
+        commands.start(model, CommandJob::StopDaemon);
+        return;
+    }
     let Some(selector) = focused_session_selector(model) else {
         model.push_warning("sync watcher cannot be stopped in TUI yet");
         return;
     };
-    let result = lock_sessions(model).and_then(|mut manager| manager.stop(&selector));
-    push_result_event(model, result);
-    model.refresh_sessions();
+    commands.start(model, CommandJob::StopSession { selector });
 }
 
-fn restart_focused(model: &mut TuiModel) {
+fn restart_focused(model: &mut TuiModel, commands: &mut TuiCommandRuntime) {
+    if focused_process_is_daemon(model) {
+        commands.start(model, CommandJob::RestartDaemon);
+        return;
+    }
     let Some(selector) = focused_session_selector(model) else {
         model.push_warning("sync watcher cannot be restarted in TUI yet");
         return;
@@ -1938,7 +2231,22 @@ fn focused_process_is_sync(model: &TuiModel) -> bool {
     model
         .processes
         .get(model.focused)
-        .is_some_and(|process| process.session_id.is_none())
+        .is_some_and(process_is_sync)
+}
+
+fn focused_process_is_daemon(model: &TuiModel) -> bool {
+    model
+        .processes
+        .get(model.focused)
+        .is_some_and(process_is_daemon)
+}
+
+fn process_is_sync(process: &UiProcess) -> bool {
+    process.session_id.is_none() && process.name == "sync" && process.kind == "watcher"
+}
+
+fn process_is_daemon(process: &UiProcess) -> bool {
+    process.session_id.is_none() && process.name == "daemon" && process.kind == "ssh"
 }
 
 fn lock_sessions(
