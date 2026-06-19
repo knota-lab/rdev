@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,10 +17,19 @@ use crate::error_info;
 use crate::path::{RelativePath, RemotePath};
 use crate::ssh::SshClient;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const DAEMON_FILE: &str = "daemon.json";
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_HEADER_LEN: usize = 4;
 const STREAM_BUFFER_LEN: usize = 16 * 1024;
+const PGID_MARKER: &str = "__RDEV_PGID=";
+
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonState {
@@ -46,6 +56,10 @@ enum DaemonRequest {
         command: String,
         dir: Option<String>,
     },
+    Cancel {
+        token: String,
+        id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +69,7 @@ enum DaemonResponse {
         pid: u32,
         remote: String,
         busy: bool,
+        active_job: Option<String>,
     },
     Stopped,
     Stdout {
@@ -78,15 +93,33 @@ enum DaemonResponse {
 struct DaemonRuntime {
     config: AppConfig,
     state: DaemonState,
-    ssh: SshClient,
-    busy: bool,
+    ssh: Option<SshClient>,
+    active_job: Option<ActiveJob>,
     shutdown: bool,
+}
+
+struct ActiveJob {
+    id: String,
+    cancel: Arc<AtomicBool>,
 }
 
 struct ExecRequest {
     id: String,
     command: String,
     dir: Option<String>,
+}
+
+struct StreamContext<'a> {
+    config: &'a AppConfig,
+    ssh: &'a mut SshClient,
+    stream: &'a mut TcpStream,
+    request: &'a ExecRequest,
+    cancel: Arc<AtomicBool>,
+}
+
+struct RemoteCommand {
+    command: String,
+    cancel_path: String,
 }
 
 pub fn run_daemon_command(args: DaemonArgs, cwd: &Path) -> Result<String> {
@@ -102,6 +135,12 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
     let state = ensure_daemon(cwd)?;
     let mut stream = connect_state(&state)?;
     let id = format!("exec-{}", std::process::id());
+    let cancel_state = state.clone();
+    let cancel_id = id.clone();
+    ctrlc::set_handler(move || {
+        let _cancel_result = send_cancel(&cancel_state, &cancel_id);
+    })
+    .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
     write_frame(
         &mut stream,
         &DaemonRequest::ExecStart {
@@ -130,6 +169,9 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
                 if code == 0 {
                     return Ok(String::new());
                 }
+                if code == 130 {
+                    return Err(err(error_info::DAEMON_FAILED).with_hint("exec cancelled"));
+                }
                 return Err(err(error_info::REMOTE_COMMAND_FAILED).with_exit_code(Some(code)));
             }
             DaemonResponse::Error { code, message } => {
@@ -146,13 +188,17 @@ fn start_daemon(cwd: &Path) -> Result<String> {
     }
     let exe = std::env::current_exe()
         .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
-    ProcessCommand::new(exe)
+    let mut command = ProcessCommand::new(exe);
+    command
         .arg("daemon")
         .arg("serve")
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    command
         .spawn()
         .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
 
@@ -175,7 +221,10 @@ fn ensure_daemon(cwd: &Path) -> Result<DaemonState> {
                 token: state.token.clone(),
             },
         )?;
-        let _: DaemonResponse = read_frame(&mut stream)?;
+        let response: DaemonResponse = read_frame(&mut stream)?;
+        if matches!(response, DaemonResponse::Error { .. }) {
+            return Err(err(error_info::DAEMON_NOT_RUNNING));
+        }
         Ok(state)
     }) {
         Ok(state) => Ok(state),
@@ -196,10 +245,18 @@ fn daemon_status(cwd: &Path) -> Result<String> {
         },
     )?;
     match read_frame(&mut stream)? {
-        DaemonResponse::Status { pid, remote, busy } => Ok(format!(
-            "[daemon] pid={pid} remote={remote} addr={} busy={busy}",
-            state.addr
-        )),
+        DaemonResponse::Status {
+            pid,
+            remote,
+            busy,
+            active_job,
+        } => {
+            let job = active_job.unwrap_or_else(|| "<none>".to_owned());
+            Ok(format!(
+                "[daemon] pid={pid} remote={remote} addr={} busy={busy} active_job={job}",
+                state.addr
+            ))
+        }
         DaemonResponse::Error { code, message } => {
             Err(err(error_info::DAEMON_FAILED).with_hint(format!("{code}: {message}")))
         }
@@ -220,7 +277,19 @@ fn stop_daemon(cwd: &Path) -> Result<String> {
     }
 }
 
+fn send_cancel(state: &DaemonState, id: &str) -> Result<()> {
+    let mut stream = connect_state(state)?;
+    write_frame(
+        &mut stream,
+        &DaemonRequest::Cancel {
+            token: state.token.clone(),
+            id: id.to_owned(),
+        },
+    )
+}
+
 fn serve_daemon(cwd: &Path) -> Result<String> {
+    let _ignore_ctrl_c = ctrlc::set_handler(|| {});
     let config = AppConfig::load_from_dir(cwd)?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
@@ -243,8 +312,8 @@ fn serve_daemon(cwd: &Path) -> Result<String> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime {
         config,
         state,
-        ssh,
-        busy: false,
+        ssh: Some(ssh),
+        active_job: None,
         shutdown: false,
     }));
 
@@ -302,7 +371,8 @@ fn handle_client(runtime: Arc<Mutex<DaemonRuntime>>, mut stream: TcpStream) -> R
                 &DaemonResponse::Status {
                     pid: guard.state.pid,
                     remote: guard.state.remote.clone(),
-                    busy: guard.busy,
+                    busy: guard.active_job.is_some(),
+                    active_job: guard.active_job.as_ref().map(|job| job.id.clone()),
                 },
             )
         }
@@ -328,6 +398,17 @@ fn handle_client(runtime: Arc<Mutex<DaemonRuntime>>, mut stream: TcpStream) -> R
             }
             Ok(())
         }
+        DaemonRequest::Cancel { id, .. } => {
+            let guard = runtime
+                .lock()
+                .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
+            if let Some(job) = &guard.active_job {
+                if job.id == id {
+                    job.cancel.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -336,54 +417,91 @@ fn exec_request(
     stream: &mut TcpStream,
     request: ExecRequest,
 ) -> Result<()> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = runtime
+            .lock()
+            .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
+        if guard.active_job.is_some() {
+            write_frame(
+                stream,
+                &DaemonResponse::Error {
+                    code: error_info::DAEMON_BUSY.code.to_owned(),
+                    message: "another exec is running".to_owned(),
+                },
+            )?;
+            return Ok(());
+        }
+        if guard.ssh.is_none() {
+            write_frame(
+                stream,
+                &DaemonResponse::Error {
+                    code: error_info::DAEMON_BUSY.code.to_owned(),
+                    message: "ssh connection is busy".to_owned(),
+                },
+            )?;
+            return Ok(());
+        }
+        guard.active_job = Some(ActiveJob {
+            id: request.id.clone(),
+            cancel: Arc::clone(&cancel),
+        });
+    }
+    let (config, mut ssh) = {
+        let mut guard = runtime
+            .lock()
+            .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
+        let Some(ssh) = guard.ssh.take() else {
+            return Err(err(error_info::DAEMON_BUSY).with_hint("ssh connection is busy"));
+        };
+        (guard.config.clone(), ssh)
+    };
+    let result = stream_remote_command(StreamContext {
+        config: &config,
+        ssh: &mut ssh,
+        stream,
+        request: &request,
+        cancel: Arc::clone(&cancel),
+    });
     let mut guard = runtime
         .lock()
         .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
-    if guard.busy {
-        write_frame(
-            stream,
-            &DaemonResponse::Error {
-                code: error_info::DAEMON_BUSY.code.to_owned(),
-                message: "another exec is running".to_owned(),
-            },
-        )?;
-        return Ok(());
-    }
-    guard.busy = true;
-    let result = stream_remote_command(&mut guard, stream, &request);
-    guard.busy = false;
+    guard.ssh = Some(ssh);
+    guard.active_job = None;
     result
 }
 
-fn stream_remote_command(
-    runtime: &mut DaemonRuntime,
-    stream: &mut TcpStream,
-    request: &ExecRequest,
-) -> Result<()> {
-    let remote_command =
-        build_remote_command(&runtime.config, &request.command, request.dir.as_deref())?;
-    let session = runtime.ssh.session_mut();
+fn stream_remote_command(context: StreamContext<'_>) -> Result<()> {
+    let remote = build_remote_command(context.config, context.request)?;
+    let session = context.ssh.session_mut();
     session.set_blocking(true);
     let mut channel = session
         .channel_session()
         .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
     channel
-        .exec(&remote_command)
+        .exec(&remote.command)
         .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
     session.set_blocking(false);
 
     let mut stdout = vec![0_u8; STREAM_BUFFER_LEN];
     let mut stderr = vec![0_u8; STREAM_BUFFER_LEN];
+    let mut stderr_tail = String::new();
+    let mut pgid: Option<String> = None;
+    let mut cancel_sent = false;
     loop {
+        if context.cancel.load(Ordering::SeqCst) && !cancel_sent {
+            cancel_sent = true;
+            let _cancel = write_remote_cancel_file(session, &remote.cancel_path);
+        }
         let mut progressed = false;
         match channel.read(&mut stdout) {
             Ok(0) => {}
             Ok(read) => {
                 progressed = true;
                 if write_frame(
-                    stream,
+                    context.stream,
                     &DaemonResponse::Stdout {
-                        id: request.id.clone(),
+                        id: context.request.id.clone(),
                         data: String::from_utf8_lossy(&stdout[..read]).to_string(),
                     },
                 )
@@ -402,17 +520,23 @@ fn stream_remote_command(
                 Ok(0) => {}
                 Ok(read) => {
                     progressed = true;
-                    if write_frame(
-                        stream,
-                        &DaemonResponse::Stderr {
-                            id: request.id.clone(),
-                            data: String::from_utf8_lossy(&stderr[..read]).to_string(),
-                        },
-                    )
-                    .is_err()
-                    {
-                        let _closed = channel.close();
-                        return Ok(());
+                    for data in filter_stderr_chunk(
+                        &String::from_utf8_lossy(&stderr[..read]),
+                        &mut stderr_tail,
+                        &mut pgid,
+                    ) {
+                        if write_frame(
+                            context.stream,
+                            &DaemonResponse::Stderr {
+                                id: context.request.id.clone(),
+                                data,
+                            },
+                        )
+                        .is_err()
+                        {
+                            let _closed = channel.close();
+                            return Ok(());
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -429,31 +553,142 @@ fn stream_remote_command(
         }
     }
     session.set_blocking(true);
+    if let Some(data) = flush_stderr_tail(&mut stderr_tail, &mut pgid) {
+        write_frame(
+            context.stream,
+            &DaemonResponse::Stderr {
+                id: context.request.id.clone(),
+                data,
+            },
+        )?;
+    }
     channel
         .wait_close()
         .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
-    let code = channel.exit_status().unwrap_or(1);
+    let code = if cancel_sent {
+        130
+    } else {
+        channel.exit_status().unwrap_or(1)
+    };
     write_frame(
-        stream,
+        context.stream,
         &DaemonResponse::Exit {
-            id: request.id.clone(),
+            id: context.request.id.clone(),
             code,
         },
     )
 }
 
-fn build_remote_command(config: &AppConfig, command: &str, dir: Option<&str>) -> Result<String> {
+fn build_remote_command(config: &AppConfig, request: &ExecRequest) -> Result<RemoteCommand> {
     let remote_root = RemotePath::parse(config.remote.path.as_str())?;
-    let relative = match dir {
+    let relative = match request.dir.as_deref() {
         Some(dir) => RelativePath::parse(dir)?,
         None => RelativePath::parse(".")?,
     };
     let remote_dir = remote_root.join_relative(&relative);
-    Ok(format!(
+    let cancel_path = format!(
+        "/tmp/rdev-cancel-{}-{}",
+        std::process::id(),
+        sanitize_job_id(&request.id)
+    );
+    let runner = remote_exec_wrapper(&request.command, &cancel_path);
+    let command = format!(
         "cd {} && exec sh -lc {}",
         shell_quote(remote_dir.as_str()),
-        shell_quote(command)
-    ))
+        shell_quote(&runner)
+    );
+    Ok(RemoteCommand {
+        command,
+        cancel_path,
+    })
+}
+
+fn remote_exec_wrapper(command: &str, cancel_path: &str) -> String {
+    format!(
+        r#"cancel_path={cancel_path}
+rm -f "$cancel_path"
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -lc {command} </dev/null &
+else
+  sh -lc {command} </dev/null &
+fi
+child=$!
+echo {PGID_MARKER}$child >&2
+(
+  while [ ! -e "$cancel_path" ]; do sleep 1; done
+  if kill -0 "$child" 2>/dev/null || kill -0 -"$child" 2>/dev/null; then
+    kill -INT -"$child" 2>/dev/null || kill -INT "$child" 2>/dev/null || true
+    sleep 2
+    kill -TERM -"$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+    sleep 2
+    kill -KILL -"$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
+  fi
+) &
+watcher=$!
+wait "$child"
+status=$?
+kill "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true
+rm -f "$cancel_path"
+exit "$status""#,
+        cancel_path = shell_quote(cancel_path),
+        command = shell_quote(command)
+    )
+}
+
+fn write_remote_cancel_file(session: &mut ssh2::Session, cancel_path: &str) -> Result<()> {
+    session.set_blocking(true);
+    let sftp = session
+        .sftp()
+        .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
+    let mut file = sftp
+        .create(Path::new(cancel_path))
+        .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
+    file.write_all(b"cancel\n")
+        .map_err(|source| err_with_source(error_info::REMOTE_COMMAND_FAILED, source))?;
+    session.set_blocking(false);
+    Ok(())
+}
+
+fn sanitize_job_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn filter_stderr_chunk(chunk: &str, tail: &mut String, pgid: &mut Option<String>) -> Vec<String> {
+    tail.push_str(chunk);
+    let mut output = Vec::new();
+    while let Some(newline) = tail.find('\n') {
+        let line = tail[..=newline].to_owned();
+        let rest = tail[newline + 1..].to_owned();
+        *tail = rest;
+        if let Some(value) = line.trim().strip_prefix(PGID_MARKER) {
+            *pgid = Some(value.to_owned());
+        } else {
+            output.push(line);
+        }
+    }
+    output
+}
+
+fn flush_stderr_tail(tail: &mut String, pgid: &mut Option<String>) -> Option<String> {
+    if tail.is_empty() {
+        return None;
+    }
+    let line = std::mem::take(tail);
+    if let Some(value) = line.trim().strip_prefix(PGID_MARKER) {
+        *pgid = Some(value.to_owned());
+        None
+    } else {
+        Some(line)
+    }
 }
 
 fn read_state(cwd: &Path) -> Result<DaemonState> {
@@ -486,6 +721,7 @@ fn request_token(request: &DaemonRequest) -> &str {
     match request {
         DaemonRequest::Status { token }
         | DaemonRequest::Stop { token }
+        | DaemonRequest::Cancel { token, .. }
         | DaemonRequest::ExecStart { token, .. } => token,
     }
 }
