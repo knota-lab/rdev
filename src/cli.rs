@@ -34,7 +34,7 @@ pub enum Command {
     Doctor,
     #[command(
         about = "Execute a remote command through the persistent project daemon",
-        long_about = "Execute a remote command through the persistent project daemon.\n\nThe daemon keeps one SSH connection open, so repeated exec calls avoid reconnecting. stdout/stderr are streamed to the local terminal. Press Ctrl+C to cancel the remote process; rdev exits with code 130.\n\nThe command argument may be either a literal remote shell command or a configured remote command alias from [commands.*]. Alias `dir` is resolved relative to the configured remote project path.\n\nExamples:\n  rdev exec \"pwd\"\n  rdev exec \"cargo test\"\n  rdev exec --dir backend \"cargo test\"\n  rdev exec backend-lint\n  rdev exec l2-session -- session_id=26"
+        long_about = "Execute a remote command through the persistent project daemon.\n\nThe daemon keeps one SSH connection open, so repeated exec calls avoid reconnecting. stdout/stderr are streamed to the local terminal. Press Ctrl+C to cancel the remote process; rdev exits with code 130.\n\nThe command argument may be either a literal remote shell command or a configured remote command alias from [commands.*]. Alias `dir` is resolved relative to the configured remote project path.\n\nUse `--summary` to write full output to .rdev/logs and print only a compact result summary.\n\nExamples:\n  rdev exec \"pwd\"\n  rdev exec \"cargo test\"\n  rdev exec --dir backend \"cargo test\"\n  rdev exec --summary \"cargo test\"\n  rdev exec backend-lint\n  rdev exec --summary l2-session -- session_id=26"
     )]
     Exec(ExecArgs),
     #[command(
@@ -113,6 +113,11 @@ pub struct ExecArgs {
     pub command: String,
     #[arg(long, help = "Project-relative remote working directory")]
     pub dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Write full output to .rdev/logs and print a compact summary"
+    )]
+    pub summary: bool,
     #[arg(
         last = true,
         help = "Remote command alias parameters as key=value pairs"

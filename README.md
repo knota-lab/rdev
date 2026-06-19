@@ -177,6 +177,17 @@ alias 的边界：
 - `dir` 是相对 `remote.path` 的远程工作目录；显式 `--dir` 优先于 alias 自带的 `dir`。
 - `alias set` 存在则更新，不存在则新增；`rdev alias delete <name>` 可删除别名。
 
+## Exec Summary
+
+`rdev exec --summary` 会把完整 stdout/stderr 写入本地 `.rdev/logs/`，终端只输出摘要：
+
+```powershell
+rdev exec --summary "cargo test"
+rdev exec --summary l2-session -- session_id=26
+```
+
+摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。
+
 ## Backends
 
 当前同步后端主要有两类：

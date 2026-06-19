@@ -14,6 +14,7 @@ use crate::cli::{DaemonArgs, DaemonCommand, ExecArgs};
 use crate::config::{AppConfig, CONFIG_DIR_NAME};
 use crate::error::{err, err_with_source, RdevError, Result};
 use crate::error_info;
+use crate::exec_summary::ExecSummaryRecorder;
 use crate::path::{RelativePath, RemotePath};
 use crate::ssh::SshClient;
 
@@ -160,6 +161,18 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
     let state = ensure_daemon(cwd)?;
     let mut stream = connect_state(&state)?;
     let id = format!("exec-{}", std::process::id());
+    let summary = args.summary;
+    let command_for_summary = args.command.clone();
+    let dir_for_summary = args.dir.as_ref().map(|dir| dir.display().to_string());
+    let mut recorder = if summary {
+        Some(ExecSummaryRecorder::new(
+            cwd,
+            command_for_summary.clone(),
+            dir_for_summary.clone(),
+        )?)
+    } else {
+        None
+    };
     let cancel_state = state.clone();
     let cancel_id = id.clone();
     ctrlc::set_handler(move || {
@@ -180,25 +193,46 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
         let response: DaemonResponse = read_frame(&mut stream)?;
         match response {
             DaemonResponse::Stdout { data, .. } => {
-                print!("{data}");
-                io::stdout()
-                    .flush()
-                    .map_err(|source| err_with_source(error_info::DAEMON_PROTOCOL_ERROR, source))?;
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.record(&data)?;
+                } else {
+                    print!("{data}");
+                    io::stdout().flush().map_err(|source| {
+                        err_with_source(error_info::DAEMON_PROTOCOL_ERROR, source)
+                    })?;
+                }
             }
             DaemonResponse::Stderr { data, .. } => {
-                eprint!("{data}");
-                io::stderr()
-                    .flush()
-                    .map_err(|source| err_with_source(error_info::DAEMON_PROTOCOL_ERROR, source))?;
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.record(&data)?;
+                } else {
+                    eprint!("{data}");
+                    io::stderr().flush().map_err(|source| {
+                        err_with_source(error_info::DAEMON_PROTOCOL_ERROR, source)
+                    })?;
+                }
             }
             DaemonResponse::Exit { code, .. } => {
+                let summary_text = match recorder.take() {
+                    Some(recorder) => Some(recorder.finish(code)?),
+                    None => None,
+                };
                 if code == 0 {
-                    return Ok(String::new());
+                    return Ok(summary_text.unwrap_or_default());
                 }
                 if code == 130 {
-                    return Err(err(error_info::DAEMON_EXEC_CANCELLED).with_exit_code(Some(130)));
+                    let mut error =
+                        err(error_info::DAEMON_EXEC_CANCELLED).with_exit_code(Some(130));
+                    if let Some(summary_text) = summary_text {
+                        error = error.with_hint(summary_text);
+                    }
+                    return Err(error);
                 }
-                return Err(err(error_info::REMOTE_COMMAND_FAILED).with_exit_code(Some(code)));
+                let mut error = err(error_info::REMOTE_COMMAND_FAILED).with_exit_code(Some(code));
+                if let Some(summary_text) = summary_text {
+                    error = error.with_hint(summary_text);
+                }
+                return Err(error);
             }
             DaemonResponse::Error { code, message } => {
                 return Err(err(error_info::DAEMON_FAILED).with_hint(format!("{code}: {message}")));

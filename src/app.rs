@@ -66,6 +66,7 @@ fn exec(args: ExecArgs, cwd: &Path) -> Result<String> {
         ExecArgs {
             command: resolved.command,
             dir: resolved.dir,
+            summary: args.summary,
             params: Vec::new(),
         },
         cwd,

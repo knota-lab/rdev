@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod error_info;
+pub mod exec_summary;
 pub mod path;
 pub mod process;
 pub mod session;
