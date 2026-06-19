@@ -79,6 +79,12 @@ fn run_doctor_with_exec(
     check_remote_sh(runner, &remote)?;
     checks.push(DoctorCheck::ok("remote.sh", "available"));
 
+    check_remote_setsid(runner, &remote)?;
+    checks.push(DoctorCheck::ok("remote.setsid", "available"));
+
+    check_remote_ps(runner, &remote)?;
+    checks.push(DoctorCheck::ok("remote.ps", "available"));
+
     check_remote_tar(runner, &remote)?;
     checks.push(DoctorCheck::ok("remote.tar", "available"));
 
@@ -255,6 +261,24 @@ fn check_remote_sh(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result
     )
 }
 
+fn check_remote_setsid(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(
+            remote,
+            "command -v setsid",
+            error_info::REMOTE_COMMAND_FAILED,
+        ),
+    )
+}
+
+fn check_remote_ps(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
+    check_remote_command(
+        runner,
+        RemoteCheckRequest::new(remote, "command -v ps", error_info::REMOTE_COMMAND_FAILED),
+    )
+}
+
 fn check_remote_rsync(runner: &impl ProcessRunner, remote: &RemoteTarget) -> Result<()> {
     check_remote_command(
         runner,
@@ -427,7 +451,7 @@ mod tests {
     #[test]
     fn doctor_runs_expected_checks() {
         let config = AppConfig::template("root@example.com", 22, "/root/project");
-        let runner = FakeRunner::success(6);
+        let runner = FakeRunner::success(8);
 
         let report = run_test_doctor(&config, &runner);
 
@@ -438,10 +462,12 @@ mod tests {
         };
         let output = report.format_text();
         assert!(output.contains("config ok"));
+        assert!(output.contains("remote.setsid ok"));
+        assert!(output.contains("remote.ps ok"));
         assert!(output.contains("remote.tar ok"));
         assert!(output.contains("remote.ssh_exec ok"));
         assert!(output.contains("remote.path.writable ok"));
-        assert_eq!(runner.commands.borrow().len(), 6);
+        assert_eq!(runner.commands.borrow().len(), 8);
         assert!(runner
             .commands
             .borrow()
@@ -452,7 +478,7 @@ mod tests {
     #[test]
     fn doctor_rejects_unsafe_remote_path_before_running_commands() {
         let config = AppConfig::template("root@example.com", 22, "/root");
-        let runner = FakeRunner::success(5);
+        let runner = FakeRunner::success(7);
 
         let report = run_test_doctor(&config, &runner);
 
@@ -466,6 +492,8 @@ mod tests {
         let runner = FakeRunner::from_codes([
             Some(0),
             Some(1),
+            Some(0),
+            Some(0),
             Some(0),
             Some(0),
             Some(0),
