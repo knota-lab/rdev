@@ -17,7 +17,11 @@ fn main() {
     };
 
     match rdev::app::run(cli, &cwd) {
-        Ok(message) => println!("{message}"),
+        Ok(message) => {
+            if !message.is_empty() {
+                println!("{message}");
+            }
+        }
         Err(error) => {
             let exit_code = error.exit_code();
             eprintln!("{}", format_error(&error));

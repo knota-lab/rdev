@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cli;
 pub mod command;
 pub mod config;
+pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod error_info;

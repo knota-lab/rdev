@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use crate::auth::run_auth_check;
-use crate::cli::{Cli, Command, InitArgs, RunArgs, SshArgs, SyncArgs};
+use crate::cli::{Cli, Command, DaemonArgs, ExecArgs, InitArgs, RunArgs, SshArgs, SyncArgs};
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{AppConfig, SyncBackendKind, CONFIG_DIR_NAME};
+use crate::daemon::{run_daemon_command, run_exec};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
@@ -19,7 +20,9 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
     match cli.command {
         Command::Init(args) => init(args, cwd),
         Command::AuthCheck => auth_check(cwd),
+        Command::Daemon(args) => daemon(args, cwd),
         Command::Doctor => doctor(cwd),
+        Command::Exec(args) => exec(args, cwd),
         Command::Run(args) => run_command(args, cwd),
         Command::Sync(args) => sync(args, cwd),
         Command::Up(args) => up(args, cwd),
@@ -27,6 +30,14 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Stop => stop(cwd),
         Command::Ssh(args) => ssh(args, cwd),
     }
+}
+
+fn daemon(args: DaemonArgs, cwd: &Path) -> Result<String> {
+    run_daemon_command(args, cwd)
+}
+
+fn exec(args: ExecArgs, cwd: &Path) -> Result<String> {
+    run_exec(args, cwd)
 }
 
 fn auth_check(cwd: &Path) -> Result<String> {

@@ -128,6 +128,38 @@ pub const SESSION_FAILED: ErrorInfo = ErrorInfo {
     exit_code: RdevExitCode::Watch,
 };
 
+pub const DAEMON_FAILED: ErrorInfo = ErrorInfo {
+    code: "daemon.failed",
+    message_zh: "daemon 操作失败",
+    message_en: "Daemon operation failed",
+    severity: ErrorSeverity::Environment,
+    exit_code: RdevExitCode::Watch,
+};
+
+pub const DAEMON_NOT_RUNNING: ErrorInfo = ErrorInfo {
+    code: "daemon.not_running",
+    message_zh: "daemon 未运行",
+    message_en: "Daemon is not running",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Watch,
+};
+
+pub const DAEMON_BUSY: ErrorInfo = ErrorInfo {
+    code: "daemon.busy",
+    message_zh: "daemon 当前有任务正在运行",
+    message_en: "Daemon is busy",
+    severity: ErrorSeverity::User,
+    exit_code: RdevExitCode::Watch,
+};
+
+pub const DAEMON_PROTOCOL_ERROR: ErrorInfo = ErrorInfo {
+    code: "daemon.protocol_error",
+    message_zh: "daemon 协议错误",
+    message_en: "Daemon protocol error",
+    severity: ErrorSeverity::Environment,
+    exit_code: RdevExitCode::Watch,
+};
+
 pub const WATCH_EVENT_FAILED: ErrorInfo = ErrorInfo {
     code: "watch.event_failed",
     message_zh: "文件监听事件处理失败",

@@ -17,13 +17,37 @@ pub struct Cli {
 pub enum Command {
     Init(InitArgs),
     AuthCheck,
+    Daemon(DaemonArgs),
     Doctor,
+    Exec(ExecArgs),
     Run(RunArgs),
     Sync(SyncArgs),
     Up(UpArgs),
     Status,
     Stop,
     Ssh(SshArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    Start,
+    Status,
+    Stop,
+    #[command(hide = true)]
+    Serve,
+}
+
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    pub command: String,
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
