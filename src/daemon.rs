@@ -171,7 +171,9 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
                     return Ok(String::new());
                 }
                 if code == 130 {
-                    return Err(err(error_info::DAEMON_FAILED).with_hint("exec cancelled"));
+                    return Err(err(error_info::DAEMON_FAILED)
+                        .with_hint("exec cancelled")
+                        .with_exit_code(Some(130)));
                 }
                 return Err(err(error_info::REMOTE_COMMAND_FAILED).with_exit_code(Some(code)));
             }

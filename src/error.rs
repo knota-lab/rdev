@@ -86,7 +86,9 @@ impl RdevError {
     }
 
     pub fn exit_code(&self) -> i32 {
-        self.info.exit_code.code()
+        self.context
+            .exit_code
+            .unwrap_or_else(|| self.info.exit_code.code())
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -217,6 +219,13 @@ mod tests {
 
         assert_eq!(error.exit_code(), 10);
         assert_eq!(error.info.code, "config.not_found");
+    }
+
+    #[test]
+    fn context_exit_code_overrides_error_info_exit_code() {
+        let error = err(error_info::REMOTE_COMMAND_FAILED).with_exit_code(Some(130));
+
+        assert_eq!(error.exit_code(), 130);
     }
 
     #[test]
