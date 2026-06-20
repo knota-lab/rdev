@@ -462,6 +462,8 @@ ready_pattern={ready_pattern}
 ready_line={ready_line}
 wait_timeout={timeout}
 deadline=$(( $(date +%s) + wait_timeout ))
+started_at=$(date +%s)
+last_heartbeat=$started_at
 offset=0
 {wait_script}"#,
         name = shell_quote(build.name),
@@ -510,6 +512,8 @@ ready_pattern={ready_pattern}
 ready_line={ready_line}
 wait_timeout={timeout}
 deadline=$(( $(date +%s) + wait_timeout ))
+started_at=$(date +%s)
+last_heartbeat=$started_at
 offset=0
 {wait_script}"#,
         name = shell_quote(build.name),
@@ -532,6 +536,8 @@ fn service_wait_script() -> &'static str {
     if grep -F -- "$ready_pattern" "$log_file" >/dev/null 2>&1; then
       date > "$ready_file"
       echo "$ready_line"
+      echo "[service] logs: rdev service logs $service_name"
+      echo "[service] remote_log=$log_file"
       exit 0
     fi
   fi
@@ -549,6 +555,12 @@ fn service_wait_script() -> &'static str {
     echo "[service] logs with: rdev service logs $service_name" >&2
     echo "[service] stop with: rdev service stop $service_name" >&2
     exit 124
+  fi
+  now=$(date +%s)
+  if [ $((now - last_heartbeat)) -ge 10 ]; then
+    elapsed=$((now - started_at))
+    echo "[service] waiting elapsed=${elapsed}s timeout=${wait_timeout}s pid=$pid log=$log_file" >&2
+    last_heartbeat=$now
   fi
   sleep 1
 done"#
@@ -572,11 +584,17 @@ if [ -f "$pid_file" ]; then
 fi
 ready="false"
 if [ -f "$ready_file" ]; then ready="true"; fi
+if [ "$status" = "stopped" ] && [ "$ready" = "true" ]; then
+  status="stale_ready"
+fi
 echo "service=$service_name"
 echo "status=$status"
 echo "pid=$pid"
 echo "ready=$ready"
-echo "log=$log_file"
+echo "remote_log=$log_file"
+echo "logs_command=rdev service logs $service_name"
+echo "wait_command=rdev service wait $service_name"
+echo "stop_command=rdev service stop $service_name"
 printf 'url=%s\n' {url}"#,
         name = shell_quote(build.name),
         state_dir = shell_quote(&paths.state_dir),
@@ -1252,6 +1270,9 @@ mod tests {
         assert!(start.contains("setsid sh -lc"));
         assert!(start.contains("ready timeout after ${wait_timeout}s"));
         assert!(start.contains("still running pid=$pid"));
+        assert!(start.contains("waiting elapsed=${elapsed}s timeout=${wait_timeout}s"));
+        assert!(start.contains("[service] logs: rdev service logs $service_name"));
+        assert!(start.contains("[service] remote_log=$log_file"));
         assert!(start.contains("rdev service logs $service_name"));
         assert!(start.contains("[service] api ready: http://10.124.124.0:5150"));
 
@@ -1277,6 +1298,10 @@ mod tests {
             Err(error) => panic!("build status: {error}"),
         };
         assert!(status.contains("status=$status"));
+        assert!(status.contains("status=\"stale_ready\""));
+        assert!(status.contains("remote_log=$log_file"));
+        assert!(status.contains("logs_command=rdev service logs $service_name"));
+        assert!(status.contains("wait_command=rdev service wait $service_name"));
         assert!(status.contains("printf 'url=%s\\n'"));
 
         let logs = match build_service_logs_command(ServiceCommandBuild {

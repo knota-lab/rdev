@@ -198,7 +198,7 @@ rdev service logs backend
 rdev service stop backend
 ```
 
-`service set` 存在则更新，不存在则新增。`service start` 通过项目 daemon 在远端后台启动服务，阻塞等待 `ready_pattern`，默认最多等待 10 分钟，可用 `--timeout <seconds>` 覆盖；等待期间流式输出新日志。匹配 ready 后打印配置的 `url` 并退出 `0`，远端服务继续运行。ready 超时会退出 `124`，但不会停止远端服务，会提示使用 `wait/status/logs/stop` 继续等待、检查或停止。运行状态和日志保存在远端项目 `.rdev/services/<name>/` 下。
+`service set` 存在则更新，不存在则新增。`service start` 通过项目 daemon 在远端后台启动服务，阻塞等待 `ready_pattern`，默认最多等待 10 分钟，可用 `--timeout <seconds>` 覆盖；等待期间流式输出新日志，并每 10 秒输出一次等待心跳。匹配 ready 后打印配置的 `url`、日志查看命令和远端日志路径，然后退出 `0`，远端服务继续运行。ready 超时会退出 `124`，但不会停止远端服务，会提示使用 `wait/status/logs/stop` 继续等待、检查或停止。运行状态和日志保存在远端项目 `.rdev/services/<name>/` 下。
 
 ## Exec Summary
 
