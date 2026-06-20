@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use crate::auth::run_auth_check;
 use crate::cli::{
     AliasArgs, AliasCommand, AliasDeleteArgs, AliasSetArgs, Cli, Command, DaemonArgs, ExecArgs,
-    InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceSetArgs, ServiceStartArgs, SshArgs,
-    SyncArgs, WhyIgnoreArgs,
+    InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceLogsArgs, ServiceSetArgs,
+    ServiceStartArgs, ServiceStatusArgs, ServiceStopArgs, SshArgs, SyncArgs, WhyIgnoreArgs,
 };
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{
     AppConfig, CommandAliasConfig, ServiceConfig, SyncBackendKind, CONFIG_DIR_NAME,
 };
-use crate::daemon::{run_daemon_command, run_exec, run_exec_with_observer};
+use crate::daemon::{run_daemon_command, run_exec};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
@@ -88,6 +88,9 @@ fn service(args: ServiceArgs, cwd: &Path) -> Result<String> {
         ServiceCommand::List => service_list(cwd),
         ServiceCommand::Set(args) => service_set(args, cwd),
         ServiceCommand::Start(args) => service_start(args, cwd),
+        ServiceCommand::Status(args) => service_status(args, cwd),
+        ServiceCommand::Logs(args) => service_logs(args, cwd),
+        ServiceCommand::Stop(args) => service_stop(args, cwd),
     }
 }
 
@@ -259,56 +262,81 @@ fn service_set(args: ServiceSetArgs, cwd: &Path) -> Result<String> {
 
 fn service_start(args: ServiceStartArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
-    let service = config
-        .services
-        .get(&args.name)
-        .ok_or_else(|| {
-            err(error_info::CONFIG_INVALID).with_hint(format!("service not found: {}", args.name))
-        })?
-        .clone();
+    let service = configured_service(&config, &args.name)?;
     validate_service(&args.name, &service)?;
-    eprintln!(
-        "[service] starting {} dir={} ready_pattern={}",
-        args.name,
-        service_dir_label(&service),
-        service.ready_pattern
-    );
-
-    let ready_pattern = service.ready_pattern.clone();
-    let mut tail = String::new();
-    let mut ready = false;
-    let service_name = args.name.clone();
-    let service_url = service.url.clone();
-    let mut observer = move |data: &str| {
-        if ready {
-            return Ok(());
-        }
-        tail.push_str(data);
-        if tail.len() > 8192 {
-            let drain_to = tail.len().saturating_sub(8192);
-            tail.drain(..drain_to);
-        }
-        if tail.contains(&ready_pattern) {
-            ready = true;
-            if service_url.trim().is_empty() {
-                eprintln!("[service] {service_name} ready");
-            } else {
-                eprintln!("[service] {service_name} ready: {service_url}");
-            }
-        }
-        Ok(())
-    };
-
-    let dir = service_dir(&service);
-    run_exec_with_observer(
+    run_exec(
         ExecArgs {
-            command: service.command,
-            dir,
+            command: build_service_start_command(ServiceCommandBuild {
+                config: &config,
+                name: &args.name,
+                service: &service,
+                value: args.timeout,
+            })?,
+            dir: None,
             summary: false,
             params: Vec::new(),
         },
         cwd,
-        Some(&mut observer),
+    )
+}
+
+fn service_status(args: ServiceStatusArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let service = configured_service(&config, &args.name)?;
+    validate_service(&args.name, &service)?;
+    run_exec(
+        ExecArgs {
+            command: build_service_status_command(ServiceCommandBuild {
+                config: &config,
+                name: &args.name,
+                service: &service,
+                value: 0,
+            })?,
+            dir: None,
+            summary: false,
+            params: Vec::new(),
+        },
+        cwd,
+    )
+}
+
+fn service_logs(args: ServiceLogsArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let service = configured_service(&config, &args.name)?;
+    validate_service(&args.name, &service)?;
+    run_exec(
+        ExecArgs {
+            command: build_service_logs_command(ServiceCommandBuild {
+                config: &config,
+                name: &args.name,
+                service: &service,
+                value: u64::from(args.lines),
+            })?,
+            dir: None,
+            summary: false,
+            params: Vec::new(),
+        },
+        cwd,
+    )
+}
+
+fn service_stop(args: ServiceStopArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let service = configured_service(&config, &args.name)?;
+    validate_service(&args.name, &service)?;
+    run_exec(
+        ExecArgs {
+            command: build_service_stop_command(ServiceCommandBuild {
+                config: &config,
+                name: &args.name,
+                service: &service,
+                value: 0,
+            })?,
+            dir: None,
+            summary: false,
+            params: Vec::new(),
+        },
+        cwd,
     )
 }
 
@@ -328,19 +356,241 @@ fn validate_service(name: &str, service: &ServiceConfig) -> Result<()> {
     Ok(())
 }
 
-fn service_dir(service: &ServiceConfig) -> Option<PathBuf> {
-    if service.dir.trim().is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(service.dir.as_str()))
-    }
-}
-
 fn service_dir_label(service: &ServiceConfig) -> &str {
     if service.dir.trim().is_empty() {
         "."
     } else {
         service.dir.as_str()
+    }
+}
+
+fn configured_service(config: &AppConfig, name: &str) -> Result<ServiceConfig> {
+    config
+        .services
+        .get(name)
+        .ok_or_else(|| {
+            err(error_info::CONFIG_INVALID).with_hint(format!("service not found: {name}"))
+        })
+        .cloned()
+}
+
+struct ServiceCommandBuild<'a> {
+    config: &'a AppConfig,
+    name: &'a str,
+    service: &'a ServiceConfig,
+    value: u64,
+}
+
+fn build_service_start_command(build: ServiceCommandBuild<'_>) -> Result<String> {
+    let paths = service_paths(build.config, build.name, build.service)?;
+    let ready_line = service_ready_line(build.name, build.service);
+    Ok(format!(
+        r#"service_name={name}
+state_dir={state_dir}
+work_dir={work_dir}
+pid_file="$state_dir/pid"
+log_file="$state_dir/output.log"
+status_file="$state_dir/status"
+ready_file="$state_dir/ready"
+pid=""
+started_here=0
+cleanup_start() {{
+  if [ "$started_here" = "1" ] && [ -n "$pid" ] && [ ! -f "$ready_file" ]; then
+    kill -INT -"$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
+    sleep 1
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$pid_file"
+    echo "stopped" > "$status_file"
+  fi
+}}
+trap cleanup_start INT TERM HUP
+mkdir -p "$state_dir"
+if [ -f "$pid_file" ]; then
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "[service] $service_name already running pid=$pid"
+    echo "[service] log=$log_file"
+    if [ -f "$ready_file" ]; then
+      echo {ready_line}
+      exit 0
+    fi
+  else
+    pid=""
+  fi
+fi
+if [ -z "$pid" ]; then
+  rm -f "$pid_file" "$ready_file"
+  : > "$log_file"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -lc {command} </dev/null >>"$log_file" 2>&1 &
+  else
+    nohup sh -lc {command} </dev/null >>"$log_file" 2>&1 &
+  fi
+  pid=$!
+  started_here=1
+  echo "$pid" > "$pid_file"
+  echo "running" > "$status_file"
+  echo "[service] $service_name started pid=$pid"
+  echo "[service] log=$log_file"
+fi
+deadline=$(( $(date +%s) + {timeout} ))
+offset=0
+while :; do
+  if [ -f "$log_file" ]; then
+    size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$offset" ] 2>/dev/null; then
+      dd if="$log_file" bs=1 skip="$offset" count=$((size - offset)) 2>/dev/null || true
+      offset=$size
+    fi
+    if grep -F -- {ready_pattern} "$log_file" >/dev/null 2>&1; then
+      date > "$ready_file"
+      echo {ready_line}
+      exit 0
+    fi
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "exited" > "$status_file"
+    wait "$pid"
+    code=$?
+    echo "[service] $service_name exited before ready code=$code" >&2
+    exit "$code"
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "[service] $service_name ready timeout after {timeout}s" >&2
+    exit 124
+  fi
+  sleep 1
+done"#,
+        name = shell_quote(build.name),
+        state_dir = shell_quote(&paths.state_dir),
+        work_dir = shell_quote(&paths.work_dir),
+        command = shell_quote(&format!(
+            "cd {} && exec sh -lc {}",
+            shell_quote(&paths.work_dir),
+            shell_quote(&build.service.command)
+        )),
+        ready_pattern = shell_quote(&build.service.ready_pattern),
+        ready_line = shell_quote(&ready_line),
+        timeout = build.value,
+    ))
+}
+
+fn build_service_status_command(build: ServiceCommandBuild<'_>) -> Result<String> {
+    let paths = service_paths(build.config, build.name, build.service)?;
+    Ok(format!(
+        r#"service_name={name}
+state_dir={state_dir}
+pid_file="$state_dir/pid"
+log_file="$state_dir/output.log"
+ready_file="$state_dir/ready"
+status="stopped"
+pid=""
+if [ -f "$pid_file" ]; then
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    status="running"
+  fi
+fi
+ready="false"
+if [ -f "$ready_file" ]; then ready="true"; fi
+echo "service=$service_name"
+echo "status=$status"
+echo "pid=$pid"
+echo "ready=$ready"
+echo "log=$log_file"
+printf 'url=%s\n' {url}"#,
+        name = shell_quote(build.name),
+        state_dir = shell_quote(&paths.state_dir),
+        url = shell_quote(&build.service.url),
+    ))
+}
+
+fn build_service_logs_command(build: ServiceCommandBuild<'_>) -> Result<String> {
+    let paths = service_paths(build.config, build.name, build.service)?;
+    Ok(format!(
+        r#"log_file={log_file}
+if [ ! -f "$log_file" ]; then
+  echo "[service] log not found: $log_file" >&2
+  exit 66
+fi
+tail -n {lines} "$log_file""#,
+        log_file = shell_quote(&paths.log_file),
+        lines = build.value,
+    ))
+}
+
+fn build_service_stop_command(build: ServiceCommandBuild<'_>) -> Result<String> {
+    let paths = service_paths(build.config, build.name, build.service)?;
+    Ok(format!(
+        r#"service_name={name}
+state_dir={state_dir}
+pid_file="$state_dir/pid"
+status_file="$state_dir/status"
+ready_file="$state_dir/ready"
+if [ ! -f "$pid_file" ]; then
+  echo "[service] $service_name not running"
+  rm -f "$ready_file"
+  echo "stopped" > "$status_file"
+  exit 0
+fi
+pid=$(cat "$pid_file" 2>/dev/null || true)
+if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+  echo "[service] $service_name not running"
+  rm -f "$pid_file" "$ready_file"
+  echo "stopped" > "$status_file"
+  exit 0
+fi
+echo "[service] stopping $service_name pid=$pid"
+kill -INT -"$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
+sleep 1
+if kill -0 "$pid" 2>/dev/null; then
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+fi
+sleep 1
+if kill -0 "$pid" 2>/dev/null; then
+  kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+fi
+rm -f "$pid_file" "$ready_file"
+echo "stopped" > "$status_file"
+echo "[service] $service_name stopped""#,
+        name = shell_quote(build.name),
+        state_dir = shell_quote(&paths.state_dir),
+    ))
+}
+
+struct ServicePaths {
+    state_dir: String,
+    work_dir: String,
+    log_file: String,
+}
+
+fn service_paths(config: &AppConfig, name: &str, service: &ServiceConfig) -> Result<ServicePaths> {
+    let remote_root = RemotePath::parse(config.remote.path.as_str())?;
+    let relative = if service.dir.trim().is_empty() {
+        RelativePath::parse(".")?
+    } else {
+        RelativePath::parse(&service.dir)?
+    };
+    let work_dir = remote_root.join_relative(&relative);
+    let state_dir = format!(
+        "{}/.rdev/services/{name}",
+        remote_root.as_str().trim_end_matches('/')
+    );
+    let log_file = format!("{state_dir}/output.log");
+    Ok(ServicePaths {
+        state_dir,
+        work_dir: work_dir.as_str().to_owned(),
+        log_file,
+    })
+}
+
+fn service_ready_line(name: &str, service: &ServiceConfig) -> String {
+    if service.url.trim().is_empty() {
+        format!("[service] {name} ready")
+    } else {
+        format!("[service] {name} ready: {}", service.url)
     }
 }
 
@@ -612,6 +862,10 @@ fn alias_expansion_message(alias: &str, resolved: &ResolvedCommand) -> String {
     )
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn resolve_local_root(project_root: &Path, local_path: &Path) -> std::path::PathBuf {
     if local_path.is_absolute() {
         local_path.to_path_buf()
@@ -630,8 +884,10 @@ mod tests {
     use crate::path::{SyncExclusionExplanation, SyncExclusionReason};
 
     use super::{
-        alias_delete, alias_set, format_sync_exclusion, resolve_command_alias, service_list,
-        service_set, AliasResolveRequest, ResolvedCommand,
+        alias_delete, alias_set, build_service_logs_command, build_service_start_command,
+        build_service_status_command, build_service_stop_command, format_sync_exclusion,
+        resolve_command_alias, service_list, service_set, AliasResolveRequest, ResolvedCommand,
+        ServiceCommandBuild,
     };
 
     #[test]
@@ -892,6 +1148,68 @@ mod tests {
         assert_eq!(service.ready_pattern, "ready");
         assert_eq!(service.url, "");
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_commands_use_remote_state_and_background_start() {
+        let config = AppConfig::template("root@example.com", 22, "/root/project");
+        let service = ServiceConfig {
+            dir: "backend".to_owned(),
+            command: "cargo loco start --all".to_owned(),
+            ready_pattern: "listening on".to_owned(),
+            url: "http://10.124.124.0:5150".to_owned(),
+        };
+        let build = ServiceCommandBuild {
+            config: &config,
+            name: "api",
+            service: &service,
+            value: 30,
+        };
+
+        let start = match build_service_start_command(build) {
+            Ok(command) => command,
+            Err(error) => panic!("build start: {error}"),
+        };
+
+        assert!(start.contains("/root/project/.rdev/services/api"));
+        assert!(start.contains("setsid sh -lc"));
+        assert!(start.contains("ready timeout after 30s"));
+        assert!(start.contains("[service] api ready: http://10.124.124.0:5150"));
+
+        let status = match build_service_status_command(ServiceCommandBuild {
+            config: &config,
+            name: "api",
+            service: &service,
+            value: 0,
+        }) {
+            Ok(command) => command,
+            Err(error) => panic!("build status: {error}"),
+        };
+        assert!(status.contains("status=$status"));
+        assert!(status.contains("printf 'url=%s\\n'"));
+
+        let logs = match build_service_logs_command(ServiceCommandBuild {
+            config: &config,
+            name: "api",
+            service: &service,
+            value: 25,
+        }) {
+            Ok(command) => command,
+            Err(error) => panic!("build logs: {error}"),
+        };
+        assert!(logs.contains("tail -n 25"));
+
+        let stop = match build_service_stop_command(ServiceCommandBuild {
+            config: &config,
+            name: "api",
+            service: &service,
+            value: 0,
+        }) {
+            Ok(command) => command,
+            Err(error) => panic!("build stop: {error}"),
+        };
+        assert!(stop.contains("kill -INT -\"$pid\""));
+        assert!(stop.contains("[service] $service_name stopped"));
     }
 
     #[test]

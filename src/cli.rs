@@ -46,7 +46,7 @@ pub enum Command {
     Run(RunArgs),
     #[command(
         about = "Start configured remote services and detect readiness",
-        long_about = "Start configured remote services from [services.*] in .rdev/config.toml.\n\n`rdev service start <name>` runs the service through the persistent daemon, streams logs, and prints a ready line when ready_pattern appears. Press Ctrl+C to stop the remote service.\n\nExample config:\n  [services.backend]\n  dir = \"knota-fold\"\n  command = \"cargo loco start --all\"\n  ready_pattern = \"listening on\"\n  url = \"http://10.124.124.0:5150\""
+        long_about = "Start configured remote services from [services.*] in .rdev/config.toml.\n\n`rdev service start <name>` starts the service in the remote background, streams logs until ready_pattern appears, then exits successfully so coding agents can continue. Use `rdev service status/logs/stop <name>` to inspect or stop the background service.\n\nExample config:\n  [services.backend]\n  dir = \"knota-fold\"\n  command = \"cargo loco start --all\"\n  ready_pattern = \"listening on\"\n  url = \"http://10.124.124.0:5150\""
     )]
     Service(ServiceArgs),
     #[command(about = "Run one full sync and exit")]
@@ -123,8 +123,14 @@ pub enum ServiceCommand {
         long_about = "Create or update a configured service in .rdev/config.toml.\n\nExamples:\n  rdev service set backend --dir knota-fold --ready \"listening on\" --url http://10.124.124.0:5150 -- cargo loco start --all\n  rdev service start backend"
     )]
     Set(ServiceSetArgs),
-    #[command(about = "Start a configured service and watch for readiness")]
+    #[command(about = "Start a configured service in the background and wait until ready")]
     Start(ServiceStartArgs),
+    #[command(about = "Show configured service runtime status")]
+    Status(ServiceStatusArgs),
+    #[command(about = "Print configured service logs")]
+    Logs(ServiceLogsArgs),
+    #[command(about = "Stop a configured background service")]
+    Stop(ServiceStopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -147,6 +153,28 @@ pub struct ServiceSetArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceStartArgs {
+    #[arg(help = "Configured service name from [services.<name>]")]
+    pub name: String,
+    #[arg(long, default_value_t = 60, help = "Seconds to wait for ready_pattern")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceStatusArgs {
+    #[arg(help = "Configured service name from [services.<name>]")]
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceLogsArgs {
+    #[arg(help = "Configured service name from [services.<name>]")]
+    pub name: String,
+    #[arg(long, default_value_t = 80, help = "Number of log lines to print")]
+    pub lines: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceStopArgs {
     #[arg(help = "Configured service name from [services.<name>]")]
     pub name: String,
 }
