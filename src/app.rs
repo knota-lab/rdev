@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::auth::run_auth_check;
 use crate::cli::{
     AliasArgs, AliasCommand, AliasDeleteArgs, AliasSetArgs, Cli, Command, DaemonArgs, ExecArgs,
-    InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceStartArgs, SshArgs, SyncArgs,
-    WhyIgnoreArgs,
+    InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceSetArgs, ServiceStartArgs, SshArgs,
+    SyncArgs, WhyIgnoreArgs,
 };
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{
@@ -86,6 +86,7 @@ fn daemon(args: DaemonArgs, cwd: &Path) -> Result<String> {
 fn service(args: ServiceArgs, cwd: &Path) -> Result<String> {
     match args.command {
         ServiceCommand::List => service_list(cwd),
+        ServiceCommand::Set(args) => service_set(args, cwd),
         ServiceCommand::Start(args) => service_start(args, cwd),
     }
 }
@@ -223,6 +224,39 @@ fn service_list(cwd: &Path) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+fn service_set(args: ServiceSetArgs, cwd: &Path) -> Result<String> {
+    validate_service_name(&args.name)?;
+    let command = args.command.join(" ").trim().to_owned();
+    if command.is_empty() {
+        return Err(err(error_info::CONFIG_INVALID).with_hint("service command cannot be empty"));
+    }
+    if args.ready.trim().is_empty() {
+        return Err(
+            err(error_info::CONFIG_INVALID).with_hint("service ready pattern cannot be empty")
+        );
+    }
+    if let Some(dir) = args.dir.as_deref() {
+        RelativePath::parse(dir)?;
+    }
+    let mut config = AppConfig::load_from_dir(cwd)?;
+    let existed = config.services.contains_key(&args.name);
+    config.services.insert(
+        args.name.clone(),
+        ServiceConfig {
+            command,
+            dir: args
+                .dir
+                .as_ref()
+                .map_or_else(String::new, |dir| dir.display().to_string()),
+            ready_pattern: args.ready,
+            url: args.url,
+        },
+    );
+    write_config(cwd, &config)?;
+    let action = if existed { "updated" } else { "created" };
+    Ok(format!("service {action}: {}", args.name))
+}
+
 fn service_start(args: ServiceStartArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
     let service = config
@@ -308,6 +342,21 @@ fn service_dir_label(service: &ServiceConfig) -> &str {
     } else {
         service.dir.as_str()
     }
+}
+
+fn validate_service_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(err(error_info::CONFIG_INVALID).with_hint("service name cannot be empty"));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(err(error_info::CONFIG_INVALID).with_hint(format!(
+            "service name may only contain letters, numbers, '-', '_' and '.': {name}"
+        )));
+    }
+    Ok(())
 }
 
 fn write_config(cwd: &Path, config: &AppConfig) -> Result<()> {
@@ -576,13 +625,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::cli::{AliasDeleteArgs, AliasSetArgs};
+    use crate::cli::{AliasDeleteArgs, AliasSetArgs, ServiceSetArgs};
     use crate::config::{AppConfig, CommandAliasConfig, ServiceConfig};
     use crate::path::{SyncExclusionExplanation, SyncExclusionReason};
 
     use super::{
         alias_delete, alias_set, format_sync_exclusion, resolve_command_alias, service_list,
-        AliasResolveRequest, ResolvedCommand,
+        service_set, AliasResolveRequest, ResolvedCommand,
     };
 
     #[test]
@@ -784,6 +833,64 @@ mod tests {
         assert!(output.contains("dir=knota-fold"));
         assert!(output.contains("ready_pattern=listening on"));
         assert!(output.contains("http://10.124.124.0:5150"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_set_creates_and_updates_config_service() {
+        let root = temp_project("rdev-service-set-test");
+        write_test_config(&root);
+
+        let created = service_set(
+            ServiceSetArgs {
+                name: "backend".to_owned(),
+                dir: Some(PathBuf::from("knota-fold")),
+                ready: "listening on".to_owned(),
+                url: "http://10.124.124.0:5150".to_owned(),
+                command: vec!["cargo loco start --all".to_owned()],
+            },
+            &root,
+        );
+
+        let created = match created {
+            Ok(message) => message,
+            Err(error) => panic!("service set should create: {error}"),
+        };
+        assert_eq!(created, "service created: backend");
+        let config = load_test_config(&root);
+        let service = match config.services.get("backend") {
+            Some(service) => service,
+            None => panic!("service should exist"),
+        };
+        assert_eq!(service.dir, "knota-fold");
+        assert_eq!(service.ready_pattern, "listening on");
+        assert_eq!(service.url, "http://10.124.124.0:5150");
+
+        let updated = service_set(
+            ServiceSetArgs {
+                name: "backend".to_owned(),
+                dir: Some(PathBuf::from("api")),
+                ready: "ready".to_owned(),
+                url: String::new(),
+                command: vec!["pnpm dev --host".to_owned()],
+            },
+            &root,
+        );
+
+        let updated = match updated {
+            Ok(message) => message,
+            Err(error) => panic!("service set should update: {error}"),
+        };
+        assert_eq!(updated, "service updated: backend");
+        let config = load_test_config(&root);
+        let service = match config.services.get("backend") {
+            Some(service) => service,
+            None => panic!("service should exist"),
+        };
+        assert_eq!(service.dir, "api");
+        assert_eq!(service.command, "pnpm dev --host");
+        assert_eq!(service.ready_pattern, "ready");
+        assert_eq!(service.url, "");
         let _cleanup = fs::remove_dir_all(root);
     }
 

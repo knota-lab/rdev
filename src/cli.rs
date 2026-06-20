@@ -118,8 +118,31 @@ pub struct ServiceArgs {
 pub enum ServiceCommand {
     #[command(about = "List configured services")]
     List,
+    #[command(
+        about = "Create or update a configured service",
+        long_about = "Create or update a configured service in .rdev/config.toml.\n\nExamples:\n  rdev service set backend --dir knota-fold --ready \"listening on\" --url http://10.124.124.0:5150 -- cargo loco start --all\n  rdev service start backend"
+    )]
+    Set(ServiceSetArgs),
     #[command(about = "Start a configured service and watch for readiness")]
     Start(ServiceStartArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceSetArgs {
+    #[arg(help = "Service name")]
+    pub name: String,
+    #[arg(long, help = "Project-relative remote working directory")]
+    pub dir: Option<PathBuf>,
+    #[arg(long, help = "Ready log pattern to detect")]
+    pub ready: String,
+    #[arg(
+        long,
+        default_value = "",
+        help = "URL to print when the service is ready"
+    )]
+    pub url: String,
+    #[arg(last = true, required = true, help = "Remote service command to store")]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]

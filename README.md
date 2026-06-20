@@ -189,11 +189,12 @@ alias 的边界：
 `services` 用于启动远端长期运行服务并检测就绪日志：
 
 ```powershell
+rdev service set backend --dir knota-fold --ready "listening on" --url http://10.124.124.0:5150 -- cargo loco start --all
 rdev service list
 rdev service start backend
 ```
 
-`service start` 通过项目 daemon 执行远程命令，持续输出服务日志；当日志包含 `ready_pattern` 时打印 ready 和配置的 `url`。按 `Ctrl+C` 会取消远程服务。
+`service set` 存在则更新，不存在则新增。`service start` 通过项目 daemon 执行远程命令，持续输出服务日志；当日志包含 `ready_pattern` 时打印 ready 和配置的 `url`。按 `Ctrl+C` 会取消远程服务。
 
 ## Exec Summary
 
