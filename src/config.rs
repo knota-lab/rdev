@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub command: CommandConfig,
     #[serde(default)]
     pub commands: BTreeMap<String, CommandAliasConfig>,
+    #[serde(default)]
+    pub services: BTreeMap<String, ServiceConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +104,16 @@ pub struct CommandAliasConfig {
     pub dir: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceConfig {
+    pub command: String,
+    #[serde(default)]
+    pub dir: String,
+    pub ready_pattern: String,
+    #[serde(default)]
+    pub url: String,
+}
+
 impl AppConfig {
     pub fn path_in_dir(dir: &Path) -> PathBuf {
         dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME)
@@ -139,6 +151,7 @@ impl AppConfig {
             sync: SyncConfig::default(),
             command: CommandConfig::default(),
             commands: BTreeMap::new(),
+            services: BTreeMap::new(),
         }
     }
 }
@@ -217,6 +230,12 @@ remote_env = {}
 [commands.backend-lint]
 dir = "backend"
 command = "cargo clippy --all-features -- -D warnings"
+
+[services.backend]
+dir = "backend"
+command = "cargo run -- start"
+ready_pattern = "listening on"
+url = "http://127.0.0.1:5150"
 "#;
 
         let config = AppConfig::parse(raw);
@@ -237,6 +256,14 @@ command = "cargo clippy --all-features -- -D warnings"
         };
         assert_eq!(alias.dir, "backend");
         assert_eq!(alias.command, "cargo clippy --all-features -- -D warnings");
+        let service = match config.services.get("backend") {
+            Some(service) => service,
+            None => panic!("service should parse"),
+        };
+        assert_eq!(service.dir, "backend");
+        assert_eq!(service.command, "cargo run -- start");
+        assert_eq!(service.ready_pattern, "listening on");
+        assert_eq!(service.url, "http://127.0.0.1:5150");
     }
 
     #[test]
@@ -252,6 +279,7 @@ command = "cargo clippy --all-features -- -D warnings"
         assert_eq!(config.sync.backend, super::SyncBackendKind::Auto);
         assert_eq!(config.sync.rsync_mode, super::RsyncMode::Auto);
         assert!(config.commands.is_empty());
+        assert!(config.services.is_empty());
     }
 
     #[test]

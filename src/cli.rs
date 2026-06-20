@@ -44,6 +44,11 @@ pub enum Command {
         long_about = "Run a one-shot remote command over SSH.\n\nThis command does not use the persistent daemon. Prefer `rdev exec` for Codex/Claude-style repeated remote command execution.\n\nThe command argument may be either a literal remote shell command or a configured remote command alias from [commands.*]. Alias `dir` is resolved relative to the configured remote project path."
     )]
     Run(RunArgs),
+    #[command(
+        about = "Start configured remote services and detect readiness",
+        long_about = "Start configured remote services from [services.*] in .rdev/config.toml.\n\n`rdev service start <name>` runs the service through the persistent daemon, streams logs, and prints a ready line when ready_pattern appears. Press Ctrl+C to stop the remote service.\n\nExample config:\n  [services.backend]\n  dir = \"knota-fold\"\n  command = \"cargo loco start --all\"\n  ready_pattern = \"listening on\"\n  url = \"http://10.124.124.0:5150\""
+    )]
+    Service(ServiceArgs),
     #[command(about = "Run one full sync and exit")]
     Sync(SyncArgs),
     #[command(about = "Start file watching, sync, and optional TUI process console")]
@@ -101,6 +106,26 @@ pub struct AliasDeleteArgs {
 pub struct WhyIgnoreArgs {
     #[arg(help = "Project-relative or absolute local path to inspect")]
     pub path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    #[command(about = "List configured services")]
+    List,
+    #[command(about = "Start a configured service and watch for readiness")]
+    Start(ServiceStartArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceStartArgs {
+    #[arg(help = "Configured service name from [services.<name>]")]
+    pub name: String,
 }
 
 #[derive(Debug, Subcommand)]

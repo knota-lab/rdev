@@ -152,6 +152,12 @@ command = "cargo clippy --all-features -- -D warnings"
 [commands.l2-session]
 dir = "knota-fold"
 command = "cargo run -- task l2_process_session session_id:{session_id}"
+
+[services.backend]
+dir = "knota-fold"
+command = "cargo loco start --all"
+ready_pattern = "listening on"
+url = "http://10.124.124.0:5150"
 ```
 
 `exclude` 支持用 `!` 写包含规则，例如排除所有 `data`，但保留任意路径下的 `src/data`：
@@ -177,6 +183,17 @@ alias 的边界：
 - 不接入 TUI；TUI 里继续用 `new session` / `new remote-session` 管理常驻进程。
 - `dir` 是相对 `remote.path` 的远程工作目录；显式 `--dir` 优先于 alias 自带的 `dir`。
 - `alias set` 存在则更新，不存在则新增；`rdev alias delete <name>` 可删除别名。
+
+## Services
+
+`services` 用于启动远端长期运行服务并检测就绪日志：
+
+```powershell
+rdev service list
+rdev service start backend
+```
+
+`service start` 通过项目 daemon 执行远程命令，持续输出服务日志；当日志包含 `ready_pattern` 时打印 ready 和配置的 `url`。按 `Ctrl+C` 会取消远程服务。
 
 ## Exec Summary
 

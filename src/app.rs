@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use crate::auth::run_auth_check;
 use crate::cli::{
     AliasArgs, AliasCommand, AliasDeleteArgs, AliasSetArgs, Cli, Command, DaemonArgs, ExecArgs,
-    InitArgs, RunArgs, SshArgs, SyncArgs, WhyIgnoreArgs,
+    InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceStartArgs, SshArgs, SyncArgs,
+    WhyIgnoreArgs,
 };
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
-use crate::config::{AppConfig, CommandAliasConfig, SyncBackendKind, CONFIG_DIR_NAME};
-use crate::daemon::{run_daemon_command, run_exec};
+use crate::config::{
+    AppConfig, CommandAliasConfig, ServiceConfig, SyncBackendKind, CONFIG_DIR_NAME,
+};
+use crate::daemon::{run_daemon_command, run_exec, run_exec_with_observer};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
@@ -30,6 +33,7 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Doctor => doctor(cwd),
         Command::Exec(args) => exec(args, cwd),
         Command::Run(args) => run_command(args, cwd),
+        Command::Service(args) => service(args, cwd),
         Command::Sync(args) => sync(args, cwd),
         Command::Up(args) => up(args, cwd),
         Command::Status => status(cwd),
@@ -77,6 +81,13 @@ fn format_sync_exclusion(explanation: SyncExclusionExplanation) -> String {
 
 fn daemon(args: DaemonArgs, cwd: &Path) -> Result<String> {
     run_daemon_command(args, cwd)
+}
+
+fn service(args: ServiceArgs, cwd: &Path) -> Result<String> {
+    match args.command {
+        ServiceCommand::List => service_list(cwd),
+        ServiceCommand::Start(args) => service_start(args, cwd),
+    }
 }
 
 fn alias(args: AliasArgs, cwd: &Path) -> Result<String> {
@@ -188,6 +199,115 @@ fn alias_delete(args: AliasDeleteArgs, cwd: &Path) -> Result<String> {
     }
     write_config(cwd, &config)?;
     Ok(format!("alias deleted: {}", args.name))
+}
+
+fn service_list(cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    if config.services.is_empty() {
+        return Ok("no services configured".to_owned());
+    }
+    let mut lines = Vec::new();
+    for (name, service) in &config.services {
+        let url = if service.url.trim().is_empty() {
+            "-"
+        } else {
+            service.url.as_str()
+        };
+        lines.push(format!(
+            "{name}\tdir={}\tready_pattern={}\turl={url}\tcommand={}",
+            service_dir_label(service),
+            service.ready_pattern,
+            service.command
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn service_start(args: ServiceStartArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let service = config
+        .services
+        .get(&args.name)
+        .ok_or_else(|| {
+            err(error_info::CONFIG_INVALID).with_hint(format!("service not found: {}", args.name))
+        })?
+        .clone();
+    validate_service(&args.name, &service)?;
+    eprintln!(
+        "[service] starting {} dir={} ready_pattern={}",
+        args.name,
+        service_dir_label(&service),
+        service.ready_pattern
+    );
+
+    let ready_pattern = service.ready_pattern.clone();
+    let mut tail = String::new();
+    let mut ready = false;
+    let service_name = args.name.clone();
+    let service_url = service.url.clone();
+    let mut observer = move |data: &str| {
+        if ready {
+            return Ok(());
+        }
+        tail.push_str(data);
+        if tail.len() > 8192 {
+            let drain_to = tail.len().saturating_sub(8192);
+            tail.drain(..drain_to);
+        }
+        if tail.contains(&ready_pattern) {
+            ready = true;
+            if service_url.trim().is_empty() {
+                eprintln!("[service] {service_name} ready");
+            } else {
+                eprintln!("[service] {service_name} ready: {service_url}");
+            }
+        }
+        Ok(())
+    };
+
+    let dir = service_dir(&service);
+    run_exec_with_observer(
+        ExecArgs {
+            command: service.command,
+            dir,
+            summary: false,
+            params: Vec::new(),
+        },
+        cwd,
+        Some(&mut observer),
+    )
+}
+
+fn validate_service(name: &str, service: &ServiceConfig) -> Result<()> {
+    if service.command.trim().is_empty() {
+        return Err(
+            err(error_info::CONFIG_INVALID).with_hint(format!("service command is empty: {name}"))
+        );
+    }
+    if service.ready_pattern.trim().is_empty() {
+        return Err(err(error_info::CONFIG_INVALID)
+            .with_hint(format!("service ready_pattern is empty: {name}")));
+    }
+    if !service.dir.trim().is_empty() {
+        RelativePath::parse(&service.dir)?;
+    }
+    Ok(())
+}
+
+fn service_dir(service: &ServiceConfig) -> Option<PathBuf> {
+    if service.dir.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(service.dir.as_str()))
+    }
+}
+
+fn service_dir_label(service: &ServiceConfig) -> &str {
+    if service.dir.trim().is_empty() {
+        "."
+    } else {
+        service.dir.as_str()
+    }
 }
 
 fn write_config(cwd: &Path, config: &AppConfig) -> Result<()> {
@@ -457,12 +577,12 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::cli::{AliasDeleteArgs, AliasSetArgs};
-    use crate::config::{AppConfig, CommandAliasConfig};
+    use crate::config::{AppConfig, CommandAliasConfig, ServiceConfig};
     use crate::path::{SyncExclusionExplanation, SyncExclusionReason};
 
     use super::{
-        alias_delete, alias_set, format_sync_exclusion, resolve_command_alias, AliasResolveRequest,
-        ResolvedCommand,
+        alias_delete, alias_set, format_sync_exclusion, resolve_command_alias, service_list,
+        AliasResolveRequest, ResolvedCommand,
     };
 
     #[test]
@@ -640,6 +760,34 @@ mod tests {
     }
 
     #[test]
+    fn service_list_formats_configured_services() {
+        let root = temp_project("rdev-service-list-test");
+        write_test_config(&root);
+        let mut config = load_test_config(&root);
+        config.services.insert(
+            "backend".to_owned(),
+            ServiceConfig {
+                dir: "knota-fold".to_owned(),
+                command: "cargo loco start --all".to_owned(),
+                ready_pattern: "listening on".to_owned(),
+                url: "http://10.124.124.0:5150".to_owned(),
+            },
+        );
+        write_raw_config(&root, &config);
+
+        let output = match service_list(&root) {
+            Ok(output) => output,
+            Err(error) => panic!("service list should succeed: {error}"),
+        };
+
+        assert!(output.contains("backend"));
+        assert!(output.contains("dir=knota-fold"));
+        assert!(output.contains("ready_pattern=listening on"));
+        assert!(output.contains("http://10.124.124.0:5150"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn formats_sync_exclusion_reason() {
         let output = format_sync_exclusion(SyncExclusionExplanation {
             relative_path: Some("knota-fold/src/data/mod.rs".to_owned()),
@@ -667,6 +815,10 @@ mod tests {
 
     fn write_test_config(root: &std::path::Path) {
         let config = AppConfig::template("root@example.com", 22, "/root/project");
+        write_raw_config(root, &config);
+    }
+
+    fn write_raw_config(root: &std::path::Path, config: &AppConfig) {
         let raw = match toml::to_string_pretty(&config) {
             Ok(raw) => raw,
             Err(error) => panic!("serialize config: {error}"),

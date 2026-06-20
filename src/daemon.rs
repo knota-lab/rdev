@@ -28,6 +28,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const FRAME_HEADER_LEN: usize = 4;
 const STREAM_BUFFER_LEN: usize = 16 * 1024;
 const SUMMARY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+pub type ExecOutputObserver<'a> = &'a mut dyn FnMut(&str) -> Result<()>;
 const PGID_MARKER: &str = "__RDEV_PGID=";
 const DAEMON_BIN_DIR: &str = "bin";
 
@@ -173,6 +175,14 @@ pub fn daemon_status_snapshot(cwd: &Path) -> DaemonStatusSnapshot {
 }
 
 pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
+    run_exec_with_observer(args, cwd, None)
+}
+
+pub fn run_exec_with_observer(
+    args: ExecArgs,
+    cwd: &Path,
+    mut observer: Option<ExecOutputObserver<'_>>,
+) -> Result<String> {
     let state = ensure_daemon(cwd)?;
     let mut stream = connect_state(&state)?;
     let id = format!("exec-{}", std::process::id());
@@ -216,6 +226,9 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
         let response: DaemonResponse = read_frame(&mut stream)?;
         match response {
             DaemonResponse::Stdout { data, .. } => {
+                if let Some(observer) = observer.as_mut() {
+                    observer(&data)?;
+                }
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.record(&data)?;
                     maybe_print_summary_heartbeat(
@@ -231,6 +244,9 @@ pub fn run_exec(args: ExecArgs, cwd: &Path) -> Result<String> {
                 }
             }
             DaemonResponse::Stderr { data, .. } => {
+                if let Some(observer) = observer.as_mut() {
+                    observer(&data)?;
+                }
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.record(&data)?;
                     maybe_print_summary_heartbeat(
