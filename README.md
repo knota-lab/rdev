@@ -187,7 +187,7 @@ rdev exec --summary "cargo test"
 rdev exec --summary l2-session -- session_id=26
 ```
 
-执行开始时会打印日志路径；长时间运行时会低频打印 captured bytes 心跳。摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。
+执行开始时会打印日志路径；长时间运行时会低频打印 captured bytes 心跳。摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。`.rdev/logs/` 下的 `exec-*.log` 只保留最近 1 小时。
 
 daemon 同一时间只执行一个 `exec`。如果已有远程命令正在运行，新的 `rdev exec` 会排队等待，不会直接返回 `daemon.busy`；`rdev daemon status` 会显示 `queue=N`。
 

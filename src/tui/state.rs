@@ -51,13 +51,9 @@ impl TuiStateStore {
         } else {
             None
         };
-        (
-            Self {
-                path,
-                state: loaded.unwrap_or_default(),
-            },
-            event,
-        )
+        let mut state = loaded.unwrap_or_default();
+        compact_command_history(&mut state.command_history);
+        (Self { path, state }, event)
     }
 
     pub(super) fn command_history(&self) -> &[String] {
@@ -68,14 +64,9 @@ impl TuiStateStore {
         if command.is_empty() {
             return Ok(());
         }
-        if self
-            .state
+        self.state
             .command_history
-            .last()
-            .is_some_and(|previous| previous == command)
-        {
-            return Ok(());
-        }
+            .retain(|previous| previous != command);
         self.state.command_history.push(command.to_owned());
         if self.state.command_history.len() > limit {
             let overflow = self.state.command_history.len() - limit;
@@ -163,6 +154,18 @@ impl TuiStateStore {
     }
 }
 
+fn compact_command_history(history: &mut Vec<String>) {
+    let mut compacted: Vec<String> = Vec::with_capacity(history.len());
+    for command in history.drain(..) {
+        if command.is_empty() {
+            continue;
+        }
+        compacted.retain(|previous| previous != &command);
+        compacted.push(command);
+    }
+    *history = compacted;
+}
+
 impl SavedSessionKind {
     fn label(self) -> &'static str {
         match self {
@@ -174,6 +177,8 @@ impl SavedSessionKind {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{SavedSessionKind, TuiStateStore};
 
     #[test]
@@ -196,5 +201,55 @@ mod tests {
             store.find_session("1").map(|session| session.name),
             Some("web".to_owned())
         );
+    }
+
+    #[test]
+    fn command_history_is_recently_used_unique_on_push() {
+        let root =
+            std::env::temp_dir().join(format!("rdev-state-history-test-{}", std::process::id()));
+        let _cleanup_before = fs::remove_dir_all(&root);
+        let (mut store, _) = TuiStateStore::load(&root);
+        store.state.command_history.clear();
+
+        for command in ["logs web", "s", "logs web", "r", "s"] {
+            if let Err(error) = store.push_command_history(command, 100) {
+                panic!("push history: {error}");
+            }
+        }
+
+        assert_eq!(
+            store.command_history(),
+            &["logs web".to_owned(), "r".to_owned(), "s".to_owned()]
+        );
+        let _cleanup_after = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn command_history_is_recently_used_unique_on_load() {
+        let root = std::env::temp_dir().join(format!(
+            "rdev-state-load-history-test-{}",
+            std::process::id()
+        ));
+        let _cleanup_before = fs::remove_dir_all(&root);
+        let state_dir = root.join(".rdev");
+        if let Err(error) = fs::create_dir_all(&state_dir) {
+            panic!("create state dir: {error}");
+        }
+        let raw = r#"
+command_history = ["logs web", "s", "logs web", "r", "s"]
+sessions = []
+"#;
+        if let Err(error) = fs::write(state_dir.join("tui-state.toml"), raw) {
+            panic!("write state: {error}");
+        }
+
+        let (store, event) = TuiStateStore::load(&root);
+
+        assert_eq!(event, None);
+        assert_eq!(
+            store.command_history(),
+            &["logs web".to_owned(), "r".to_owned(), "s".to_owned()]
+        );
+        let _cleanup_after = fs::remove_dir_all(&root);
     }
 }

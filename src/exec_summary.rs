@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::CONFIG_DIR_NAME;
 use crate::error::{err_with_source, Result};
@@ -10,6 +10,7 @@ use crate::error_info;
 
 const LOG_DIR_NAME: &str = "logs";
 const TAIL_LIMIT: usize = 40;
+const LOG_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct ExecSummaryRecorder {
     command: String,
@@ -28,6 +29,7 @@ impl ExecSummaryRecorder {
         let log_dir = project_root.join(CONFIG_DIR_NAME).join(LOG_DIR_NAME);
         fs::create_dir_all(&log_dir)
             .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
+        prune_logs_older_than(&log_dir, LOG_RETENTION)?;
         let path = log_dir.join(format!("exec-{}.log", now_ms()));
         let file = File::create(&path)
             .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
@@ -134,9 +136,38 @@ fn now_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+fn prune_logs_older_than(log_dir: &Path, retention: Duration) -> Result<()> {
+    let entries = fs::read_dir(log_dir)
+        .map_err(|source| err_with_source(error_info::DAEMON_FAILED, source))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_exec_log_path(&path) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified.elapsed().unwrap_or_default() >= retention {
+            let _remove_result = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_exec_log_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("exec-") && name.ends_with(".log"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_issue_line, ExecSummaryRecorder};
+    use std::time::Duration;
+
+    use super::{is_issue_line, prune_logs_older_than, ExecSummaryRecorder};
 
     #[test]
     fn detects_common_issue_lines() {
@@ -182,6 +213,32 @@ mod tests {
             Err(error) => panic!("read log dir: {error}"),
         };
         assert_eq!(entries, 1);
+        let _cleanup_after = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prunes_only_exec_logs_past_retention() {
+        let root =
+            std::env::temp_dir().join(format!("rdev-exec-log-prune-test-{}", std::process::id()));
+        let _cleanup_before = std::fs::remove_dir_all(&root);
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            panic!("create dir: {error}");
+        }
+        let exec_log = root.join("exec-old.log");
+        let other_log = root.join("other.log");
+        if let Err(error) = std::fs::write(&exec_log, "old") {
+            panic!("write exec log: {error}");
+        }
+        if let Err(error) = std::fs::write(&other_log, "keep") {
+            panic!("write other log: {error}");
+        }
+
+        if let Err(error) = prune_logs_older_than(&root, Duration::ZERO) {
+            panic!("prune logs: {error}");
+        }
+
+        assert!(!exec_log.exists());
+        assert!(other_log.exists());
         let _cleanup_after = std::fs::remove_dir_all(&root);
     }
 }
