@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::auth::run_auth_check;
 use crate::cli::{
     AliasArgs, AliasCommand, AliasDeleteArgs, AliasSetArgs, Cli, Command, DaemonArgs, ExecArgs,
-    InitArgs, RunArgs, SshArgs, SyncArgs,
+    InitArgs, RunArgs, SshArgs, SyncArgs, WhyIgnoreArgs,
 };
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{AppConfig, CommandAliasConfig, SyncBackendKind, CONFIG_DIR_NAME};
@@ -13,7 +13,7 @@ use crate::daemon::{run_daemon_command, run_exec};
 use crate::doctor::run_doctor;
 use crate::error::{err, err_with_source, Result};
 use crate::error_info;
-use crate::path::{RelativePath, RemotePath};
+use crate::path::{RelativePath, RemotePath, SyncExclusionExplanation, SyncExclusionReason};
 use crate::process::SystemProcessRunner;
 use crate::sftp::SftpDeltaBackend;
 use crate::sync::{RsyncSyncBackend, SyncBackend, SyncRequest};
@@ -25,6 +25,7 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Init(args) => init(args, cwd),
         Command::Alias(args) => alias(args, cwd),
         Command::AuthCheck => auth_check(cwd),
+        Command::WhyIgnore(args) => why_ignore(args, cwd),
         Command::Daemon(args) => daemon(args, cwd),
         Command::Doctor => doctor(cwd),
         Command::Exec(args) => exec(args, cwd),
@@ -35,6 +36,43 @@ pub fn run(cli: Cli, cwd: &Path) -> Result<String> {
         Command::Stop => stop(cwd),
         Command::Ssh(args) => ssh(args, cwd),
     }
+}
+
+fn why_ignore(args: WhyIgnoreArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let local_root = resolve_local_root(cwd, &config.sync.local_path);
+    let path = if args.path.is_absolute() {
+        args.path
+    } else {
+        local_root.join(args.path)
+    };
+    let explanation = crate::path::explain_sync_exclusion(&path, &local_root, &config.sync.exclude);
+    Ok(format_sync_exclusion(explanation))
+}
+
+fn format_sync_exclusion(explanation: SyncExclusionExplanation) -> String {
+    let relative = explanation.relative_path.as_deref().unwrap_or("<outside>");
+    let status = if explanation.excluded {
+        "ignored"
+    } else {
+        "included"
+    };
+    let reason = match explanation.reason {
+        SyncExclusionReason::OutsideLocalRoot => {
+            "path is outside configured local sync root".to_owned()
+        }
+        SyncExclusionReason::ProjectRoot => "project root is never ignored".to_owned(),
+        SyncExclusionReason::NoMatchingRule => "no matching exclude rule".to_owned(),
+        SyncExclusionReason::MatchedRule {
+            rule,
+            include,
+            pattern,
+        } => {
+            let kind = if include { "include" } else { "exclude" };
+            format!("matched {kind} rule `{rule}` pattern=`{pattern}`")
+        }
+    };
+    format!("path={relative}\nstatus={status}\nreason={reason}")
 }
 
 fn daemon(args: DaemonArgs, cwd: &Path) -> Result<String> {
@@ -420,9 +458,11 @@ mod tests {
 
     use crate::cli::{AliasDeleteArgs, AliasSetArgs};
     use crate::config::{AppConfig, CommandAliasConfig};
+    use crate::path::{SyncExclusionExplanation, SyncExclusionReason};
 
     use super::{
-        alias_delete, alias_set, resolve_command_alias, AliasResolveRequest, ResolvedCommand,
+        alias_delete, alias_set, format_sync_exclusion, resolve_command_alias, AliasResolveRequest,
+        ResolvedCommand,
     };
 
     #[test]
@@ -597,6 +637,23 @@ mod tests {
         let config = load_test_config(&root);
         assert!(!config.commands.contains_key("build"));
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn formats_sync_exclusion_reason() {
+        let output = format_sync_exclusion(SyncExclusionExplanation {
+            relative_path: Some("knota-fold/src/data/mod.rs".to_owned()),
+            excluded: false,
+            reason: SyncExclusionReason::MatchedRule {
+                rule: "!src/data".to_owned(),
+                include: true,
+                pattern: "src/data".to_owned(),
+            },
+        });
+
+        assert!(output.contains("path=knota-fold/src/data/mod.rs"));
+        assert!(output.contains("status=included"));
+        assert!(output.contains("matched include rule `!src/data`"));
     }
 
     fn temp_project(prefix: &str) -> PathBuf {

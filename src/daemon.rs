@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -74,6 +75,7 @@ enum DaemonResponse {
         remote: String,
         busy: bool,
         active_job: Option<String>,
+        queue: Option<usize>,
     },
     Stopped,
     Stdout {
@@ -99,6 +101,8 @@ struct DaemonRuntime {
     state: DaemonState,
     ssh: Option<SshClient>,
     active_job: Option<ActiveJob>,
+    queued_execs: usize,
+    cancelled_jobs: HashSet<String>,
     shutdown: bool,
 }
 
@@ -123,6 +127,14 @@ struct StreamContext<'a> {
     remote: &'a RemoteCommand,
 }
 
+struct ExecSlotContext<'a> {
+    runtime: &'a Arc<Mutex<DaemonRuntime>>,
+    stream: &'a mut TcpStream,
+    request: &'a ExecRequest,
+    remote: &'a RemoteCommand,
+    cancel: Arc<AtomicBool>,
+}
+
 struct RemoteCommand {
     command: String,
     cancel_path: String,
@@ -136,6 +148,7 @@ pub struct DaemonStatusSnapshot {
     pub remote: Option<String>,
     pub busy: bool,
     pub active_job: Option<String>,
+    pub queue: usize,
 }
 
 pub fn run_daemon_command(args: DaemonArgs, cwd: &Path) -> Result<String> {
@@ -155,6 +168,7 @@ pub fn daemon_status_snapshot(cwd: &Path) -> DaemonStatusSnapshot {
         remote: None,
         busy: false,
         active_job: None,
+        queue: 0,
     })
 }
 
@@ -280,7 +294,7 @@ fn maybe_print_summary_heartbeat(
 
 fn start_daemon(cwd: &Path) -> Result<String> {
     if daemon_is_running(cwd) {
-        return daemon_status(cwd);
+        return daemon_status_with_prefix(cwd, "[daemon] already running");
     }
     let exe = daemon_exe(cwd)?;
     let exe_display = exe.display().to_string();
@@ -301,8 +315,8 @@ fn start_daemon(cwd: &Path) -> Result<String> {
 
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
-        if let Ok(status) = daemon_status(cwd) {
-            return Ok(status);
+        if daemon_status_details(cwd).is_ok() {
+            return daemon_status_with_prefix(cwd, "[daemon] started");
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -368,6 +382,10 @@ fn ensure_daemon(cwd: &Path) -> Result<DaemonState> {
 }
 
 fn daemon_status(cwd: &Path) -> Result<String> {
+    daemon_status_with_prefix(cwd, "[daemon]")
+}
+
+fn daemon_status_with_prefix(cwd: &Path, prefix: &str) -> Result<String> {
     let status = match daemon_status_details(cwd) {
         Ok(status) => status,
         Err(error) if is_daemon_not_running(&error) => {
@@ -380,8 +398,8 @@ fn daemon_status(cwd: &Path) -> Result<String> {
     let addr = status.addr.unwrap_or_else(|| "<unknown>".to_owned());
     let job = status.active_job.unwrap_or_else(|| "<none>".to_owned());
     Ok(format!(
-        "[daemon] pid={pid} remote={remote} addr={addr} busy={} active_job={job}",
-        status.busy
+        "{prefix} pid={pid} remote={remote} addr={addr} busy={} active_job={job} queue={}",
+        status.busy, status.queue
     ))
 }
 
@@ -404,6 +422,7 @@ fn daemon_status_details(cwd: &Path) -> Result<DaemonStatusSnapshot> {
             remote,
             busy,
             active_job,
+            queue,
         } => Ok(DaemonStatusSnapshot {
             running: true,
             pid: Some(pid),
@@ -411,6 +430,7 @@ fn daemon_status_details(cwd: &Path) -> Result<DaemonStatusSnapshot> {
             remote: Some(remote),
             busy,
             active_job,
+            queue: queue.unwrap_or(0),
         }),
         DaemonResponse::Error { code, message } => {
             Err(err(error_info::DAEMON_FAILED).with_hint(format!("{code}: {message}")))
@@ -469,6 +489,8 @@ fn serve_daemon(cwd: &Path) -> Result<String> {
         state,
         ssh: Some(ssh),
         active_job: None,
+        queued_execs: 0,
+        cancelled_jobs: HashSet::new(),
         shutdown: false,
     }));
 
@@ -530,6 +552,7 @@ fn handle_client(runtime: Arc<Mutex<DaemonRuntime>>, mut stream: TcpStream) -> R
                     remote: guard.state.remote.clone(),
                     busy: guard.active_job.is_some(),
                     active_job: guard.active_job.as_ref().map(|job| job.id.clone()),
+                    queue: Some(guard.queued_execs),
                 },
             )
         }
@@ -560,15 +583,17 @@ fn handle_client(runtime: Arc<Mutex<DaemonRuntime>>, mut stream: TcpStream) -> R
             Ok(())
         }
         DaemonRequest::Cancel { id, .. } => {
-            let guard = runtime
+            let mut guard = runtime
                 .lock()
                 .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
             if let Some(job) = &guard.active_job {
                 if job.id == id {
                     job.cancel.store(true, Ordering::SeqCst);
                     write_remote_cancel_file_detached(&guard.config, &job.cancel_path);
+                    return Ok(());
                 }
             }
+            guard.cancelled_jobs.insert(id);
             Ok(())
         }
     }
@@ -587,36 +612,13 @@ fn exec_request(
         guard.config.clone()
     };
     let remote = build_remote_command(&config, &request)?;
-    {
-        let mut guard = runtime
-            .lock()
-            .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
-        if guard.active_job.is_some() {
-            write_frame(
-                stream,
-                &DaemonResponse::Error {
-                    code: error_info::DAEMON_BUSY.code.to_owned(),
-                    message: "another exec is running".to_owned(),
-                },
-            )?;
-            return Ok(());
-        }
-        if guard.ssh.is_none() {
-            write_frame(
-                stream,
-                &DaemonResponse::Error {
-                    code: error_info::DAEMON_BUSY.code.to_owned(),
-                    message: "ssh connection is busy".to_owned(),
-                },
-            )?;
-            return Ok(());
-        }
-        guard.active_job = Some(ActiveJob {
-            id: request.id.clone(),
-            cancel: Arc::clone(&cancel),
-            cancel_path: remote.cancel_path.clone(),
-        });
-    }
+    wait_for_exec_slot(ExecSlotContext {
+        runtime: &runtime,
+        stream,
+        request: &request,
+        remote: &remote,
+        cancel: Arc::clone(&cancel),
+    })?;
     let mut ssh = {
         let mut guard = runtime
             .lock()
@@ -640,6 +642,71 @@ fn exec_request(
     guard.ssh = Some(ssh);
     guard.active_job = None;
     result
+}
+
+fn wait_for_exec_slot(context: ExecSlotContext<'_>) -> Result<()> {
+    let mut queued = false;
+    loop {
+        {
+            let mut guard = context
+                .runtime
+                .lock()
+                .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
+            if guard.shutdown {
+                if queued {
+                    guard.queued_execs = guard.queued_execs.saturating_sub(1);
+                }
+                return Err(err(error_info::DAEMON_FAILED).with_hint("daemon is stopping"));
+            }
+            if guard.cancelled_jobs.remove(&context.request.id) {
+                if queued {
+                    guard.queued_execs = guard.queued_execs.saturating_sub(1);
+                }
+                write_frame(
+                    context.stream,
+                    &DaemonResponse::Exit {
+                        id: context.request.id.clone(),
+                        code: 130,
+                    },
+                )?;
+                return Ok(());
+            }
+            if guard.active_job.is_none() && guard.ssh.is_some() {
+                if queued {
+                    guard.queued_execs = guard.queued_execs.saturating_sub(1);
+                }
+                guard.active_job = Some(ActiveJob {
+                    id: context.request.id.clone(),
+                    cancel: Arc::clone(&context.cancel),
+                    cancel_path: context.remote.cancel_path.clone(),
+                });
+                return Ok(());
+            }
+            if !queued {
+                guard.queued_execs += 1;
+                queued = true;
+                write_frame(
+                    context.stream,
+                    &DaemonResponse::Stderr {
+                        id: context.request.id.clone(),
+                        data: "[daemon] exec queued; waiting for active command to finish\n"
+                            .to_owned(),
+                    },
+                )?;
+            }
+        }
+        if client_disconnected(context.stream) {
+            let mut guard = context
+                .runtime
+                .lock()
+                .map_err(|_| err(error_info::DAEMON_FAILED).with_hint("daemon lock poisoned"))?;
+            if queued {
+                guard.queued_execs = guard.queued_execs.saturating_sub(1);
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn stream_remote_command(context: StreamContext<'_>) -> Result<()> {

@@ -25,6 +25,8 @@ pub enum Command {
     Alias(AliasArgs),
     #[command(about = "Check internal SSH authentication")]
     AuthCheck,
+    #[command(about = "Explain whether a path is ignored by sync exclude rules")]
+    WhyIgnore(WhyIgnoreArgs),
     #[command(
         about = "Manage the project daemon used by rdev exec",
         long_about = "Manage the local project daemon used by `rdev exec`.\n\nThe daemon listens on 127.0.0.1, stores state in .rdev/daemon.json, and keeps one persistent SSH connection to the configured remote."
@@ -93,6 +95,12 @@ pub struct AliasSetArgs {
 pub struct AliasDeleteArgs {
     #[arg(help = "Alias name")]
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WhyIgnoreArgs {
+    #[arg(help = "Project-relative or absolute local path to inspect")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]

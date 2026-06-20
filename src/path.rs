@@ -64,21 +64,67 @@ pub struct PathMapper {
 }
 
 pub fn is_sync_excluded(path: &Path, local_root: &Path, excludes: &[String]) -> bool {
+    explain_sync_exclusion(path, local_root, excludes).excluded
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncExclusionExplanation {
+    pub relative_path: Option<String>,
+    pub excluded: bool,
+    pub reason: SyncExclusionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncExclusionReason {
+    OutsideLocalRoot,
+    ProjectRoot,
+    NoMatchingRule,
+    MatchedRule {
+        rule: String,
+        include: bool,
+        pattern: String,
+    },
+}
+
+pub fn explain_sync_exclusion(
+    path: &Path,
+    local_root: &Path,
+    excludes: &[String],
+) -> SyncExclusionExplanation {
     let Ok(relative) = path.strip_prefix(local_root) else {
-        return true;
+        return SyncExclusionExplanation {
+            relative_path: None,
+            excluded: true,
+            reason: SyncExclusionReason::OutsideLocalRoot,
+        };
     };
+    let relative_path = Some(normalize_relative_path(relative));
     let components = relative_normal_components(relative);
     if components.is_empty() {
-        return false;
+        return SyncExclusionExplanation {
+            relative_path,
+            excluded: false,
+            reason: SyncExclusionReason::ProjectRoot,
+        };
     }
     let mut excluded = false;
-    for rule in excludes {
-        let rule = parse_exclude_rule(rule);
+    let mut reason = SyncExclusionReason::NoMatchingRule;
+    for raw_rule in excludes {
+        let rule = parse_exclude_rule(raw_rule);
         if exclude_matches(&components, rule.pattern) {
             excluded = !rule.include;
+            reason = SyncExclusionReason::MatchedRule {
+                rule: raw_rule.clone(),
+                include: rule.include,
+                pattern: rule.pattern.to_owned(),
+            };
         }
     }
-    excluded
+    SyncExclusionExplanation {
+        relative_path,
+        excluded,
+        reason,
+    }
 }
 
 struct ExcludeRule<'a> {
@@ -214,7 +260,10 @@ fn normalize_relative_path(path: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{is_sync_excluded, PathMapper, RelativePath, RemotePath};
+    use super::{
+        explain_sync_exclusion, is_sync_excluded, PathMapper, RelativePath, RemotePath,
+        SyncExclusionReason,
+    };
 
     #[test]
     fn rejects_broad_remote_paths() {
@@ -308,6 +357,20 @@ mod tests {
             &root,
             &excludes
         ));
+        let explanation = explain_sync_exclusion(
+            &PathBuf::from("J:\\workspace\\knota-fold\\src\\data\\mod.rs"),
+            &root,
+            &excludes,
+        );
+        assert!(!explanation.excluded);
+        assert_eq!(
+            explanation.reason,
+            SyncExclusionReason::MatchedRule {
+                rule: "!src/data".to_owned(),
+                include: true,
+                pattern: "src/data".to_owned(),
+            }
+        );
     }
 
     #[test]
