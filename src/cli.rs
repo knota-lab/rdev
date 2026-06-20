@@ -125,6 +125,8 @@ pub enum ServiceCommand {
     Set(ServiceSetArgs),
     #[command(about = "Start a configured service in the background and wait until ready")]
     Start(ServiceStartArgs),
+    #[command(about = "Wait for an already started service to become ready")]
+    Wait(ServiceWaitArgs),
     #[command(about = "Show configured service runtime status")]
     Status(ServiceStatusArgs),
     #[command(about = "Print configured service logs")]
@@ -153,6 +155,18 @@ pub struct ServiceSetArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceStartArgs {
+    #[arg(help = "Configured service name from [services.<name>]")]
+    pub name: String,
+    #[arg(
+        long,
+        default_value_t = 600,
+        help = "Seconds to wait for ready_pattern"
+    )]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceWaitArgs {
     #[arg(help = "Configured service name from [services.<name>]")]
     pub name: String,
     #[arg(

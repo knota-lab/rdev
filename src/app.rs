@@ -6,7 +6,8 @@ use crate::auth::run_auth_check;
 use crate::cli::{
     AliasArgs, AliasCommand, AliasDeleteArgs, AliasSetArgs, Cli, Command, DaemonArgs, ExecArgs,
     InitArgs, RunArgs, ServiceArgs, ServiceCommand, ServiceLogsArgs, ServiceSetArgs,
-    ServiceStartArgs, ServiceStatusArgs, ServiceStopArgs, SshArgs, SyncArgs, WhyIgnoreArgs,
+    ServiceStartArgs, ServiceStatusArgs, ServiceStopArgs, ServiceWaitArgs, SshArgs, SyncArgs,
+    WhyIgnoreArgs,
 };
 use crate::command::{CommandExit, RunRequest, SshCommandBackend};
 use crate::config::{
@@ -88,6 +89,7 @@ fn service(args: ServiceArgs, cwd: &Path) -> Result<String> {
         ServiceCommand::List => service_list(cwd),
         ServiceCommand::Set(args) => service_set(args, cwd),
         ServiceCommand::Start(args) => service_start(args, cwd),
+        ServiceCommand::Wait(args) => service_wait(args, cwd),
         ServiceCommand::Status(args) => service_status(args, cwd),
         ServiceCommand::Logs(args) => service_logs(args, cwd),
         ServiceCommand::Stop(args) => service_stop(args, cwd),
@@ -280,6 +282,26 @@ fn service_start(args: ServiceStartArgs, cwd: &Path) -> Result<String> {
     )
 }
 
+fn service_wait(args: ServiceWaitArgs, cwd: &Path) -> Result<String> {
+    let config = AppConfig::load_from_dir(cwd)?;
+    let service = configured_service(&config, &args.name)?;
+    validate_service(&args.name, &service)?;
+    run_exec(
+        ExecArgs {
+            command: build_service_wait_command(ServiceCommandBuild {
+                config: &config,
+                name: &args.name,
+                service: &service,
+                value: args.timeout,
+            })?,
+            dir: None,
+            summary: false,
+            params: Vec::new(),
+        },
+        cwd,
+    )
+}
+
 fn service_status(args: ServiceStatusArgs, cwd: &Path) -> Result<String> {
     let config = AppConfig::load_from_dir(cwd)?;
     let service = configured_service(&config, &args.name)?;
@@ -384,6 +406,7 @@ struct ServiceCommandBuild<'a> {
 fn build_service_start_command(build: ServiceCommandBuild<'_>) -> Result<String> {
     let paths = service_paths(build.config, build.name, build.service)?;
     let ready_line = service_ready_line(build.name, build.service);
+    let wait_script = service_wait_script();
     Ok(format!(
         r#"service_name={name}
 state_dir={state_dir}
@@ -435,34 +458,12 @@ if [ -z "$pid" ]; then
   echo "[service] $service_name started pid=$pid"
   echo "[service] log=$log_file"
 fi
-deadline=$(( $(date +%s) + {timeout} ))
+ready_pattern={ready_pattern}
+ready_line={ready_line}
+wait_timeout={timeout}
+deadline=$(( $(date +%s) + wait_timeout ))
 offset=0
-while :; do
-  if [ -f "$log_file" ]; then
-    size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    if [ "$size" -gt "$offset" ] 2>/dev/null; then
-      dd if="$log_file" bs=1 skip="$offset" count=$((size - offset)) 2>/dev/null || true
-      offset=$size
-    fi
-    if grep -F -- {ready_pattern} "$log_file" >/dev/null 2>&1; then
-      date > "$ready_file"
-      echo {ready_line}
-      exit 0
-    fi
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "exited" > "$status_file"
-    wait "$pid"
-    code=$?
-    echo "[service] $service_name exited before ready code=$code" >&2
-    exit "$code"
-  fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "[service] $service_name ready timeout after {timeout}s" >&2
-    exit 124
-  fi
-  sleep 1
-done"#,
+{wait_script}"#,
         name = shell_quote(build.name),
         state_dir = shell_quote(&paths.state_dir),
         work_dir = shell_quote(&paths.work_dir),
@@ -474,7 +475,83 @@ done"#,
         ready_pattern = shell_quote(&build.service.ready_pattern),
         ready_line = shell_quote(&ready_line),
         timeout = build.value,
+        wait_script = wait_script,
     ))
+}
+
+fn build_service_wait_command(build: ServiceCommandBuild<'_>) -> Result<String> {
+    let paths = service_paths(build.config, build.name, build.service)?;
+    let ready_line = service_ready_line(build.name, build.service);
+    let wait_script = service_wait_script();
+    Ok(format!(
+        r#"service_name={name}
+state_dir={state_dir}
+pid_file="$state_dir/pid"
+log_file="$state_dir/output.log"
+status_file="$state_dir/status"
+ready_file="$state_dir/ready"
+if [ ! -f "$pid_file" ]; then
+  echo "[service] $service_name not running" >&2
+  exit 66
+fi
+pid=$(cat "$pid_file" 2>/dev/null || true)
+if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+  echo "[service] $service_name not running" >&2
+  echo "stopped" > "$status_file"
+  exit 66
+fi
+echo "[service] waiting $service_name pid=$pid"
+echo "[service] log=$log_file"
+if [ -f "$ready_file" ]; then
+  echo {ready_line}
+  exit 0
+fi
+ready_pattern={ready_pattern}
+ready_line={ready_line}
+wait_timeout={timeout}
+deadline=$(( $(date +%s) + wait_timeout ))
+offset=0
+{wait_script}"#,
+        name = shell_quote(build.name),
+        state_dir = shell_quote(&paths.state_dir),
+        ready_pattern = shell_quote(&build.service.ready_pattern),
+        ready_line = shell_quote(&ready_line),
+        timeout = build.value,
+        wait_script = wait_script,
+    ))
+}
+
+fn service_wait_script() -> &'static str {
+    r#"while :; do
+  if [ -f "$log_file" ]; then
+    size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$offset" ] 2>/dev/null; then
+      dd if="$log_file" bs=1 skip="$offset" count=$((size - offset)) 2>/dev/null || true
+      offset=$size
+    fi
+    if grep -F -- "$ready_pattern" "$log_file" >/dev/null 2>&1; then
+      date > "$ready_file"
+      echo "$ready_line"
+      exit 0
+    fi
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "exited" > "$status_file"
+    wait "$pid"
+    code=$?
+    echo "[service] $service_name exited before ready code=$code" >&2
+    exit "$code"
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "[service] $service_name ready timeout after ${wait_timeout}s" >&2
+    echo "[service] $service_name still running pid=$pid" >&2
+    echo "[service] inspect with: rdev service status $service_name" >&2
+    echo "[service] logs with: rdev service logs $service_name" >&2
+    echo "[service] stop with: rdev service stop $service_name" >&2
+    exit 124
+  fi
+  sleep 1
+done"#
 }
 
 fn build_service_status_command(build: ServiceCommandBuild<'_>) -> Result<String> {
@@ -885,9 +962,9 @@ mod tests {
 
     use super::{
         alias_delete, alias_set, build_service_logs_command, build_service_start_command,
-        build_service_status_command, build_service_stop_command, format_sync_exclusion,
-        resolve_command_alias, service_list, service_set, AliasResolveRequest, ResolvedCommand,
-        ServiceCommandBuild,
+        build_service_status_command, build_service_stop_command, build_service_wait_command,
+        format_sync_exclusion, resolve_command_alias, service_list, service_set,
+        AliasResolveRequest, ResolvedCommand, ServiceCommandBuild,
     };
 
     #[test]
@@ -1173,8 +1250,22 @@ mod tests {
 
         assert!(start.contains("/root/project/.rdev/services/api"));
         assert!(start.contains("setsid sh -lc"));
-        assert!(start.contains("ready timeout after 30s"));
+        assert!(start.contains("ready timeout after ${wait_timeout}s"));
+        assert!(start.contains("still running pid=$pid"));
+        assert!(start.contains("rdev service logs $service_name"));
         assert!(start.contains("[service] api ready: http://10.124.124.0:5150"));
+
+        let wait = match build_service_wait_command(ServiceCommandBuild {
+            config: &config,
+            name: "api",
+            service: &service,
+            value: 30,
+        }) {
+            Ok(command) => command,
+            Err(error) => panic!("build wait: {error}"),
+        };
+        assert!(wait.contains("[service] waiting $service_name pid=$pid"));
+        assert!(wait.contains("ready timeout after ${wait_timeout}s"));
 
         let status = match build_service_status_command(ServiceCommandBuild {
             config: &config,
