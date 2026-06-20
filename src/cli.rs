@@ -155,7 +155,11 @@ pub struct ServiceSetArgs {
 pub struct ServiceStartArgs {
     #[arg(help = "Configured service name from [services.<name>]")]
     pub name: String,
-    #[arg(long, default_value_t = 60, help = "Seconds to wait for ready_pattern")]
+    #[arg(
+        long,
+        default_value_t = 600,
+        help = "Seconds to wait for ready_pattern"
+    )]
     pub timeout: u64,
 }
 
