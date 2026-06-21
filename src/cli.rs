@@ -46,7 +46,7 @@ pub enum Command {
     Run(RunArgs),
     #[command(
         about = "Start configured remote services and detect readiness",
-        long_about = "Start configured remote services from [services.*] in .rdev/config.toml.\n\n`rdev service start <name>` starts the service in the remote background, streams logs until ready_pattern appears, then exits successfully so coding agents can continue. Use `rdev service status/logs/stop <name>` to inspect or stop the background service.\n\nExample config:\n  [services.backend]\n  dir = \"knota-fold\"\n  command = \"cargo loco start --all\"\n  ready_pattern = \"listening on\"\n  url = \"http://10.124.124.0:5150\""
+        long_about = "Start configured remote services from [services.*] in .rdev/config.toml.\n\n`rdev service start <name>` starts the service in the remote background, prints low-frequency heartbeat while waiting for ready_pattern, then exits successfully so coding agents can continue. Use `--logs` when you need live service logs instead of heartbeat. Use `rdev service status/logs/stop <name>` to inspect or stop the background service.\n\nExample config:\n  [services.backend]\n  dir = \"knota-fold\"\n  command = \"cargo loco start --all\"\n  ready_pattern = \"listening on\"\n  url = \"http://10.124.124.0:5150\""
     )]
     Service(ServiceArgs),
     #[command(about = "Run one full sync and exit")]
@@ -159,6 +159,11 @@ pub struct ServiceStartArgs {
     pub name: String,
     #[arg(
         long,
+        help = "Stream service logs while waiting; disables heartbeat output"
+    )]
+    pub logs: bool,
+    #[arg(
+        long,
         default_value_t = 600,
         help = "Seconds to wait for ready_pattern"
     )]
@@ -169,6 +174,11 @@ pub struct ServiceStartArgs {
 pub struct ServiceWaitArgs {
     #[arg(help = "Configured service name from [services.<name>]")]
     pub name: String,
+    #[arg(
+        long,
+        help = "Stream service logs while waiting; disables heartbeat output"
+    )]
+    pub logs: bool,
     #[arg(
         long,
         default_value_t = 600,

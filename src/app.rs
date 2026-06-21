@@ -273,6 +273,7 @@ fn service_start(args: ServiceStartArgs, cwd: &Path) -> Result<String> {
                 name: &args.name,
                 service: &service,
                 value: args.timeout,
+                stream_logs: args.logs,
             })?,
             dir: None,
             summary: false,
@@ -293,6 +294,7 @@ fn service_wait(args: ServiceWaitArgs, cwd: &Path) -> Result<String> {
                 name: &args.name,
                 service: &service,
                 value: args.timeout,
+                stream_logs: args.logs,
             })?,
             dir: None,
             summary: false,
@@ -313,6 +315,7 @@ fn service_status(args: ServiceStatusArgs, cwd: &Path) -> Result<String> {
                 name: &args.name,
                 service: &service,
                 value: 0,
+                stream_logs: false,
             })?,
             dir: None,
             summary: false,
@@ -333,6 +336,7 @@ fn service_logs(args: ServiceLogsArgs, cwd: &Path) -> Result<String> {
                 name: &args.name,
                 service: &service,
                 value: u64::from(args.lines),
+                stream_logs: false,
             })?,
             dir: None,
             summary: false,
@@ -353,6 +357,7 @@ fn service_stop(args: ServiceStopArgs, cwd: &Path) -> Result<String> {
                 name: &args.name,
                 service: &service,
                 value: 0,
+                stream_logs: false,
             })?,
             dir: None,
             summary: false,
@@ -401,12 +406,15 @@ struct ServiceCommandBuild<'a> {
     name: &'a str,
     service: &'a ServiceConfig,
     value: u64,
+    stream_logs: bool,
 }
 
 fn build_service_start_command(build: ServiceCommandBuild<'_>) -> Result<String> {
     let paths = service_paths(build.config, build.name, build.service)?;
     let ready_line = service_ready_line(build.name, build.service);
+    let summary_script = service_ready_summary_script();
     let wait_script = service_wait_script();
+    let stream_logs = if build.stream_logs { "1" } else { "0" };
     Ok(format!(
         r#"service_name={name}
 state_dir={state_dir}
@@ -415,6 +423,12 @@ pid_file="$state_dir/pid"
 log_file="$state_dir/output.log"
 status_file="$state_dir/status"
 ready_file="$state_dir/ready"
+service_url={url}
+ready_pattern={ready_pattern}
+ready_line={ready_line}
+stream_logs={stream_logs}
+wait_timeout={timeout}
+{summary_script}
 pid=""
 started_here=0
 cleanup_start() {{
@@ -436,7 +450,7 @@ if [ -f "$pid_file" ]; then
     echo "[service] $service_name already running pid=$pid"
     echo "[service] log=$log_file"
     if [ -f "$ready_file" ]; then
-      echo {ready_line}
+      print_service_ready_summary
       exit 0
     fi
   else
@@ -458,9 +472,6 @@ if [ -z "$pid" ]; then
   echo "[service] $service_name started pid=$pid"
   echo "[service] log=$log_file"
 fi
-ready_pattern={ready_pattern}
-ready_line={ready_line}
-wait_timeout={timeout}
 deadline=$(( $(date +%s) + wait_timeout ))
 started_at=$(date +%s)
 last_heartbeat=$started_at
@@ -474,9 +485,12 @@ offset=0
             shell_quote(&paths.work_dir),
             shell_quote(&build.service.command)
         )),
+        url = shell_quote(&build.service.url),
         ready_pattern = shell_quote(&build.service.ready_pattern),
         ready_line = shell_quote(&ready_line),
+        stream_logs = stream_logs,
         timeout = build.value,
+        summary_script = summary_script,
         wait_script = wait_script,
     ))
 }
@@ -484,7 +498,9 @@ offset=0
 fn build_service_wait_command(build: ServiceCommandBuild<'_>) -> Result<String> {
     let paths = service_paths(build.config, build.name, build.service)?;
     let ready_line = service_ready_line(build.name, build.service);
+    let summary_script = service_ready_summary_script();
     let wait_script = service_wait_script();
+    let stream_logs = if build.stream_logs { "1" } else { "0" };
     Ok(format!(
         r#"service_name={name}
 state_dir={state_dir}
@@ -492,6 +508,12 @@ pid_file="$state_dir/pid"
 log_file="$state_dir/output.log"
 status_file="$state_dir/status"
 ready_file="$state_dir/ready"
+service_url={url}
+ready_pattern={ready_pattern}
+ready_line={ready_line}
+stream_logs={stream_logs}
+wait_timeout={timeout}
+{summary_script}
 if [ ! -f "$pid_file" ]; then
   echo "[service] $service_name not running" >&2
   exit 66
@@ -505,12 +527,9 @@ fi
 echo "[service] waiting $service_name pid=$pid"
 echo "[service] log=$log_file"
 if [ -f "$ready_file" ]; then
-  echo {ready_line}
+  print_service_ready_summary
   exit 0
 fi
-ready_pattern={ready_pattern}
-ready_line={ready_line}
-wait_timeout={timeout}
 deadline=$(( $(date +%s) + wait_timeout ))
 started_at=$(date +%s)
 last_heartbeat=$started_at
@@ -518,11 +537,30 @@ offset=0
 {wait_script}"#,
         name = shell_quote(build.name),
         state_dir = shell_quote(&paths.state_dir),
+        url = shell_quote(&build.service.url),
         ready_pattern = shell_quote(&build.service.ready_pattern),
         ready_line = shell_quote(&ready_line),
+        stream_logs = stream_logs,
         timeout = build.value,
+        summary_script = summary_script,
         wait_script = wait_script,
     ))
+}
+
+fn service_ready_summary_script() -> &'static str {
+    r#"print_service_ready_summary() {
+  echo "$ready_line"
+  echo "[service] status=ready"
+  echo "[service] name=$service_name"
+  if [ -n "$service_url" ]; then
+    printf '[service] url=%s\n' "$service_url"
+  fi
+  echo "[service] pid=$pid"
+  echo "[service] remote_log=$log_file"
+  echo "[service] logs_command=rdev service logs $service_name"
+  echo "[service] status_command=rdev service status $service_name"
+  echo "[service] stop_command=rdev service stop $service_name"
+}"#
 }
 
 fn service_wait_script() -> &'static str {
@@ -530,14 +568,14 @@ fn service_wait_script() -> &'static str {
   if [ -f "$log_file" ]; then
     size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
     if [ "$size" -gt "$offset" ] 2>/dev/null; then
-      dd if="$log_file" bs=1 skip="$offset" count=$((size - offset)) 2>/dev/null || true
+      if [ "$stream_logs" = "1" ]; then
+        dd if="$log_file" bs=1 skip="$offset" count=$((size - offset)) 2>/dev/null || true
+      fi
       offset=$size
     fi
     if grep -F -- "$ready_pattern" "$log_file" >/dev/null 2>&1; then
       date > "$ready_file"
-      echo "$ready_line"
-      echo "[service] logs: rdev service logs $service_name"
-      echo "[service] remote_log=$log_file"
+      print_service_ready_summary
       exit 0
     fi
   fi
@@ -556,11 +594,13 @@ fn service_wait_script() -> &'static str {
     echo "[service] stop with: rdev service stop $service_name" >&2
     exit 124
   fi
-  now=$(date +%s)
-  if [ $((now - last_heartbeat)) -ge 10 ]; then
-    elapsed=$((now - started_at))
-    echo "[service] waiting elapsed=${elapsed}s timeout=${wait_timeout}s pid=$pid log=$log_file" >&2
-    last_heartbeat=$now
+  if [ "$stream_logs" != "1" ]; then
+    now=$(date +%s)
+    if [ $((now - last_heartbeat)) -ge 10 ]; then
+      elapsed=$((now - started_at))
+      echo "[service] waiting elapsed=${elapsed}s timeout=${wait_timeout}s pid=$pid log=$log_file" >&2
+      last_heartbeat=$now
+    fi
   fi
   sleep 1
 done"#
@@ -1259,6 +1299,7 @@ mod tests {
             name: "api",
             service: &service,
             value: 30,
+            stream_logs: false,
         };
 
         let start = match build_service_start_command(build) {
@@ -1270,8 +1311,12 @@ mod tests {
         assert!(start.contains("setsid sh -lc"));
         assert!(start.contains("ready timeout after ${wait_timeout}s"));
         assert!(start.contains("still running pid=$pid"));
+        assert!(start.contains("stream_logs=0"));
+        assert!(start.contains("if [ \"$stream_logs\" = \"1\" ]; then"));
+        assert!(start.contains("if [ \"$stream_logs\" != \"1\" ]; then"));
         assert!(start.contains("waiting elapsed=${elapsed}s timeout=${wait_timeout}s"));
-        assert!(start.contains("[service] logs: rdev service logs $service_name"));
+        assert!(start.contains("logs_command=rdev service logs $service_name"));
+        assert!(start.contains("status_command=rdev service status $service_name"));
         assert!(start.contains("[service] remote_log=$log_file"));
         assert!(start.contains("rdev service logs $service_name"));
         assert!(start.contains("[service] api ready: http://10.124.124.0:5150"));
@@ -1281,6 +1326,7 @@ mod tests {
             name: "api",
             service: &service,
             value: 30,
+            stream_logs: false,
         }) {
             Ok(command) => command,
             Err(error) => panic!("build wait: {error}"),
@@ -1293,6 +1339,7 @@ mod tests {
             name: "api",
             service: &service,
             value: 0,
+            stream_logs: false,
         }) {
             Ok(command) => command,
             Err(error) => panic!("build status: {error}"),
@@ -1309,6 +1356,7 @@ mod tests {
             name: "api",
             service: &service,
             value: 25,
+            stream_logs: false,
         }) {
             Ok(command) => command,
             Err(error) => panic!("build logs: {error}"),
@@ -1320,12 +1368,39 @@ mod tests {
             name: "api",
             service: &service,
             value: 0,
+            stream_logs: false,
         }) {
             Ok(command) => command,
             Err(error) => panic!("build stop: {error}"),
         };
         assert!(stop.contains("kill -INT -\"$pid\""));
         assert!(stop.contains("[service] $service_name stopped"));
+    }
+
+    #[test]
+    fn service_start_can_stream_logs_instead_of_heartbeat() {
+        let config = AppConfig::template("root@example.com", 22, "/root/project");
+        let service = ServiceConfig {
+            dir: "backend".to_owned(),
+            command: "pnpm dev --host".to_owned(),
+            ready_pattern: "ready".to_owned(),
+            url: String::new(),
+        };
+
+        let start = match build_service_start_command(ServiceCommandBuild {
+            config: &config,
+            name: "web",
+            service: &service,
+            value: 600,
+            stream_logs: true,
+        }) {
+            Ok(command) => command,
+            Err(error) => panic!("build start: {error}"),
+        };
+
+        assert!(start.contains("stream_logs=1"));
+        assert!(start.contains("dd if=\"$log_file\""));
+        assert!(start.contains("if [ \"$stream_logs\" != \"1\" ]; then"));
     }
 
     #[test]
