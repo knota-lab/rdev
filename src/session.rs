@@ -386,6 +386,15 @@ impl SessionManager {
         ))
     }
 
+    pub fn insert_blank_log(&mut self, id: u32) -> Result<()> {
+        self.refresh();
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
+        };
+        push_log(session, String::new());
+        Ok(())
+    }
+
     pub fn logs(&mut self, selector: Option<&str>) -> Result<String> {
         self.refresh();
         let id = self.resolve_or_focused(selector)?;

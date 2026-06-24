@@ -703,6 +703,15 @@ impl TuiModel {
         }
     }
 
+    fn push_sync_blank_log(&mut self) {
+        self.sync_logs.push(UiLogLine::blank());
+        self.sync_log_version = self.sync_log_version.saturating_add(1);
+        if self.sync_logs.len() > 500 {
+            let overflow = self.sync_logs.len() - 500;
+            self.sync_logs.drain(0..overflow);
+        }
+    }
+
     fn focus_manager_to_current(&mut self) {
         let Some(session_id) = self
             .processes
@@ -958,13 +967,28 @@ impl TuiSyncRuntime {
         model.sync_status = ProcessStatus::Running;
         let upload_count = changes.uploads.len();
         let delete_count = changes.deletes.len();
-        model.push_sync_log(format!(
-            "delta start uploads={upload_count} deletes={delete_count}"
-        ));
+        let force_full = changes.exceeds_full_sync_threshold(config.sync.full_sync_threshold);
+        if force_full {
+            model.push_sync_log(format!(
+                "pending changes={} exceeds full_sync_threshold={}; running full sync",
+                changes.len(),
+                config.sync.full_sync_threshold
+            ));
+        } else {
+            model.push_sync_log(format!(
+                "delta start uploads={upload_count} deletes={delete_count}"
+            ));
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         match self.worker.sender.send(SyncJob {
             project_root: self.local_root.clone(),
-            kind: SyncJobKind::Delta(changes),
+            kind: if force_full {
+                SyncJobKind::Full {
+                    delete: config.sync.delete,
+                }
+            } else {
+                SyncJobKind::Delta(changes)
+            },
             cancel: Arc::clone(&cancel),
         }) {
             Ok(()) => {
@@ -2010,10 +2034,40 @@ fn submit_input(model: &mut TuiModel, runtime: &mut TuiEventRuntime<'_>) -> bool
     let command = model.input.trim().to_owned();
     model.clear_input();
     if command.is_empty() {
+        insert_blank_log_line(model);
         return false;
     }
     model.push_command_history(&command);
     execute_console_command(model, runtime, parse_console_command(&command))
+}
+
+fn insert_blank_log_line(model: &mut TuiModel) {
+    let focused = model.focused_process().cloned();
+    match focused.as_ref().and_then(|process| process.session_id) {
+        Some(id) => {
+            if let Err(error) =
+                lock_sessions(model).and_then(|mut manager| manager.insert_blank_log(id))
+            {
+                model.push_error(tui_error_message(&error));
+                return;
+            }
+            model.focused_log_version = 0;
+        }
+        None if focused
+            .as_ref()
+            .is_some_and(|process| process.name == "sync") =>
+        {
+            model.push_sync_blank_log();
+        }
+        None => {
+            model.logs.push(UiLogLine::blank());
+            model.focused_log_version = 0;
+            model.log_rows_cache = None;
+        }
+    }
+    model.follow_logs = true;
+    model.log_scroll = 0;
+    model.selection = None;
 }
 
 fn focus_by_digit(model: &mut TuiModel, digit: char) {

@@ -86,6 +86,7 @@ exclude = [".git", "target", "node_modules", "data", ".rdev", "dist", "build"]
 use_gitignore = true
 debounce_ms = 300
 delete = true
+full_sync_threshold = 32
 backend = "auto"
 
 [command]
@@ -215,6 +216,8 @@ ready 超时返回 `124`，但不会停止远端服务。可以继续用 `wait/s
 - `backend = "rsync"`：复用系统 rsync，适合已有 rsync 环境。
 
 TUI 的内置 SFTP 连接会缓存 SSH 连接。连接失效时会清掉旧连接、重连一次并重试当前同步；如果重连仍失败，下一次手动 `sync` 会重新建连接。
+
+监听模式下，如果一次待同步列表超过 `full_sync_threshold`，会直接改跑全量同步，避免大量文件逐个排队上传。设置为 `0` 可关闭这个自动切换。
 
 ## 排障
 

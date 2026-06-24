@@ -324,15 +324,41 @@ fn run_watch_loop(watch: WatchLoop<'_>) -> Result<()> {
                         continue;
                     }
                     watch.interrupt.store(false, Ordering::SeqCst);
-                    let result = watch.backend.sync_delta(SyncDeltaRequest {
-                        project_root: watch.local_root.to_path_buf(),
-                        uploads: changes.uploads.iter().cloned().collect(),
-                        deletes: changes.deletes.iter().cloned().collect(),
-                        cancelled: Some(Arc::clone(&watch.interrupt)),
-                    });
+                    let result = if changes
+                        .exceeds_full_sync_threshold(watch.config.sync.full_sync_threshold)
+                    {
+                        println!(
+                            "[sync] pending changes={} exceeds full_sync_threshold={}; running full sync",
+                            changes.len(),
+                            watch.config.sync.full_sync_threshold
+                        );
+                        watch.backend.sync_full(SyncRequest {
+                            dry_run: false,
+                            delete: watch.config.sync.delete,
+                            project_root: watch.local_root.to_path_buf(),
+                            cancelled: Some(Arc::clone(&watch.interrupt)),
+                        })
+                    } else {
+                        watch.backend.sync_delta(SyncDeltaRequest {
+                            project_root: watch.local_root.to_path_buf(),
+                            uploads: changes.uploads.iter().cloned().collect(),
+                            deletes: changes.deletes.iter().cloned().collect(),
+                            cancelled: Some(Arc::clone(&watch.interrupt)),
+                        })
+                    };
                     match result {
                         Ok(report) => {
-                            synced_files.record(&changes, watch.local_root);
+                            if changes
+                                .exceeds_full_sync_threshold(watch.config.sync.full_sync_threshold)
+                            {
+                                synced_files.record_existing(&EventFilter {
+                                    local_root: watch.local_root,
+                                    watch_dirs: &watch.config.sync.watch_dirs,
+                                    excludes: &watch.config.sync.exclude,
+                                });
+                            } else {
+                                synced_files.record(&changes, watch.local_root);
+                            }
                             println!("{}", report.format_text());
                         }
                         Err(error) => {
@@ -830,6 +856,14 @@ impl PendingChanges {
         !self.uploads.is_empty() || !self.deletes.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.uploads.len() + self.deletes.len()
+    }
+
+    pub(crate) fn exceeds_full_sync_threshold(&self, threshold: usize) -> bool {
+        threshold > 0 && self.len() > threshold
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         for upload in other.uploads {
             self.deletes.remove(&upload);
@@ -1041,6 +1075,19 @@ mod tests {
 
         assert!(changes.uploads.is_empty());
         assert!(changes.deletes.contains(&PathBuf::from("src\\gone.rs")));
+    }
+
+    #[test]
+    fn pending_changes_exceed_full_sync_threshold() {
+        let mut changes = super::PendingChanges::default();
+        changes.uploads.insert(PathBuf::from("src\\a.rs"));
+        changes.uploads.insert(PathBuf::from("src\\b.rs"));
+        changes.deletes.insert(PathBuf::from("src\\old.rs"));
+
+        assert_eq!(changes.len(), 3);
+        assert!(!changes.exceeds_full_sync_threshold(0));
+        assert!(!changes.exceeds_full_sync_threshold(3));
+        assert!(changes.exceeds_full_sync_threshold(2));
     }
 
     #[test]

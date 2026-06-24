@@ -24,6 +24,20 @@ pub(crate) fn upload_tar(client: &mut SshClient, upload: TarUpload<'_>) -> Resul
     if upload.request.is_cancelled() {
         return Err(err(error_info::SYNC_CANCELLED));
     }
+    let stats = scan_project_tar(TarUpload {
+        config: upload.config,
+        request: upload.request,
+        remote_root: upload.remote_root,
+        output: Arc::clone(&upload.output),
+    })?;
+    upload.output.line(format!(
+        "[sync] full scan files={} dirs={} excluded={} bytes={} ({})",
+        stats.files,
+        stats.dirs,
+        stats.excluded,
+        stats.bytes,
+        format_bytes(stats.bytes)
+    ));
     let remote_root = shell_quote(upload.remote_root.as_str());
     client.exec_checked(
         &sh_c(&format!("mkdir -p {remote_root}")),
@@ -134,6 +148,51 @@ impl TarProgress {
     }
 }
 
+#[derive(Default)]
+struct TarScanStats {
+    files: u64,
+    dirs: u64,
+    excluded: u64,
+    bytes: u64,
+}
+
+fn scan_project_tar(upload: TarUpload<'_>) -> Result<TarScanStats> {
+    let mut stats = TarScanStats::default();
+    for watch_dir in &upload.config.sync.watch_dirs {
+        let source = local_source(&upload.request.project_root, watch_dir);
+        for entry in WalkDir::new(&source)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                let keep = entry.path() == source
+                    || !is_sync_excluded(entry.path(), &source, &upload.config.sync.exclude);
+                if !keep {
+                    stats.excluded = stats.excluded.saturating_add(1);
+                }
+                keep
+            })
+        {
+            if upload.request.is_cancelled() {
+                return Err(err(error_info::SYNC_CANCELLED));
+            }
+            let entry =
+                entry.map_err(|source| err_with_source(error_info::SYNC_SSH_TAR_FAILED, source))?;
+            let path = entry.path();
+            if path == source {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                stats.dirs = stats.dirs.saturating_add(1);
+            } else if entry.file_type().is_file() {
+                stats.files = stats.files.saturating_add(1);
+                let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
+                stats.bytes = stats.bytes.saturating_add(bytes);
+            }
+        }
+    }
+    Ok(stats)
+}
+
 fn append_project_tar<W: Write>(
     archive: &mut tar::Builder<W>,
     upload: TarUpload<'_>,
@@ -178,6 +237,21 @@ fn append_project_tar<W: Write>(
     }
     progress.print("done");
     Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn tar_channel_error(

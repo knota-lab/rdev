@@ -17,6 +17,7 @@ enum LogStream {
     Stdout,
     Stderr,
     Rdev,
+    Blank,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,13 @@ impl UiLogLine {
         }
     }
 
+    pub(super) fn blank() -> Self {
+        Self {
+            stream: LogStream::Blank,
+            text: String::new(),
+        }
+    }
+
     fn prefix_segment(&self) -> Option<StyledTextSegment> {
         match self.stream {
             LogStream::Stdout => Some(StyledTextSegment {
@@ -69,6 +77,7 @@ impl UiLogLine {
                 text: "rdev".to_owned(),
                 style: Style::default().fg(Color::DarkGray),
             }),
+            LogStream::Blank => None,
         }
     }
 
@@ -322,7 +331,9 @@ fn message_width(width: u16) -> u16 {
 }
 
 pub(super) fn parse_log_line(line: &str) -> UiLogLine {
-    if let Some(text) = line.strip_prefix("[stdout] ") {
+    if line.is_empty() {
+        UiLogLine::blank()
+    } else if let Some(text) = line.strip_prefix("[stdout] ") {
         UiLogLine::stdout(text)
     } else if let Some(text) = line.strip_prefix("[stderr] ") {
         UiLogLine::stderr(text)
@@ -463,7 +474,7 @@ fn byte_index_for_display_col(text: &str, col: u16) -> usize {
 mod tests {
     use super::{
         ansi_styled_segments, parse_log_line, strip_ansi_escapes, wrap_display_line,
-        wrap_styled_line, wrapped_log_rows,
+        wrap_styled_line, wrapped_log_rows, UiLogLine,
     };
     use ratatui::style::{Color, Style};
 
@@ -493,6 +504,16 @@ mod tests {
                 "index.js".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn blank_log_line_renders_without_prefix() {
+        let rows = wrapped_log_rows(&[UiLogLine::blank()], 80);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].plain, "");
+        assert!(rows[0].prefix.is_none());
+        assert_eq!(parse_log_line(""), UiLogLine::blank());
     }
 
     #[test]
