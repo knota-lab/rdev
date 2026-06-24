@@ -2077,6 +2077,9 @@ fn execute_console_command(
             stop_focused(model, runtime.commands);
             Ok(String::new())
         }
+        ConsoleCommand::Enter { selector } => {
+            lock_sessions(model).and_then(|mut manager| manager.send_enter(selector.as_deref()))
+        }
         ConsoleCommand::Restart { selector } => SessionManager::restart(&model.sessions, &selector),
         ConsoleCommand::RestartFocused => {
             restart_focused(model, runtime.commands);

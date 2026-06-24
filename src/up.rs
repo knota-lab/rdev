@@ -430,6 +430,10 @@ fn handle_console_command(
         ConsoleCommand::StopFocused => {
             println!("[console] shorthand s is available in TUI mode");
         }
+        ConsoleCommand::Enter { selector } => {
+            let mut manager = lock_sessions_for_console(sessions)?;
+            println!("{}", manager.send_enter(selector.as_deref())?);
+        }
         ConsoleCommand::Restart { selector } => {
             println!("{}", SessionManager::restart(sessions, &selector)?);
         }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,6 +56,9 @@ pub enum ConsoleCommand {
         selector: String,
     },
     StopFocused,
+    Enter {
+        selector: Option<String>,
+    },
     Restart {
         selector: String,
     },
@@ -128,6 +131,7 @@ struct ManagedSession {
     command: String,
     status: SessionStatus,
     child: Option<Child>,
+    stdin: Option<ChildStdin>,
     logs: VecDeque<String>,
     log_version: u64,
     exit_code: Option<i32>,
@@ -257,11 +261,12 @@ impl SessionManager {
         let process_display = command_display(&process);
         let mut child = process
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| err_with_source(error_info::WATCH_EVENT_FAILED, source))?;
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let id = {
@@ -281,6 +286,7 @@ impl SessionManager {
                     command: command.clone(),
                     status: SessionStatus::Running,
                     child: Some(child),
+                    stdin,
                     logs: VecDeque::from([format!("[rdev] spawn {process_display}")]),
                     log_version: 1,
                     exit_code: None,
@@ -439,6 +445,28 @@ impl SessionManager {
         self.stop_id(id)
     }
 
+    pub fn send_enter(&mut self, selector: Option<&str>) -> Result<String> {
+        self.refresh();
+        let id = self.resolve_or_focused(selector)?;
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Err(err(error_info::SESSION_FAILED).with_hint("session not found"));
+        };
+        if session.status != SessionStatus::Running {
+            return Err(err(error_info::SESSION_FAILED)
+                .with_hint(format!("session is not running: {}", session.name)));
+        }
+        let Some(stdin) = session.stdin.as_mut() else {
+            return Err(err(error_info::SESSION_FAILED)
+                .with_hint(format!("session stdin is not available: {}", session.name)));
+        };
+        stdin
+            .write_all(b"\n")
+            .and_then(|_| stdin.flush())
+            .map_err(|source| err_with_source(error_info::SESSION_FAILED, source))?;
+        push_log(session, "[rdev] sent enter".to_owned());
+        Ok(format!("sent enter: {}", session.name))
+    }
+
     pub fn delete_inactive(&mut self, selector: &str) -> Result<String> {
         self.refresh();
         let id = self.resolve(selector)?;
@@ -532,6 +560,7 @@ impl SessionManager {
             terminate_child(&mut child)?;
             session.exit_code = wait_child_exit(&mut child)?;
         }
+        session.stdin = None;
         session.status = SessionStatus::Stopped;
         push_log(session, "[rdev] stopped".to_owned());
         Ok(format!("session stopped: {}", session.name))
@@ -581,6 +610,7 @@ impl SessionManager {
                 session.exit_code = status.code();
                 session.status = SessionStatus::Exited;
                 session.child = None;
+                session.stdin = None;
                 push_log(
                     session,
                     format!("[rdev] exited code={}", status_code_label(status.code())),
@@ -748,6 +778,19 @@ pub fn parse_console_command(line: &str) -> ConsoleCommand {
             selector: rest.trim().to_owned(),
         };
     }
+    if trimmed == "enter" || trimmed == "newline" {
+        return ConsoleCommand::Enter { selector: None };
+    }
+    if let Some(rest) = trimmed.strip_prefix("enter ") {
+        return ConsoleCommand::Enter {
+            selector: optional_arg(rest),
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("newline ") {
+        return ConsoleCommand::Enter {
+            selector: optional_arg(rest),
+        };
+    }
     if let Some(rest) = trimmed.strip_prefix("restart ") {
         return ConsoleCommand::Restart {
             selector: rest.trim().to_owned(),
@@ -776,6 +819,7 @@ pub fn help_text() -> &'static str {
      clear-logs [name|id]        clear buffered logs\n\
      focus <name|id>             focus a session\n\
      stop <name|id> | s          stop a session, or focused session with s\n\
+     enter [name|id]             send Enter/newline to a running session\n\
      restart <name|id> | r       restart a session, or focused session with r\n\
      sync                        run full sync\n\
      daemon start                start persistent SSH daemon for rdev exec\n\
@@ -888,8 +932,7 @@ impl RemoteSession {
         let remote_command = self.remote_session_command(name, command);
         let remote_shell = remote_session_shell(&remote_command);
         let mut ssh = Command::new("ssh");
-        ssh.arg("-n")
-            .arg("-T")
+        ssh.arg("-T")
             .arg("-p")
             .arg(self.port.to_string())
             .arg("-o")
@@ -1139,6 +1182,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_enter_command() {
+        assert_eq!(
+            parse_console_command("enter"),
+            ConsoleCommand::Enter { selector: None }
+        );
+        assert_eq!(
+            parse_console_command("enter web"),
+            ConsoleCommand::Enter {
+                selector: Some("web".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_console_command("newline 2"),
+            ConsoleCommand::Enter {
+                selector: Some("2".to_owned())
+            }
+        );
+    }
+
+    #[test]
     fn parses_daemon_commands() {
         assert_eq!(
             parse_console_command("daemon start"),
@@ -1283,7 +1346,6 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert!(args.iter().any(|arg| arg == "-n"));
         assert!(args.iter().any(|arg| arg == "-T"));
         assert!(args.iter().any(|arg| arg == "ServerAliveInterval=15"));
         assert!(args.iter().any(|arg| arg == "ServerAliveCountMax=3"));
@@ -1343,6 +1405,7 @@ mod tests {
                 command: "echo old".to_owned(),
                 status,
                 child: None,
+                stdin: None,
                 logs: VecDeque::new(),
                 log_version: 0,
                 exit_code: None,

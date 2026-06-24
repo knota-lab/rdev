@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::AppConfig;
-use crate::error::{err, Result};
+use crate::error::{err, RdevError, Result};
 use crate::error_info;
 use crate::path::RemotePath;
 use crate::ssh::{sh_c, RemoteCheck, SshClient, UploadRequest};
@@ -49,47 +49,50 @@ impl<'a> SftpDeltaBackend<'a> {
             request.deletes.len()
         ));
         let started = Instant::now();
-        self.with_client(|client| {
-            for path in &request.uploads {
-                if request.is_cancelled() {
-                    return Err(err(error_info::SYNC_CANCELLED));
-                }
-                let item_started = Instant::now();
-                let local_path = request.project_root.join(path);
-                if !local_path.exists() {
+        self.with_client_retry_if(
+            |error| !request.is_cancelled() && should_retry_with_reconnect(error),
+            |client| {
+                for path in &request.uploads {
+                    if request.is_cancelled() {
+                        return Err(err(error_info::SYNC_CANCELLED));
+                    }
+                    let item_started = Instant::now();
+                    let local_path = request.project_root.join(path);
+                    if !local_path.exists() {
+                        self.output.line(format!(
+                            "[sync] upload skipped vanished path={}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    let remote_path = remote_path(&remote_root, path);
+                    client.upload(UploadRequest {
+                        local_path: &local_path,
+                        remote_path: Path::new(&remote_path),
+                        cancelled: request.cancelled.as_ref(),
+                    })?;
                     self.output.line(format!(
-                        "[sync] upload skipped vanished path={}",
-                        path.display()
+                        "[sync] upload ok path={} elapsed_ms={}",
+                        path.display(),
+                        item_started.elapsed().as_millis()
                     ));
-                    continue;
                 }
-                let remote_path = remote_path(&remote_root, path);
-                client.upload(UploadRequest {
-                    local_path: &local_path,
-                    remote_path: Path::new(&remote_path),
-                    cancelled: request.cancelled.as_ref(),
-                })?;
-                self.output.line(format!(
-                    "[sync] upload ok path={} elapsed_ms={}",
-                    path.display(),
-                    item_started.elapsed().as_millis()
-                ));
-            }
-            for path in &request.deletes {
-                if request.is_cancelled() {
-                    return Err(err(error_info::SYNC_CANCELLED));
+                for path in &request.deletes {
+                    if request.is_cancelled() {
+                        return Err(err(error_info::SYNC_CANCELLED));
+                    }
+                    let item_started = Instant::now();
+                    let remote_path = remote_path(&remote_root, path);
+                    client.remove(Path::new(&remote_path))?;
+                    self.output.line(format!(
+                        "[sync] delete ok path={} elapsed_ms={}",
+                        path.display(),
+                        item_started.elapsed().as_millis()
+                    ));
                 }
-                let item_started = Instant::now();
-                let remote_path = remote_path(&remote_root, path);
-                client.remove(Path::new(&remote_path))?;
-                self.output.line(format!(
-                    "[sync] delete ok path={} elapsed_ms={}",
-                    path.display(),
-                    item_started.elapsed().as_millis()
-                ));
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         self.output.line(format!(
             "[sync] delta done elapsed_ms={}",
             started.elapsed().as_millis()
@@ -110,17 +113,20 @@ impl<'a> SftpDeltaBackend<'a> {
         let started = Instant::now();
         self.output
             .line("[sync] full start transport=ssh-tar".to_owned());
-        self.with_client(|client| {
-            upload_tar(
-                client,
-                TarUpload {
-                    config: self.config,
-                    request: &request,
-                    remote_root: &remote_root,
-                    output: Arc::clone(&self.output),
-                },
-            )
-        })?;
+        self.with_client_retry_if(
+            |error| !request.is_cancelled() && should_retry_with_reconnect(error),
+            |client| {
+                upload_tar(
+                    client,
+                    TarUpload {
+                        config: self.config,
+                        request: &request,
+                        remote_root: &remote_root,
+                        output: Arc::clone(&self.output),
+                    },
+                )
+            },
+        )?;
         self.output.line(format!(
             "[sync] full done transport=ssh-tar elapsed_ms={}",
             started.elapsed().as_millis()
@@ -141,7 +147,41 @@ impl<'a> SftpDeltaBackend<'a> {
         Ok(())
     }
 
-    fn with_client<T>(&self, action: impl FnOnce(&mut SshClient) -> Result<T>) -> Result<T> {
+    fn with_client<T>(&self, action: impl FnMut(&mut SshClient) -> Result<T>) -> Result<T> {
+        self.with_client_retry_if(should_retry_with_reconnect, action)
+    }
+
+    fn with_client_retry_if<T>(
+        &self,
+        should_retry: impl Fn(&RdevError) -> bool,
+        mut action: impl FnMut(&mut SshClient) -> Result<T>,
+    ) -> Result<T> {
+        match self.with_client_once(&mut action) {
+            Ok(value) => Ok(value),
+            Err(error) if should_retry(&error) => {
+                let first_error = error.to_string();
+                self.output.line(format!(
+                    "[sync] ssh connection may be stale; reconnecting once after {first_error}"
+                ));
+                self.client.replace(None);
+                match self.with_client_once(&mut action) {
+                    Ok(value) => Ok(value),
+                    Err(retry_error) => {
+                        self.client.replace(None);
+                        Err(retry_error.with_hint(format!(
+                            "retry after SSH reconnect failed; first error: {first_error}"
+                        )))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn with_client_once<T>(
+        &self,
+        action: &mut impl FnMut(&mut SshClient) -> Result<T>,
+    ) -> Result<T> {
         if self.client.borrow().is_none() {
             let mut client = SshClient::connect(self.config)?;
             client.set_output(Arc::clone(&self.output));
@@ -153,6 +193,14 @@ impl<'a> SftpDeltaBackend<'a> {
         };
         action(client)
     }
+}
+fn should_retry_with_reconnect(error: &RdevError) -> bool {
+    matches!(
+        error.info,
+        error_info::SYNC_SFTP_FAILED
+            | error_info::SYNC_SSH_TAR_FAILED
+            | error_info::REMOTE_SSH_CONNECT_FAILED
+    )
 }
 
 impl SyncBackend for SftpDeltaBackend<'_> {
@@ -195,9 +243,11 @@ fn path_to_forward_slashes(path: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::error::err;
+    use crate::error_info;
     use crate::path::RemotePath;
 
-    use super::remote_path;
+    use super::{remote_path, should_retry_with_reconnect};
 
     #[test]
     fn builds_remote_path_with_forward_slashes() {
@@ -207,6 +257,25 @@ mod tests {
             remote_path(&root, &PathBuf::from("src\\main.rs")),
             "/rdev/project/src/main.rs"
         );
+    }
+
+    #[test]
+    fn reconnect_retry_only_handles_ssh_sync_errors() {
+        assert!(should_retry_with_reconnect(&err(
+            error_info::SYNC_SFTP_FAILED
+        )));
+        assert!(should_retry_with_reconnect(&err(
+            error_info::SYNC_SSH_TAR_FAILED
+        )));
+        assert!(should_retry_with_reconnect(&err(
+            error_info::REMOTE_SSH_CONNECT_FAILED
+        )));
+        assert!(!should_retry_with_reconnect(&err(
+            error_info::SYNC_CANCELLED
+        )));
+        assert!(!should_retry_with_reconnect(&err(
+            error_info::CONFIG_INVALID
+        )));
     }
 
     fn parse_root() -> RemotePath {

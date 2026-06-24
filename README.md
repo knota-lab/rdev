@@ -1,51 +1,44 @@
 # rdev
 
-rdev 是一个面向“本地编辑、远程构建/运行”工作流的开发辅助工具。
+rdev 用于“本地写代码，远程构建/运行”的开发方式。它把文件同步、远程命令、服务启动和 TUI 日志面板放在一个工具里，主要面向 Windows 本地编辑、Linux 服务器运行项目的场景。
 
-它把文件同步、远程命令执行、服务日志查看和进程管理收敛到一个命令行工具里，适合在 Windows 本地编辑代码、Linux 服务器上构建和运行服务的场景。
+## 核心能力
 
-## Features
+- `rdev sync`：同步一次。
+- `rdev up`：持续监听文件变化并同步。
+- `rdev up --tui`：打开同步、session、daemon 状态集成界面。
+- `rdev exec "cmd"`：通过本地 daemon 复用 SSH 连接执行远程命令。
+- `rdev service start <name>`：启动远端长期服务，ready 后退出，服务留在后台。
+- `rdev why-ignore <path>`：解释某个文件为什么没有同步。
 
-- 初始化项目级配置：`.rdev/config.toml`
-- 单次全量同步：`rdev sync`
-- 持续监听并增量同步：`rdev up`
-- TUI 一体化控制台：`rdev up --tui`
-- 远程命令执行：`rdev run "cargo test"` / `rdev run backend-lint`
-- 同步排除诊断：`rdev why-ignore path/to/file`
-- 远程 shell：`rdev ssh`
-- SSH 认证检查：`rdev auth-check`
-- 环境检查：`rdev doctor`
+## 安装
 
-## Install
-
-本地开发时可以直接构建 release 二进制：
+开发构建：
 
 ```powershell
 cargo build --release
 ```
 
-如果要在正式开发项目里测试本仓库的开发构建，建议生成单独命名的开发二进制：
+安装到 Cargo bin：
+
+```powershell
+cargo install --path . --force
+```
+
+如果只是替换当前机器上的版本，也可以直接复制 release 产物：
+
+```powershell
+Copy-Item target\release\rdev.exe "$env:USERPROFILE\.cargo\bin\rdev.exe" -Force
+```
+
+开发版建议用单独名字，避免和正式项目里运行的 `rdev.exe` 混淆：
 
 ```powershell
 .\scripts\dev-release.ps1
 J:\cargo-target\release\rdev-dev.exe doctor
 ```
 
-这样前台进程名是 `rdev-dev.exe`，它启动的后台 daemon 是 `rdev-dev-daemon.exe`。正式安装版仍然使用 `rdev.exe`，后台 daemon 是 `rdev-daemon.exe`，在任务管理器里更不容易误杀。
-
-也可以安装到 Cargo bin 目录：
-
-```powershell
-cargo install --path . --force
-```
-
-如果只是替换本机正在使用的版本，可以直接复制 release 产物：
-
-```powershell
-Copy-Item target\release\rdev.exe "$env:USERPROFILE\.cargo\bin\rdev.exe" -Force
-```
-
-## Quick Start
+## 快速开始
 
 在项目根目录初始化配置：
 
@@ -53,36 +46,109 @@ Copy-Item target\release\rdev.exe "$env:USERPROFILE\.cargo\bin\rdev.exe" -Force
 rdev init --host root@example.com --path /root/my-project
 ```
 
-检查本地和远程环境：
+检查环境：
 
 ```powershell
 rdev doctor
 rdev auth-check
 ```
 
-执行一次全量同步：
+常用启动方式：
 
 ```powershell
 rdev sync
+rdev up
+rdev up --tui
 ```
 
-启动持续同步：
+配置文件默认是：
+
+```text
+.rdev/config.toml
+```
+
+## 配置示例
+
+```toml
+version = 1
+
+[remote]
+host = "root@example.com"
+port = 22
+path = "/root/my-project"
+identity_file = ""
+passphrase_env = ""
+
+[sync]
+local_path = "."
+watch_dirs = ["."]
+exclude = [".git", "target", "node_modules", "data", ".rdev", "dist", "build"]
+use_gitignore = true
+debounce_ms = 300
+delete = true
+backend = "auto"
+
+[command]
+default_shell = "bash"
+remote_env = {}
+
+[commands.backend-lint]
+dir = "backend"
+command = "cargo clippy --all-features -- -D warnings"
+
+[services.backend]
+dir = "backend"
+command = "cargo run"
+ready_pattern = "listening on"
+url = "http://10.124.124.0:5150"
+```
+
+`exclude` 支持 `!` 包含规则。下面表示排除任意路径下名为 `data` 的目录或文件，但保留任意路径下的 `src/data`：
+
+```toml
+exclude = ["data", "!src/data"]
+```
+
+## 远程命令
+
+优先用 `exec`：
 
 ```powershell
-rdev up
+rdev exec "pwd"
+rdev exec "cargo test"
+rdev exec backend-lint
+rdev exec --summary "cargo test"
 ```
 
-启动 TUI 控制台：
+`exec` 会通过项目 daemon 复用 SSH 连接，适合 Codex、Claude Code 这类频繁执行命令的场景。`--summary` 会把完整日志写入 `.rdev/logs/`，终端只打印摘要。
+
+`run` 是一次性 SSH 命令，不使用 daemon：
+
+```powershell
+rdev run "pwd"
+```
+
+它适合偶尔执行，或者排查 daemon 本身问题。
+
+命令别名用 `alias set` 管理：
+
+```powershell
+rdev alias set backend-lint --dir backend -- cargo clippy --all-features -- -D warnings
+rdev alias list
+rdev alias delete backend-lint
+```
+
+alias 只会被 `rdev exec <alias>` 和 `rdev run <alias>` 展开，不接入 TUI。
+
+## TUI
+
+启动：
 
 ```powershell
 rdev up --tui
 ```
 
-## TUI Commands
-
-进入 `rdev up --tui` 后，底部输入区支持常用控制命令：
-
-TUI 不展开 `alias`。需要复用常用服务命令时，使用 `new remote-session <name> -- <command>` 创建可停止、可恢复日志的 session；`alias` 只用于非 TUI 的 `rdev run` / `rdev exec` 远程命令执行。
+常用命令：
 
 ```text
 new session web -- pnpm dev
@@ -91,8 +157,10 @@ ps
 logs web
 tail web
 stop web
+enter web
 restart web
 sync
+daemon status
 help
 quit
 quit!
@@ -108,132 +176,58 @@ Ctrl+C      复制日志选区；聚焦 sync 时取消当前同步
 Esc         关闭 help 或清空输入
 ```
 
-## Configuration
+TUI 里的 `new remote-session` 会启动外部 SSH 进程。SSH 断开后该 session 会退出，需要手动 `restart <name>` 或 `restore <name>`。
 
-配置文件默认位于：
+`enter [name|id]` 会给运行中的 session 发送一个回车；不带参数时发送给当前聚焦 session，适合在查看服务日志时插入分隔。
 
-```text
-.rdev/config.toml
-```
+## 服务
 
-示例：
-
-```toml
-version = 1
-
-[remote]
-host = "root@example.com"
-port = 22
-path = "/root/my-project"
-identity_file = ""
-passphrase_env = ""
-
-[sync]
-local_path = "."
-watch_dirs = ["."]
-exclude = [".git", "target", "node_modules", "data", ".rdev", ".idea", ".vscode", ".codegraph", "dist", "build"]
-use_gitignore = true
-debounce_ms = 300
-direction = "push"
-delete = true
-delete_policy = "propagate"
-full_sync_threshold = 32
-backend = "auto"
-rsync_mode = "auto"
-
-[command]
-default_shell = "bash"
-remote_env = {}
-
-[commands.backend-lint]
-dir = "knota-fold"
-command = "cargo clippy --all-features -- -D warnings"
-
-[commands.l2-session]
-dir = "knota-fold"
-command = "cargo run -- task l2_process_session session_id:{session_id}"
-
-[services.backend]
-dir = "knota-fold"
-command = "cargo loco start --all"
-ready_pattern = "listening on"
-url = "http://10.124.124.0:5150"
-```
-
-`exclude` 支持用 `!` 写包含规则，例如排除所有 `data`，但保留任意路径下的 `src/data`：
-
-```toml
-exclude = ["data", "!src/data"]
-```
-
-`commands` 支持项目级远程服务器命令别名。别名可以携带执行目录，并支持 `key=value` 参数替换：
+`service` 适合给编程代理启动远端开发服务：本地命令等待 ready，ready 后退出 0，远端服务继续运行。
 
 ```powershell
-rdev alias set backend-lint --dir knota-fold -- cargo clippy --all-features -- -D warnings
-rdev alias set l2-session --dir knota-fold -- cargo run -- task l2_process_session session_id:{session_id}
-rdev alias list
-rdev run backend-lint
-rdev exec l2-session -- session_id=26
-```
-
-alias 的边界：
-
-- 只由 `rdev run <alias>` 和 `rdev exec <alias>` 展开。
-- 只面向配置里的远程服务器，不是本地 shell alias。
-- 不接入 TUI；TUI 里继续用 `new session` / `new remote-session` 管理常驻进程。
-- `dir` 是相对 `remote.path` 的远程工作目录；显式 `--dir` 优先于 alias 自带的 `dir`。
-- `alias set` 存在则更新，不存在则新增；`rdev alias delete <name>` 可删除别名。
-
-## Services
-
-`services` 用于给编程代理或自动化流程启动远端长期服务，并在服务 ready 后让命令退出成功：
-
-```powershell
-rdev service set backend --dir knota-fold --ready "listening on" --url http://10.124.124.0:5150 -- cargo loco start --all
-rdev service list
+rdev service set backend --dir backend --ready "listening on" --url http://10.124.124.0:5150 -- cargo run
 rdev service start backend
-rdev service wait backend
 rdev service status backend
 rdev service logs backend
 rdev service stop backend
 ```
 
-`service set` 存在则更新，不存在则新增。`service start` 通过项目 daemon 在远端后台启动服务，阻塞等待 `ready_pattern`，默认最多等待 10 分钟，可用 `--timeout <seconds>` 覆盖。默认等待期间只输出低频心跳，匹配 ready 后打印类似 summary 的结果，包括 `url`、pid、远端日志路径和后续 `logs/status/stop` 命令，然后退出 `0`，远端服务继续运行。需要实时查看启动日志时使用 `rdev service start --logs <name>` 或 `rdev service wait --logs <name>`；启用 `--logs` 后不再输出心跳。ready 超时会退出 `124`，但不会停止远端服务，会提示使用 `wait/status/logs/stop` 继续等待、检查或停止。运行状态和日志保存在远端项目 `.rdev/services/<name>/` 下。
-
-## Exec Summary
-
-`rdev exec --summary` 会把完整 stdout/stderr 写入本地 `.rdev/logs/`，终端只输出摘要：
+默认 `start` / `wait` 只输出低频心跳和 ready summary，不回放完整日志。需要实时看启动日志时加 `--logs`：
 
 ```powershell
-rdev exec --summary "cargo test"
-rdev exec --summary l2-session -- session_id=26
+rdev service start --logs backend
+rdev service wait --logs backend
 ```
 
-执行开始时会打印日志路径；长时间运行时会低频打印 captured bytes 心跳。摘要包含 exit code、执行目录、实际命令、完整日志路径、捕获行数/字节数、第一条 error/warn 线索和最后若干行日志。`.rdev/logs/` 下的 `exec-*.log` 只保留最近 1 小时。
+ready 后会提示：
 
-daemon 同一时间只执行一个 `exec`。如果已有远程命令正在运行，新的 `rdev exec` 会排队等待，不会直接返回 `daemon.busy`；`rdev daemon status` 会显示 `queue=N`。
+```text
+logs_command=rdev service logs backend
+status_command=rdev service status backend
+stop_command=rdev service stop backend
+```
 
-## Backends
+ready 超时返回 `124`，但不会停止远端服务。可以继续用 `wait/status/logs/stop` 处理。
 
-当前同步后端主要有两类：
+## 同步后端
 
-- `rsync`：复用系统 rsync，适合已有 rsync 环境。
-- `ssh` / `auto`：全量同步走 `ssh-tar`，增量同步走内置 SFTP。
+- `backend = "auto"`：默认推荐。全量同步走 `ssh-tar`，增量同步走内置 SFTP。
+- `backend = "rsync"`：复用系统 rsync，适合已有 rsync 环境。
 
-Windows 下如果不想依赖 WSL rsync，可以优先使用默认的 `backend = "auto"`。
+TUI 的内置 SFTP 连接会缓存 SSH 连接。连接失效时会清掉旧连接、重连一次并重试当前同步；如果重连仍失败，下一次手动 `sync` 会重新建连接。
 
-## Ignore Diagnostics
-
-如果文件没有同步，可以用 `why-ignore` 查看是否命中了 `sync.exclude` 规则：
+## 排障
 
 ```powershell
-rdev why-ignore knota-fold\data\db
-rdev why-ignore knota-fold\src\data\mod.rs
+rdev doctor
+rdev auth-check
+rdev why-ignore path\to\file
+rdev daemon status
 ```
 
-输出会说明路径是 `ignored` 还是 `included`，以及最后命中的 exclude/include 规则。
+`why-ignore` 会说明路径是 `ignored` 还是 `included`，以及命中了哪条 exclude/include 规则。
 
-## Requirements
+## 要求
 
 本机：
 
@@ -246,15 +240,11 @@ rdev why-ignore knota-fold\src\data\mod.rs
 - SSH server
 - `sh`
 - `tar`
-- 运行项目所需的语言工具链，例如 Rust、Node.js、pnpm 等
+- 项目需要的语言工具链，例如 Rust、Node.js、pnpm 等
 
-## Status
+## 当前边界
 
-rdev 目前处于实用化早期阶段，主线能力是单向 push 同步和轻量 TUI process 管理。
-
-暂不支持：
-
-- 双向同步
-- 完整交互式远程终端嵌入
-- 多机器协同状态
-- 远端 agent 服务
+- 只做本地到远端的 push 同步。
+- 不支持双向同步。
+- 不做完整交互式远程终端嵌入。
+- 暂不提供远端 agent 服务。
